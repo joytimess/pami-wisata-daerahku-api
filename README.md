@@ -1,58 +1,27 @@
-<p align="center"><a href="https://laravel.com" target="_blank"><img src="https://raw.githubusercontent.com/laravel/art/master/logo-lockup/5%20SVG/2%20CMYK/1%20Full%20Color/laravel-logolockup-cmyk-red.svg" width="400" alt="Laravel Logo"></a></p>
+# Wisata Daerahku Backend API
 
-<p align="center">
-<a href="https://github.com/laravel/framework/actions"><img src="https://github.com/laravel/framework/workflows/tests/badge.svg" alt="Build Status"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/dt/laravel/framework" alt="Total Downloads"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/v/laravel/framework" alt="Latest Stable Version"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/l/laravel/framework" alt="License"></a>
-</p>
+Laravel 13 API, currently under development. The implementation is not ready for production: payment provider, payment reconciliation, final visit cutoff and MySQL concurrency verification remain outstanding. No Firebase business data is migrated.
 
-## About Laravel
+## Local setup
 
-Laravel is a web application framework with expressive, elegant syntax. We believe development must be an enjoyable and creative experience to be truly fulfilling. Laravel takes the pain out of development by easing common tasks used in many web projects, such as:
+Install PHP 8.3+, Composer and MySQL, run `composer install`, copy `.env.example` to `.env`, and set `APP_KEY` with `php artisan key:generate`. Set `DB_CONNECTION=mysql` and the database connection values for an empty dedicated database. Set a random `JWT_SECRET` of at least 32 characters, `JWT_ISSUER`, `JWT_AUDIENCE`, and `FIREBASE_PROJECT_ID` when Google sign-in is configured. Never commit credentials. Run `php artisan migrate`; bootstrap a superadmin with `php artisan app:bootstrap-superadmin` (interactive). Configure SMTP and `PASSWORD_RESET_URL` for the mobile client before using email recovery. Use `QUEUE_CONNECTION=database`, `php artisan queue:work`, and schedule `php artisan schedule:run` every minute. Auth verification emails require a working queue; configure FIREBASE_CREDENTIALS with the path to a service account JSON for FCM.
 
-- [Simple, fast routing engine](https://laravel.com/docs/routing).
-- [Powerful dependency injection container](https://laravel.com/docs/container).
-- Multiple back-ends for [session](https://laravel.com/docs/session) and [cache](https://laravel.com/docs/cache) storage.
-- Expressive, intuitive [database ORM](https://laravel.com/docs/eloquent).
-- Database agnostic [schema migrations](https://laravel.com/docs/migrations).
-- [Robust background job processing](https://laravel.com/docs/queues).
-- [Real-time event broadcasting](https://laravel.com/docs/broadcasting).
+Timestamps are UTC; visit dates are interpreted in each destination's timezone. The current conservative provisional cutoff requires creation more than 25 hours 15 minutes before midnight at the start of the visit date and approval more than 1 hour 15 minutes before it. Product approval of the final cutoff is a release gate. Pending payment remains allocated: after the payment deadline it enters verification and, after grace, review; it is never treated as unpaid without a verified provider response. Access tokens last 15 minutes; refresh tokens last 30 days and are stored hashed and rotated. Laravel infrastructure tables retain vendor column names; sessions use a UUID-compatible user reference.
 
-Laravel is accessible, powerful, and provides tools required for large, robust applications.
+## API examples
 
-## Learning Laravel
+All endpoints use `/api/v1`; protected requests use `Authorization: Bearer <access_token>`. Collection responses are paginated. Examples:
 
-Laravel has the most extensive and thorough [documentation](https://laravel.com/docs) and video tutorial library of all modern web application frameworks, making it a breeze to get started with the framework.
+- `POST /auth/register` with JSON `{"name":"Example","email":"person@example.test","password":"example-password","password_confirmation":"example-password"}`.
+- `POST /auth/login` with `email` and `password`; `POST /auth/refresh` with `refresh_token`; `POST /auth/logout`; `GET /auth/me`.
+- `GET /categories`, `GET /destinations?search=park`; administrators manage destinations and dated quotas, superadmins manage categories.
+- `PUT /destinations/{guid}/quotas` with `visit_date`, integer `capacity`, `booking_opens_at` and `booking_closes_at`.
+- `POST /bookings` with header `Idempotency-Key` and JSON `destination_guid`, `visit_date`, positive `quantity`, `visitor_name`, `visitor_email`, `visitor_phone`, optional `notes`. Price is calculated by the server. `GET /bookings`, `GET /bookings/{guid}`; admin `POST /admin/bookings/{guid}/approve` or `/reject`.
+- `GET /notifications`, `GET /notifications/unread-count`, `PATCH /notifications/{guid}/read`; `PUT /devices` with `token` and `platform`, `DELETE /devices` with `token`.
+- `GET /favorites`, `PUT` or `DELETE /favorites/{destination_guid}`.
 
-In addition, [Laracasts](https://laracasts.com) contains thousands of video tutorials on a range of topics including Laravel, modern PHP, unit testing, and JavaScript. Boost your skills by digging into our comprehensive video library.
+Run `php artisan route:list --path=api` for the complete implemented route list. Payment, webhook, review and check-in endpoints are not implemented. Confirmed bookings receive a private confirmation invoice and group ticket PDF through the scheduled document dispatcher. The invoice is not proof of payment; its final semantics remain a release decision. Documents are available at GET /bookings/{guid}/documents and GET /bookings/{guid}/documents/{invoice|ticket}. A worker crash can leave an orphan private file; files deleted after their database records are created are not automatically regenerated. Email delivery uses the configured transport and may be retried; external delivery is at least once, not exactly once.
 
-You can also watch bite-sized lessons with real-world projects on [Laravel Learn](https://laravel.com/learn), where you will be guided through building a Laravel application from scratch while learning PHP fundamentals.
+## Validation and deployment limits
 
-## Agentic Development
-
-Laravel's predictable structure and conventions make it ideal for AI coding agents like Claude Code, Cursor, and GitHub Copilot. Install [Laravel Boost](https://laravel.com/docs/ai) to supercharge your AI workflow:
-
-```bash
-composer require laravel/boost --dev
-
-php artisan boost:install
-```
-
-Boost provides your agent 15+ tools and skills that help agents build Laravel applications while following best practices.
-
-## Contributing
-
-Thank you for considering contributing to the Laravel framework! The contribution guide can be found in the [Laravel documentation](https://laravel.com/docs/contributions).
-
-## Code of Conduct
-
-In order to ensure that the Laravel community is welcoming to all, please review and abide by the [Code of Conduct](https://laravel.com/docs/contributions#code-of-conduct).
-
-## Security Vulnerabilities
-
-If you discover a security vulnerability within Laravel, please send an e-mail to Taylor Otwell via [taylor@laravel.com](mailto:taylor@laravel.com). All security vulnerabilities will be promptly addressed.
-
-## License
-
-The Laravel framework is open-sourced software licensed under the [MIT license](https://opensource.org/licenses/MIT).
+Run `php artisan test` and `vendor/bin/pint --test`. SQLite tests do not demonstrate MySQL row locking. Run dedicated MySQL concurrency tests before release; do not run destructive test migrations against existing data. Real Firebase credentials, SMTP, FCM device delivery, gateway sandbox, operational alerting and deployment remain unverified. Production decisions remain open for payment provider, refund/cancellation, review duration, cutoff, invoice semantics, data import and review/check-in rules.
