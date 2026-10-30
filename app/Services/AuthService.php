@@ -11,6 +11,7 @@ use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Str;
 use Illuminate\Validation\ValidationException;
 use Kreait\Firebase\JWT\IdTokenVerifier;
+use Symfony\Component\HttpKernel\Exception\HttpException;
 use Throwable;
 
 class AuthService
@@ -54,8 +55,7 @@ class AuthService
             throw new \RuntimeException('FIREBASE_PROJECT_ID is not configured.');
         }
         try {
-            $token = IdTokenVerifier::createWithProjectId($project)->verifyIdToken($data['id_token']);
-            $claims = $token->payload();
+            $claims = $this->verifyFirebaseToken($project, $data['id_token']);
             $firebase = $claims['firebase'] ?? [];
             if (($firebase['sign_in_provider'] ?? null) !== 'google.com' || ! ($claims['email_verified'] ?? false)) {
                 throw new AuthenticationException;
@@ -73,7 +73,9 @@ class AuthService
             if ($identity) {
                 return User::findOrFail($identity->user_guid);
             }
-            if (User::where('email', $email)->exists()) {
+            $existing = User::where('email', $email)->first();
+            if ($existing) {
+                $this->assertGoogleAllowed($existing);
                 throw ValidationException::withMessages(['id_token' => 'Account linking requires proof of ownership.']);
             }
             $user = User::create(['name' => (string) ($claims['name'] ?? $email), 'email' => $email]);
@@ -86,12 +88,26 @@ class AuthService
 
         return DB::transaction(function () use ($user, $data) {
             $user = User::whereKey($user->guid)->lockForUpdate()->firstOrFail();
+            // Authorization uses the role stored in Laravel's database, never client input.
+            $this->assertGoogleAllowed($user);
             if ($user->status !== 'active') {
                 throw new AuthenticationException('Account unavailable.');
             }
 
             return $this->newSession($user, $data['device_name'] ?? null);
         }, 3);
+    }
+
+    protected function verifyFirebaseToken(string $project, string $idToken): array
+    {
+        return IdTokenVerifier::createWithProjectId($project)->verifyIdToken($idToken)->payload();
+    }
+
+    private function assertGoogleAllowed(User $user): void
+    {
+        if ((int) $user->role !== 0) {
+            throw new HttpException(403, 'Google login is not available for this account.');
+        }
     }
 
     private function newSession(User $user, ?string $device): array
