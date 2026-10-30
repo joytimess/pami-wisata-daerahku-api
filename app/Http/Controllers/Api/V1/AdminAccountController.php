@@ -4,6 +4,7 @@ namespace App\Http\Controllers\Api\V1;
 
 use App\Http\Controllers\Controller;
 use App\Http\Requests\Auth\CreateAdminRequest;
+use App\Http\Requests\Auth\ListAdminAccountsRequest;
 use App\Http\Requests\Auth\UpdateAdminRequest;
 use App\Http\Resources\UserResource;
 use App\Models\User;
@@ -12,6 +13,11 @@ use App\Services\AdminService;
 class AdminAccountController extends Controller
 {
     public function __construct(private AdminService $admins) {}
+
+    public function index(ListAdminAccountsRequest $request)
+    {
+        return UserResource::collection($this->admins->list($request->user(), $request->validated()));
+    }
 
     public function store(CreateAdminRequest $request): UserResource
     {

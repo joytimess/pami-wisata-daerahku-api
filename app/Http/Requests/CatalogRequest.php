@@ -7,14 +7,20 @@ use Illuminate\Validation\Rule;
 
 class CatalogRequest extends FormRequest
 {
+    private function requiredRole(): int
+    {
+        return $this->routeIs('categories.*', 'admin.categories.*') ? 2 : 1;
+    }
+
     public function authorize(): bool
     {
-        if ($this->isMethod('GET')) {
+        // Public reads stay open; every admin route and every write needs the minimum role.
+        if ($this->isMethod('GET') && ! $this->routeIs('admin.*') && ! $this->routeIs('destinations.image.admin')) {
             return true;
         }
         $role = $this->user()?->role;
 
-        return $role !== null && (int) $role >= ($this->routeIs('categories.*') ? 2 : 1);
+        return $role !== null && (int) $role >= $this->requiredRole();
     }
 
     public function rules(): array
@@ -23,6 +29,7 @@ class CatalogRequest extends FormRequest
             return [
                 'search' => ['sometimes', 'string', 'max:100'], 'category' => ['sometimes', 'uuid'],
                 'sort' => ['sometimes', Rule::in(['name', '-name', 'created_at', '-created_at'])],
+                'status' => ['sometimes', Rule::in(['active', 'inactive', 'all'])],
                 'per_page' => ['sometimes', 'integer', 'min:1', 'max:100'],
             ];
         }

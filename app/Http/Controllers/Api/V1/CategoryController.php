@@ -31,4 +31,9 @@ class CategoryController extends Controller
     {
         return new CategoryResource($this->service->deactivate($category));
     }
+
+    public function adminIndex(CatalogRequest $request)
+    {
+        return CategoryResource::collection($this->service->adminCategories($request->validated()));
+    }
 }

@@ -24,6 +24,7 @@ class BookingResource extends JsonResource
             'currency' => $this->currency,
             'notes' => $this->notes,
             'status' => $this->status,
+            'cancellable' => (bool) ($this->cancellable ?? false),
             'approval_expires_at' => $this->approval_expires_at,
             'payment_expires_at' => $this->payment_expires_at,
             'notification_grace_expires_at' => $this->notification_grace_expires_at,

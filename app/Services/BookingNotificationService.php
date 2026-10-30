@@ -13,6 +13,7 @@ class BookingNotificationService
             'created' => ['Booking baru', 'Ada booking baru yang menunggu keputusan.', true],
             'approved' => ['Booking disetujui', 'Booking Anda telah disetujui.', false],
             'rejected' => ['Booking ditolak', 'Booking Anda telah ditolak.', false],
+            'cancelled' => ['Booking dibatalkan', 'Booking dibatalkan oleh pemesan.', true],
             'expired' => ['Booking kedaluwarsa', 'Booking Anda telah kedaluwarsa.', false],
             'payment_review' => ['Pembayaran perlu ditinjau', 'Status pembayaran booking perlu ditinjau.', true],
         };

@@ -24,6 +24,26 @@ class AdminService
         }, 3);
     }
 
+    public function list(User $actor, array $filters)
+    {
+        if ($actor->role !== 2 || $actor->status !== 'active') {
+            throw new AuthorizationException;
+        }
+        $query = User::query();
+        if (isset($filters['role'])) {
+            $query->where('role', (int) $filters['role']);
+        }
+        if (! empty($filters['status'])) {
+            $query->where('status', $filters['status']);
+        }
+        if (! empty($filters['search'])) {
+            $like = '%'.addcslashes($filters['search'], '%_\\').'%';
+            $query->where(fn ($q) => $q->where('name', 'like', $like)->orWhere('email', 'like', $like));
+        }
+
+        return $query->orderByDesc('role')->orderBy('name')->orderBy('guid')->paginate($filters['per_page'] ?? 15);
+    }
+
     public function update(User $actor, User $target, array $data): User
     {
         if (isset($data['role'])) {
@@ -36,6 +56,9 @@ class AdminService
             $target = User::whereKey($target->guid)->lockForUpdate()->firstOrFail();
             if ($actor->role !== 2 || $actor->status !== 'active') {
                 throw new AuthorizationException;
+            }
+            if ($actor->guid === $target->guid && (($data['role'] ?? $target->role) !== $target->role || ($data['status'] ?? $target->status) !== $target->status)) {
+                throw ValidationException::withMessages(['role' => 'You cannot change your own role or status.']);
             }
             if ($target->role === 2 && $target->status === 'active' && (($data['role'] ?? 2) !== 2 || ($data['status'] ?? 'active') !== 'active') && $superadmins->count() <= 1) {
                 throw ValidationException::withMessages(['role' => 'The last active superadmin cannot be suspended or demoted.']);

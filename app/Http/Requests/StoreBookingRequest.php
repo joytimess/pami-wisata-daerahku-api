@@ -19,7 +19,7 @@ class StoreBookingRequest extends FormRequest
     public function rules(): array
     {
         return [
-            'idempotency_key' => ['required', 'string', 'max:128', 'regex:/^[\x21-\x7E]+$/'],
+            'idempotency_key' => ['required', 'string', 'max:128', 'regex:/^[A-Za-z0-9._~-]+$/'],
             'destination_guid' => ['required', 'uuid'],
             'visit_date' => ['required', 'date_format:Y-m-d'],
             'quantity' => ['required', 'integer', 'min:1', 'max:1000000'],
