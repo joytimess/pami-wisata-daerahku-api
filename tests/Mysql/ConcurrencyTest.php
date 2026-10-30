@@ -3,6 +3,8 @@
 use App\Models\Destination;
 use App\Models\User;
 use App\Services\BookingService;
+use App\Services\CatalogService;
+use App\Services\VisitService;
 use App\Support\BookingRules;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
@@ -69,6 +71,42 @@ function held(string $quota): int
 {
     return (int) DB::table('bookings')->where('destination_quota_guid', $quota)->whereIn('status', BookingRules::HELD)->sum('quantity');
 }
+
+it('records exactly one check-in under concurrent owner and staff requests', function () {
+    [$destination, $date, $quota] = mysqlSeed(10);
+    $owner = makeUser();
+    $staff = makeUser(1);
+    $service = app(BookingService::class);
+    $booking = $service->create($owner, bookingPayload($destination, $date) + ['idempotency_key' => 'checkin-race']);
+    $service->decide($staff, $booking->guid, true);
+    DB::table('destination_quotas')->where('guid', $quota)->update(['visit_date' => now($destination->timezone)->toDateString()]);
+    $jobs = collect(range(1, 8))->map(fn ($i) => ['action' => 'check-in', 'user' => $i % 2 ? $owner->guid : $staff->guid, 'guid' => $booking->guid])->all();
+
+    $results = collect(runConcurrently($jobs));
+    expect($results->where('ok', true))->toHaveCount(1)
+        ->and($results->where('ok', false)->pluck('code')->unique()->all())->toBe(['check_in_duplicate']);
+    expect(DB::table('check_ins')->where('booking_guid', $booking->guid)->count())->toBe(1)
+        ->and(DB::table('bookings')->where('guid', $booking->guid)->value('status'))->toBe('confirmed')
+        ->and(held($quota))->toBe(1);
+});
+
+it('records exactly one review and one aggregate contribution under concurrent requests', function () {
+    [$destination, $date, $quota] = mysqlSeed(10);
+    $owner = makeUser();
+    $service = app(BookingService::class);
+    $booking = $service->create($owner, bookingPayload($destination, $date) + ['idempotency_key' => 'review-race']);
+    $service->decide(makeUser(1), $booking->guid, true);
+    DB::table('destination_quotas')->where('guid', $quota)->update(['visit_date' => now($destination->timezone)->toDateString()]);
+    app(VisitService::class)->checkIn($owner, $booking->guid);
+    $job = ['action' => 'review', 'user' => $owner->guid, 'guid' => $booking->guid, 'fields' => ['rating' => 4, 'comment' => 'Real visit']];
+
+    $results = collect(runConcurrently(array_fill(0, 8, $job)));
+    expect($results->where('ok', true))->toHaveCount(1)
+        ->and($results->where('ok', false)->pluck('code')->unique()->all())->toBe(['review_duplicate']);
+    expect(DB::table('reviews')->where('booking_guid', $booking->guid)->count())->toBe(1);
+    $aggregate = app(CatalogService::class)->destination($destination);
+    expect((int) $aggregate->rating_count)->toBe(1)->and((float) $aggregate->rating_average)->toBe(4.0);
+});
 
 it('never oversells when many users book the last seats at the same time', function () {
     [$destination, $date, $quota] = mysqlSeed(10);

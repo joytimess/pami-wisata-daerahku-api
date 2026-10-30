@@ -10,6 +10,7 @@ use App\Http\Controllers\Api\V1\DestinationController;
 use App\Http\Controllers\Api\V1\FavoriteController;
 use App\Http\Controllers\Api\V1\InboxController;
 use App\Http\Controllers\Api\V1\QuotaController;
+use App\Http\Controllers\Api\V1\VisitController;
 use App\Http\Middleware\AuthenticateApiToken;
 use Illuminate\Support\Facades\Route;
 
@@ -26,12 +27,15 @@ Route::prefix('v1')->group(function () {
     Route::get('categories', [CategoryController::class, 'index'])->name('categories.index');
     Route::get('destinations', [DestinationController::class, 'index'])->name('destinations.index');
     Route::get('destinations/{destination}', [DestinationController::class, 'show'])->name('destinations.show');
+    Route::get('destinations/{destination}/reviews', [VisitController::class, 'destinationReviews'])->name('destinations.reviews');
     Route::get('destinations/{destination}/image', [DestinationController::class, 'image'])->name('destinations.image');
     Route::middleware(AuthenticateApiToken::class)->group(function () {
         Route::get('auth/me', [AuthController::class, 'me']);
         Route::post('auth/logout', [AuthController::class, 'logout']);
         Route::post('profile/close', [AccountController::class, 'close'])->middleware('throttle:6,1');
         Route::patch('profile', [AccountController::class, 'update']);
+        Route::get('profile/statistics', [VisitController::class, 'statistics']);
+        Route::get('reviews', [VisitController::class, 'history']);
         Route::post('auth/email/verification-notification', [AccountController::class, 'resend'])->middleware('throttle:6,1');
 
         Route::post('categories', [CategoryController::class, 'store'])->name('categories.store');
@@ -59,6 +63,8 @@ Route::prefix('v1')->group(function () {
         Route::get('bookings/{booking}/documents', [BookingDocumentController::class, 'show']);
         Route::get('bookings/{booking}/documents/{type}', [BookingDocumentController::class, 'download'])->whereIn('type', ['invoice', 'ticket']);
         Route::get('bookings/{booking}', [BookingController::class, 'show']);
+        Route::post('bookings/{booking}/check-in', [VisitController::class, 'checkIn']);
+        Route::post('bookings/{booking}/review', [VisitController::class, 'review']);
         Route::get('admin/accounts', [AdminAccountController::class, 'index']);
         Route::post('admin/accounts', [AdminAccountController::class, 'store']);
         Route::patch('admin/accounts/{user}', [AdminAccountController::class, 'update']);

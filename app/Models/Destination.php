@@ -5,6 +5,7 @@ namespace App\Models;
 use Illuminate\Database\Eloquent\Concerns\HasUuids;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Support\Str;
 
 class Destination extends Model
@@ -30,5 +31,10 @@ class Destination extends Model
     public function category(): BelongsTo
     {
         return $this->belongsTo(DestinationCategory::class, 'destination_category_guid', 'guid');
+    }
+
+    public function reviews(): HasMany
+    {
+        return $this->hasMany(Review::class, 'destination_guid', 'guid');
     }
 }

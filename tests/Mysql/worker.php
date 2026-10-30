@@ -11,6 +11,7 @@ use App\Models\Destination;
 use App\Models\User;
 use App\Services\BookingService;
 use App\Services\QuotaService;
+use App\Services\VisitService;
 use Illuminate\Contracts\Console\Kernel;
 
 require __DIR__.'/../../vendor/autoload.php';
@@ -38,6 +39,8 @@ try {
         'cancel' => $bookings->cancel($user, $job['guid']),
         'decide' => $bookings->decide($user, $job['guid'], $job['approve']),
         'quota' => app(QuotaService::class)->upsert(Destination::findOrFail($job['destination']), $job['fields']),
+        'check-in' => app(VisitService::class)->checkIn($user, $job['guid']),
+        'review' => app(VisitService::class)->review($user, $job['guid'], $job['fields']),
     };
     echo json_encode(['ok' => true, 'guid' => $result->guid ?? null, 'status' => $result->status ?? null, 'capacity' => $result->capacity ?? null]);
 } catch (Throwable $e) {

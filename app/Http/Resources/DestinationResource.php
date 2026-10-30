@@ -18,6 +18,8 @@ class DestinationResource extends JsonResource
             'has_image' => (bool) $this->image_path,
             'image_url' => $this->image_path ? 'destinations/'.$this->guid.'/image?v='.($this->updated_at?->timestamp ?? 0) : null,
             'is_active' => $this->is_active,
+            'rating_average' => $this->rating_average === null ? null : (float) $this->rating_average,
+            'rating_count' => (int) $this->rating_count,
         ];
     }
 }

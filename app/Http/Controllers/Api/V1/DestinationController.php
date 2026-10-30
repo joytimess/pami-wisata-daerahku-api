@@ -45,7 +45,7 @@ class DestinationController extends Controller
 
     public function adminShow(CatalogRequest $request, Destination $destination)
     {
-        return new DestinationResource($destination->load('category'));
+        return new DestinationResource($destination->load('category')->loadCount('reviews as rating_count')->loadAvg('reviews as rating_average', 'rating'));
     }
 
     public function image(CatalogRequest $request, Destination $destination)

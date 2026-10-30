@@ -317,7 +317,13 @@ class BookingService
     private function query(): Builder
     {
         return DB::table('bookings')->join('destination_quotas', 'destination_quotas.guid', '=', 'bookings.destination_quota_guid')
-            ->select('bookings.*', 'destination_quotas.destination_guid', 'destination_quotas.visit_date');
+            ->join('destinations', 'destinations.guid', '=', 'destination_quotas.destination_guid')
+            ->leftJoin('check_ins', 'check_ins.booking_guid', '=', 'bookings.guid')
+            ->leftJoin('reviews', 'reviews.booking_guid', '=', 'bookings.guid')
+            ->select('bookings.*', 'destination_quotas.destination_guid', 'destination_quotas.visit_date',
+                'destinations.timezone as destination_timezone', 'check_ins.checked_in_at',
+                'reviews.guid as review_guid', 'reviews.rating as review_rating',
+                'reviews.comment as review_comment', 'reviews.created_at as review_created_at');
     }
 
     private function find(string $guid): object
@@ -333,6 +339,15 @@ class BookingService
         $booking->visit_date = substr((string) $booking->visit_date, 0, 10);
         $booking->cancellable = $booking->status === 'pending_approval'
             && CarbonImmutable::parse($booking->approval_expires_at)->isFuture();
+        $booking->checked_in_at = $booking->checked_in_at ? CarbonImmutable::parse($booking->checked_in_at, 'UTC')->toIso8601String() : null;
+        $booking->can_check_in = $booking->status === 'confirmed' && $booking->checked_in_at === null
+            && $booking->visit_date === now($booking->destination_timezone)->toDateString();
+        $booking->can_review = $booking->status === 'confirmed' && $booking->checked_in_at !== null && $booking->review_guid === null;
+        $booking->review = $booking->review_guid === null ? null : (object) [
+            'guid' => $booking->review_guid, 'booking_guid' => $booking->guid,
+            'destination_guid' => $booking->destination_guid, 'destination_name' => $booking->destination_name_snapshot,
+            'rating' => (int) $booking->review_rating, 'comment' => $booking->review_comment, 'created_at' => $booking->review_created_at,
+        ];
 
         return $booking;
     }

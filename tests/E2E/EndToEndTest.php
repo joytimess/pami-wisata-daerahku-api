@@ -1,6 +1,7 @@
 <?php
 
 use App\Models\User;
+use App\Services\BookingDocumentService;
 use Illuminate\Http\Client\PendingRequest;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
@@ -79,6 +80,60 @@ function e2eDestination(string $adminToken, string $categoryGuid, int $price = 0
 
     return $response->json('data.guid');
 }
+
+it('Phase 6: profile, visit, review and documents use authoritative Laravel data over HTTP', function () {
+    $owner = makeUser();
+    $stranger = makeUser();
+    $admin = makeUser(1);
+    $ownerToken = e2eLogin($owner);
+    $strangerToken = e2eLogin($stranger);
+    $adminToken = e2eLogin($admin);
+    [$destination, $date, $quota] = seedDestination();
+    $created = e2e($ownerToken)->withHeaders(['Idempotency-Key' => 'phase6-visit'])
+        ->post('bookings', bookingPayload($destination, $date));
+    expect($created->status())->toBe(200);
+    $guid = $created->json('data.guid');
+
+    expect(e2e($ownerToken)->patch('profile', ['name' => 'Phase Six', 'phone' => '081234'])->status())->toBe(200);
+    expect(e2e($ownerToken)->get('auth/me')->json('data.name'))->toBe('Phase Six');
+    expect(e2e($ownerToken)->post("bookings/{$guid}/check-in")->json('code'))->toBe('check_in_not_eligible');
+    expect(e2e($adminToken)->post("admin/bookings/{$guid}/approve")->json('data.status'))->toBe('confirmed');
+    expect(e2e($ownerToken)->post("bookings/{$guid}/check-in")->json('code'))->toBe('check_in_wrong_date');
+    expect(e2e($ownerToken)->post("bookings/{$guid}/review", ['rating' => 5, 'comment' => 'Visited'])->json('code'))->toBe('review_not_eligible');
+
+    // Move only this isolated fixture to visit day; the API still validates the real server clock.
+    DB::table('destination_quotas')->where('guid', $quota)->update([
+        'visit_date' => now($destination->timezone)->toDateString(),
+    ]);
+    expect(e2e()->post("bookings/{$guid}/check-in")->status())->toBe(401);
+    expect(e2e($strangerToken)->post("bookings/{$guid}/check-in")->status())->toBe(404);
+    expect(e2e($ownerToken)->get("bookings/{$guid}")->json('data.can_check_in'))->toBeTrue();
+    $visit = e2e($adminToken)->post("bookings/{$guid}/check-in");
+    expect($visit->successful())->toBeTrue();
+    $detail = e2e($ownerToken)->get("bookings/{$guid}")->json('data');
+    expect($detail['checked_in_at'])->not->toBeNull();
+    expect($detail['can_check_in'])->toBeFalse()->and($detail['can_review'])->toBeTrue();
+    expect(e2e($ownerToken)->post("bookings/{$guid}/check-in")->json('code'))->toBe('check_in_duplicate');
+    expect(e2e($strangerToken)->post("bookings/{$guid}/review", ['rating' => 5, 'comment' => 'Other'])->status())->toBe(404);
+    expect(e2e($adminToken)->post("bookings/{$guid}/review", ['rating' => 5, 'comment' => 'Admin'])->status())->toBe(404);
+    expect(e2e($ownerToken)->post("bookings/{$guid}/review", ['rating' => 6, 'comment' => 'Invalid'])->status())->toBe(422);
+    $review = e2e($ownerToken)->post("bookings/{$guid}/review", ['rating' => 4, 'comment' => 'Kunjungan nyata dalam fixture pengujian.']);
+    expect($review->successful())->toBeTrue();
+    expect(e2e($ownerToken)->post("bookings/{$guid}/review", ['rating' => 5, 'comment' => 'Duplicate'])->json('code'))->toBe('review_duplicate');
+    expect(e2e($ownerToken)->get("bookings/{$guid}")->json('data.can_review'))->toBeFalse();
+    expect(e2e($ownerToken)->get('reviews')->json('meta.total'))->toBe(1);
+    expect(e2e($strangerToken)->get('reviews')->json('meta.total'))->toBe(0);
+    expect(e2e()->get("destinations/{$destination->guid}/reviews")->json('meta.total'))->toBe(1);
+    $rated = e2e()->get("destinations/{$destination->guid}")->json('data');
+    expect((float) $rated['rating_average'])->toBe(4.0)->and($rated['rating_count'])->toBe(1);
+    expect(e2e($ownerToken)->get('profile/statistics')->json('data'))->toMatchArray(['bookings' => 1, 'visits' => 1, 'reviews' => 1]);
+    expect(e2e($strangerToken)->get('profile/statistics')->json('data'))->toMatchArray(['bookings' => 0, 'visits' => 0, 'reviews' => 0]);
+
+    app(BookingDocumentService::class)->generate($guid);
+    expect(e2e($ownerToken)->get("bookings/{$guid}/documents/ticket")->body())->toStartWith('%PDF');
+    expect(e2e($strangerToken)->get("bookings/{$guid}/documents/ticket")->status())->toBe(404);
+    expect(DB::table('bookings')->where('guid', $guid)->value('status'))->toBe('confirmed');
+});
 
 it('Scenario A: user books, admin sees and decides, user sees the server status', function () {
     $user = makeUser();
