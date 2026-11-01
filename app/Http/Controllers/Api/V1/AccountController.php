@@ -9,11 +9,14 @@ use App\Http\Requests\Auth\ResendEmailOtpRequest;
 use App\Http\Requests\Auth\ResetPasswordRequest;
 use App\Http\Requests\Auth\UpdateProfileRequest;
 use App\Http\Requests\Auth\VerifyEmailOtpRequest;
+use App\Http\Requests\Auth\VerifyPasswordResetOtpRequest;
 use App\Http\Resources\MessageResource;
 use App\Http\Resources\UserResource;
 use App\Services\AccountService;
 use App\Services\EmailVerificationOtpService;
+use App\Services\PasswordResetOtpService;
 use Illuminate\Http\Request;
+use Illuminate\Http\Resources\Json\JsonResource;
 
 class AccountController extends Controller
 {
@@ -59,16 +62,29 @@ class AccountController extends Controller
         return new MessageResource('If verification is needed, a code may be sent.');
     }
 
-    public function forgot(ForgotPasswordRequest $request): MessageResource
+    public function forgot(ForgotPasswordRequest $request, PasswordResetOtpService $otp): MessageResource
     {
-        $this->accounts->forgot($request->validated('email'));
+        $start = hrtime(true);
+        try {
+            $otp->issue($request->validated('email'));
+        } finally {
+            $remaining = 200_000 - (int) ((hrtime(true) - $start) / 1000);
+            if ($remaining > 0) {
+                usleep($remaining);
+            }
+        }
 
         return new MessageResource('If the account exists, the reset request has been received.');
     }
 
-    public function reset(ResetPasswordRequest $request): MessageResource
+    public function verifyPasswordResetOtp(VerifyPasswordResetOtpRequest $request, PasswordResetOtpService $otp): JsonResource
     {
-        $this->accounts->reset($request->validated());
+        return new JsonResource($otp->verify($request->validated('email'), $request->validated('otp')));
+    }
+
+    public function reset(ResetPasswordRequest $request, PasswordResetOtpService $otp): MessageResource
+    {
+        $otp->reset($request->validated());
 
         return new MessageResource('Password reset.');
     }

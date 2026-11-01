@@ -3,7 +3,6 @@
 namespace App\Models;
 
 // use Illuminate\Contracts\Auth\MustVerifyEmail;
-use App\Notifications\QueuedResetPassword;
 use App\Notifications\QueuedVerifyEmail;
 use Database\Factories\UserFactory;
 use Illuminate\Contracts\Auth\MustVerifyEmail;
@@ -25,7 +24,7 @@ class User extends Authenticatable implements MustVerifyEmail
 
     public function sendPasswordResetNotification($token): void
     {
-        $this->notify(new QueuedResetPassword($token));
+        throw new \LogicException('Password reset links are disabled.');
     }
 
     protected $attributes = ['role' => 0, 'status' => 'active'];

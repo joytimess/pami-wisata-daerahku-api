@@ -213,7 +213,7 @@ Variabel berikut berasal dari `.env.example` dan `config/api_tokens.php`. Jangan
 | `JWT_AUDIENCE` | Klaim `aud` | Default `wisata-daerahku-api` |
 | `FIREBASE_PROJECT_ID` | Project Firebase untuk verifikasi ID token Google | Wajib bila `/auth/google` dipakai; tanpa ini endpoint gagal |
 | `FIREBASE_CREDENTIALS` | Path ke service account JSON untuk FCM | Wajib untuk push; kosong berarti pengiriman FCM ditunda dan dicoba ulang (`fcm_unconfigured`) |
-| `PASSWORD_RESET_URL` | URL halaman reset password di klien | Dipakai oleh email reset password |
+| `PASSWORD_RESET_URL` | Konfigurasi legacy | Tidak digunakan oleh pemulihan OTP |
 | `QUEUE_CONNECTION` | Driver queue | `database` (default `.env.example`) |
 | `CACHE_STORE`, `SESSION_DRIVER` | Cache dan session | `database` |
 | `MAIL_MAILER`, `MAIL_HOST`, `MAIL_PORT`, `MAIL_USERNAME`, `MAIL_PASSWORD`, `MAIL_FROM_ADDRESS`, `MAIL_FROM_NAME` | Email | Contoh Gmail SMTP dan App Password; lihat runbook di bawah |
@@ -222,7 +222,7 @@ Variabel berikut berasal dari `.env.example` dan `config/api_tokens.php`. Jangan
 Catatan penting:
 
 - Access token berlaku 15 menit dan refresh token 30 hari; nilai ini ditetapkan di `config/api_tokens.php`, bukan lewat `.env`.
-- Dengan `MAIL_MAILER=log`, email verifikasi dan reset password hanya ditulis ke log dan tautan reset yang sensitif dapat terekspos. Pengiriman email notifikasi booking oleh `DeliverBookingNotification` **menolak transport `log`, `array`, dan `null`**: delivery ditandai gagal dengan kode `mail_unconfigured` dan dicoba ulang. Jangan gunakan `log` atau fallback ke `log` untuk email reset produksi. Konfigurasikan transport SMTP nyata agar email notifikasi terkirim.
+- Pengiriman OTP reset menolak transport non-SMTP termasuk `log` dan fallback; gunakan SMTP nyata. Pengiriman email notifikasi booking oleh `DeliverBookingNotification` juga menolak `log`, `array`, dan `null`.
 - Variabel AWS, Redis, dan Memcached di `.env.example` adalah bawaan skeleton dan tidak dipakai oleh fitur project ini.
 
 ## 9. Authentication & Authorization
@@ -268,12 +268,15 @@ Respons resource Laravel mengikuti format bawaan (`data`, serta `links`/`meta` u
 
 ### Kontrak forgot dan reset password
 
-Kirim JSON dengan header `Accept: application/json`. Kedua endpoint publik dibatasi `throttle:10,1`.
+Kirim JSON dengan `Accept: application/json`. Semua endpoint bersifat publik dan dapat mengembalikan 422 untuk input tidak valid atau 429 bila batas permintaan tercapai.
 
-- `POST /api/v1/auth/forgot-password`: `{"email":"user@example.com"}`. Respons 200 untuk email terdaftar maupun tidak: `{"data":{"message":"If the account exists, the reset request has been received."}}`. Ini bukan bukti email diterima. Broker membatasi pembuatan token per email selama 60 detik.
-- `POST /api/v1/auth/reset-password`: `{"email":"user@example.com","token":"<token>","password":"<password baru>","password_confirmation":"<password baru>"}`. Password minimal 8 karakter. Respons 200: `{"data":{"message":"Password reset."}}`. Token berlaku 60 menit dan hanya sekali pakai; token invalid, kedaluwarsa, atau telah dipakai menghasilkan 422 dengan `message` dan `errors.email`. Input invalid menghasilkan 422 dengan `errors` per field. Rate limit menghasilkan 429.
+- `POST /api/v1/auth/forgot-password` dan `POST /api/v1/auth/password-reset/resend-otp`: `{"email":"user@example.com"}`. Respons 200 bersifat generik, termasuk untuk email yang tidak dikenal dan saat cooldown; respons bukan bukti email diterima.
+- `POST /api/v1/auth/password-reset/verify-otp`: `{"email":"user@example.com","otp":"012345"}`. OTP harus string enam digit. Sukses mengembalikan `data.reset_ticket` dan `data.expires_in_seconds` (300); kode salah, kedaluwarsa, terkunci, atau sudah dipakai menghasilkan 422 generik.
+- `POST /api/v1/auth/reset-password`: `{"email":"user@example.com","reset_ticket":"<ticket>","password":"<password baru>","password_confirmation":"<password baru>"}`. Sukses mengembalikan pesan dalam `data`, tanpa sesi baru. Ticket salah, kedaluwarsa, atau terpakai menghasilkan 422.
 
-Email berisi `https://<domain-klien>/reset-password?token=<token-ter-encode>&email=<email-ter-encode>`, bersumber dari `PASSWORD_RESET_URL`, bukan header request. Halaman klien harus membaca parameter dan mengirim POST reset; membuka GET tidak mengonsumsi token. Flutter, Android App Links (`assetlinks.json` dan konfigurasi aplikasi), serta domain HTTPS adalah handoff terpisah. Halaman klien harus menggunakan `Referrer-Policy: no-referrer` dan tidak meneruskan token ke analytics atau log akses yang tidak terlindungi.
+Kode berlaku 10 menit, maksimal lima kesalahan, dengan cooldown kirim ulang 60 detik. Kode baru menggantikan kode dan ticket sebelumnya. Ticket hanya berlaku lima menit dan sekali pakai; simpan hanya di memori aplikasi. Bila proses aplikasi berhenti, mulai ulang permintaan pemulihan. Reset mencabut sesi refresh dan token perangkat.
+
+Payload lama dengan `token` tidak lagi diterima. Token broker yang terbit sebelum cutover tidak dapat digunakan di endpoint ini; operator harus mengosongkan token broker lama melalui prosedur perubahan database yang disetujui. Pengguna yang memiliki tautan lama harus meminta OTP baru. `PASSWORD_RESET_URL` tidak digunakan untuk pemulihan OTP.
 
 ### Verifikasi email registrasi user
 
@@ -284,13 +287,14 @@ Flutter mengirim JSON berikut dengan `Accept: application/json`:
 - `POST /api/v1/auth/email-verification/verify-otp`: `{"email":"user@example.com","otp":"<enam digit sebagai string>"}`. Sukses: `200 {"data":{"message":"Email verified."}}`. Kode salah, kedaluwarsa, habis percobaan, atau sudah dipakai menghasilkan 422 generik pada `errors.otp`; validasi field juga 422.
 - `POST /api/v1/auth/email-verification/resend-otp`: `{"email":"user@example.com"}`. Respons generik `200 {"data":{"message":"If verification is needed, a code may be sent."}}` juga berlaku untuk akun tidak dikenal, sudah verified, atau masih cooldown. Tunggu sedikitnya 60 detik sejak penerbitan sebelumnya; kode terbaru menggantikan kode lama.
 
-Kode berlaku 10 menit dan maksimal lima kesalahan per penerbitan. Rate limit berdasarkan IP dan email dapat menghasilkan 429. Kedua endpoint bersifat publik; jangan kirim role atau mengonversi OTP ke integer karena nol awal penting. Tautan signed tetap berlaku untuk akun legacy tanpa record OTP; endpoint resend lama mengirim tautan untuk akun legacy dan menerbitkan OTP untuk akun baru sesuai cooldown. Akun registrasi OTP baru tidak dapat memakai tautan signed. Reset password tetap menggunakan tautan terpisah.
+Kode berlaku 10 menit dan maksimal lima kesalahan per penerbitan. Rate limit berdasarkan IP dan email dapat menghasilkan 429. Kedua endpoint bersifat publik; jangan kirim role atau mengonversi OTP ke integer karena nol awal penting. Tautan signed tetap berlaku untuk akun legacy tanpa record OTP; endpoint resend lama mengirim tautan untuk akun legacy dan menerbitkan OTP untuk akun baru sesuai cooldown. Akun registrasi OTP baru tidak dapat memakai tautan signed. Reset password memakai OTP dengan tujuan dan penyimpanan terpisah.
 
 ### Kelompok endpoint
 
 | Kelompok | Method & path | Akses |
 | --- | --- | --- |
-| Auth | `POST /auth/register`, `/auth/login`, `/auth/google`, `/auth/refresh`, `/auth/forgot-password`, `/auth/reset-password` | Publik, `throttle:10,1` |
+| Auth | `POST /auth/register`, `/auth/login`, `/auth/google`, `/auth/refresh` | Publik, `throttle:10,1` |
+| Auth | `POST /auth/forgot-password`, `/auth/password-reset/resend-otp`, `/auth/password-reset/verify-otp`, `/auth/reset-password` | Publik, dibatasi per IP dan email |
 | Auth | `POST /auth/email-verification/verify-otp`, `/auth/email-verification/resend-otp` | Publik, dibatasi per IP dan email |
 | Auth | `GET /auth/email/verify/{id}/{hash}` | Signed URL, `throttle:6,1` |
 | Auth | `GET /auth/me`, `POST /auth/logout`, `POST /auth/email/verification-notification` | Terautentikasi |
@@ -362,25 +366,23 @@ Job yang ada:
 
 - `DeliverBookingNotification` — mengirim satu record pengiriman (email atau FCM). Retry diatur manual lewat kolom `attempts` dan `next_attempt_at` dengan backoff eksponensial (60 detik, hingga maksimum 3600 detik).
 - `GenerateBookingDocuments` — membuat invoice dan tiket PDF; `tries = 5`, backoff 60/300/900/1800 detik.
-- `SendEmailVerificationOtp` mengirim OTP registrasi setelah commit dengan payload queue terenkripsi; `QueuedVerifyEmail` tetap untuk akun legacy dan `QueuedResetPassword` untuk reset password.
+- `SendEmailVerificationOtp` mengirim OTP registrasi setelah commit dengan payload queue terenkripsi; `QueuedVerifyEmail` tetap untuk akun legacy; reset password memakai job OTP tersendiri.
 
 ### Gmail SMTP dan pemulihan queue password reset
 
-Aktifkan verifikasi dua langkah akun Google dan buat **Google App Password**; jangan gunakan password utama atau simpan rahasia di repository. Isi `.env` dengan `MAIL_MAILER=smtp`, `MAIL_SCHEME=smtp`, `MAIL_HOST=smtp.gmail.com`, `MAIL_PORT=587`, `MAIL_USERNAME`, `MAIL_PASSWORD` (App Password), `MAIL_FROM_ADDRESS`, dan `MAIL_FROM_NAME`. Konfigurasi SMTP port 587 menggunakan STARTTLS yang dinegosiasikan transport. `MAIL_URL` harus kosong bila memakai parameter tersebut. Ganti `PASSWORD_RESET_URL` dengan URL halaman klien HTTPS yang benar, tanpa query, fragment, atau kredensial; placeholder contoh tidak dapat digunakan. Atur `QUEUE_CONNECTION=database`, lalu pastikan migrasi tabel `password_reset_tokens`, `jobs`, dan `failed_jobs` telah diterapkan.
+Aktifkan verifikasi dua langkah Google dan gunakan App Password. Konfigurasikan Gmail SMTP dan `QUEUE_CONNECTION=database` pada `.env`, simpan `APP_KEY` dan kredensial dengan aman, lalu terapkan migrasi. `PASSWORD_RESET_URL` tidak diperlukan.
 
 ```powershell
 php artisan config:clear
-php artisan queue:work --tries=3 --backoff=60
+php artisan queue:work --tries=3 --backoff=60 -v
 php artisan queue:failed
 php artisan queue:retry <failed-job-uuid>
 php artisan queue:restart
 ```
 
-Pantau jumlah dan umur baris `jobs` serta `failed_jobs`, dan batasi akses ke tabel tersebut meskipun payload notifikasi reset terenkripsi; lindungi juga APP_KEY. Retry hanya job yang masih relevan: token berlaku 60 menit dan token lama dapat diganti; bila kedaluwarsa, minta pengguna membuat permintaan baru. Setelah deploy jalankan `queue:restart`; pengelola proses yang didukung hosting harus menjalankan ulang worker secara terus-menerus. Lokal, jalankan worker di terminal terpisah. Bila dispatch gagal sebelum job tersimpan, log mencatat kegagalan; minta ulang setelah masalah diperbaiki. Hindari mencatat payload, URL lengkap, kredensial, atau token.
+Pantau antrean dan failed jobs tanpa mencatat payload, OTP, ticket, password, atau kredensial. Payload OTP terenkripsi; batasi akses tabel queue dan `APP_KEY`. Retry job yang masih relevan: job kedaluwarsa atau tergantikan dilewati, dan pengguna dapat meminta kode baru setelah cooldown. Pengiriman email yang sudah berjalan dapat tiba tidak berurutan, tetapi hanya kode terbaru yang berlaku. Worker harus berjalan terus; konfigurasi SMTP dan job yang selesai belum membuktikan penerimaan email.
 
-OTP hanya dikirim melalui mailer bertransport SMTP; transport `log`, failover, dan round-robin ditolak agar isi OTP tidak tercatat. Jangan merekam isi email atau request OTP pada log/telemetry; nonaktifkan debug di produksi. Job yang kedaluwarsa atau sudah diganti tidak dikirim meskipun di-retry. Pengiriman memegang lock user sampai SMTP selesai untuk mencegah job lama terkirim setelah resend; atur timeout SMTP dan worker sesuai operasional dan pantau antrean. Konfigurasi SMTP dan worker bukan bukti email diterima di inbox.
-
-Untuk uji integrasi manual, gunakan akun pengirim dan penerima uji milik pengembang, kirim permintaan forgot, jalankan worker, periksa failed jobs dan inbox, lalu uji tautan pada domain HTTPS yang sudah dikonfigurasi. `Notification::fake`, job yang diproses, penerimaan SMTP, dan email yang masuk inbox merupakan bukti yang berbeda; tidak satu pun membuktikan tahap berikutnya secara otomatis.
+Untuk uji manual gunakan akun uji, minta OTP, jalankan worker, periksa inbox dan selesaikan reset. Penerimaan Gmail nyata dan alur Android tetap perlu diverifikasi terpisah setelah Flutter diimplementasikan.
 
 ### Scheduler
 

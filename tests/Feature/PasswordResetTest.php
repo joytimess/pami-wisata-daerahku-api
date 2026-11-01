@@ -1,18 +1,19 @@
 <?php
 
+use App\Jobs\SendEmailVerificationOtp;
+use App\Jobs\SendPasswordResetOtp;
 use App\Models\User;
-use App\Notifications\QueuedResetPassword;
-use App\Services\AccountService;
 use App\Services\AuthService;
+use App\Services\PasswordResetOtpService;
 use Illuminate\Auth\AuthenticationException;
 use Illuminate\Database\QueryException;
 use Illuminate\Foundation\Testing\RefreshDatabase;
-use Illuminate\Support\Facades\Artisan;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
-use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Notification;
 use Illuminate\Support\Facades\Password;
+use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Str;
 
 uses(RefreshDatabase::class);
@@ -21,37 +22,89 @@ beforeEach(function () {
     config(['api_tokens.secret' => str_repeat('s', 64)]);
 });
 
-it('responds generically and throttles forgot requests while storing only a token hash', function () {
-    Notification::fake();
-    $user = User::factory()->create();
-    $registered = $this->postJson('/api/v1/auth/forgot-password', ['email' => $user->email])->assertOk();
-    $this->postJson('/api/v1/auth/forgot-password', ['email' => 'unknown@example.com'])->assertOk()->assertExactJson($registered->json());
-    $this->postJson('/api/v1/auth/forgot-password', ['email' => $user->email])->assertOk()->assertExactJson($registered->json());
-    Notification::assertSentToTimes($user, QueuedResetPassword::class, 1);
-    $notification = Notification::sent($user, QueuedResetPassword::class)->first();
-    expect(Hash::check($notification->token, DB::table('password_reset_tokens')->where('email', $user->email)->value('token')))->toBeTrue();
+function resetChallenge(?User $user = null): array
+{
+    Queue::fake([SendPasswordResetOtp::class]);
+    $user ??= User::factory()->create();
+    test()->postJson('/api/v1/auth/forgot-password', ['email' => $user->email])->assertOk();
+    Queue::assertPushed(SendPasswordResetOtp::class);
+
+    return [$user, Queue::pushed(SendPasswordResetOtp::class)->last()];
+}
+
+function resetTicket(User $user, string $otp): string
+{
+    $response = test()->postJson('/api/v1/auth/password-reset/verify-otp', ['email' => $user->email, 'otp' => $otp])->assertOk();
+    expect($response->json('data.expires_in_seconds'))->toBe(300)
+        ->and($response->json('data.reset_ticket'))->toBeString();
+
+    return $response->json('data.reset_ticket');
+}
+
+it('acknowledges known and unknown addresses identically and issues protected six digit codes for each role', function () {
+    Queue::fake([SendPasswordResetOtp::class]);
+    foreach ([0, 1, 2] as $role) {
+        $user = User::factory()->create(['role' => $role]);
+        $response = $this->postJson('/api/v1/auth/forgot-password', ['email' => $user->email])->assertOk();
+        $this->postJson('/api/v1/auth/forgot-password', ['email' => "unknown$role@example.org"])->assertOk()->assertExactJson($response->json());
+        $job = Queue::pushed(SendPasswordResetOtp::class)->last();
+        $row = DB::table('password_reset_otps')->where('user_guid', $user->guid)->first();
+        expect($job->otp)->toMatch('/^\d{6}$/')->and($row->digest)->not->toContain($job->otp)
+            ->and($response->getContent())->not->toContain($job->otp)
+            ->and(Carbon::parse($row->expires_at)->diffInSeconds(Carbon::parse($row->sent_at), true))->toEqual(600);
+    }
+    Queue::assertPushed(SendPasswordResetOtp::class, 3);
 });
 
-it('keeps the generic response when notification dispatch fails', function () {
-    $user = User::factory()->create();
-    Notification::shouldReceive('send')->once()->andThrow(new RuntimeException('sensitive failure'));
-    Log::shouldReceive('error')->once()->with('Password reset notification dispatch failed.', ['exception_class' => RuntimeException::class]);
-    $registered = $this->postJson('/api/v1/auth/forgot-password', ['email' => $user->email])->assertOk();
-    $this->postJson('/api/v1/auth/forgot-password', ['email' => 'missing@example.com'])->assertOk()->assertExactJson($registered->json());
+it('rejects malformed, wrong, expired, consumed and exhausted OTPs', function () {
+    [$user, $job] = resetChallenge();
+    $route = '/api/v1/auth/password-reset/verify-otp';
+    foreach ([123456, '12345', 'abcdef'] as $otp) {
+        $this->postJson($route, ['email' => $user->email, 'otp' => $otp])->assertUnprocessable();
+    }
+    $wrong = $job->otp === '000000' ? '000001' : '000000';
+    $unknown = $this->postJson($route, ['email' => 'missing@example.org', 'otp' => $wrong])->assertUnprocessable();
+    for ($i = 0; $i < 5; $i++) {
+        $this->postJson($route, ['email' => $user->email, 'otp' => $wrong])->assertUnprocessable()->assertExactJson($unknown->json());
+    }
+    $this->travel(61)->seconds();
+    $this->postJson($route, ['email' => $user->email, 'otp' => $job->otp])->assertUnprocessable();
+    $this->postJson('/api/v1/auth/password-reset/resend-otp', ['email' => $user->email])->assertOk();
+    $new = Queue::pushed(SendPasswordResetOtp::class)->last();
+    $this->travel(601)->seconds();
+    $this->postJson($route, ['email' => $user->email, 'otp' => $new->otp])->assertUnprocessable();
 });
 
-it('resets once and revokes access, refresh, and device registrations', function () {
-    $user = User::factory()->create();
+it('enforces cooldown and invalidates previous codes and tickets on resend', function () {
+    [$user, $old] = resetChallenge();
+    $route = '/api/v1/auth/password-reset/resend-otp';
+    $known = $this->postJson($route, ['email' => $user->email])->assertOk();
+    $this->postJson($route, ['email' => 'missing@example.org'])->assertOk()->assertExactJson($known->json());
+    Queue::assertPushed(SendPasswordResetOtp::class, 1);
+    $ticket = resetTicket($user, $old->otp);
+    $this->postJson('/api/v1/auth/password-reset/verify-otp', ['email' => $user->email, 'otp' => $old->otp])->assertUnprocessable();
+    $this->travel(61)->seconds();
+    $this->postJson($route, ['email' => $user->email])->assertOk();
+    Queue::assertPushed(SendPasswordResetOtp::class, 2);
+    $new = Queue::pushed(SendPasswordResetOtp::class)->last();
+    $this->postJson('/api/v1/auth/reset-password', ['email' => $user->email, 'reset_ticket' => $ticket, 'password' => 'new-password', 'password_confirmation' => 'new-password'])->assertUnprocessable();
+    $this->postJson('/api/v1/auth/password-reset/verify-otp', ['email' => $user->email, 'otp' => $old->otp])->assertUnprocessable();
+    resetTicket($user, $new->otp);
+});
+
+it('changes password once and revokes access, refresh and device registrations', function () {
+    [$user, $job] = resetChallenge();
     $auth = app(AuthService::class);
     $session = $auth->login(['email' => $user->email, 'password' => 'password']);
     $sid = $auth->authenticate($session['access_token'])[1];
     DB::table('device_tokens')->insert(['guid' => (string) Str::uuid(), 'user_guid' => $user->guid, 'session_guid' => $sid, 'token' => 'device', 'platform' => 'android', 'last_seen_at' => now(), 'created_at' => now(), 'updated_at' => now()]);
-    $token = Password::createToken($user);
-    $payload = ['email' => $user->email, 'token' => $token, 'password' => 'new-password', 'password_confirmation' => 'new-password'];
-    $this->postJson('/api/v1/auth/reset-password', $payload)->assertOk();
-    $this->postJson('/api/v1/auth/reset-password', $payload)->assertUnprocessable();
+    $ticket = resetTicket($user, $job->otp);
+    $data = ['email' => $user->email, 'reset_ticket' => $ticket, 'password' => 'new-password', 'password_confirmation' => 'new-password'];
+    $this->postJson('/api/v1/auth/reset-password', array_merge($data, ['password_confirmation' => 'different']))->assertUnprocessable();
+    $response = $this->postJson('/api/v1/auth/reset-password', $data)->assertOk();
+    expect($response->json('data'))->not->toHaveKey('access_token');
+    $this->postJson('/api/v1/auth/reset-password', $data)->assertUnprocessable();
     expect(Hash::check('new-password', $user->fresh()->password))->toBeTrue()
-        ->and(DB::table('password_reset_tokens')->where('email', $user->email)->exists())->toBeFalse()
         ->and(DB::table('device_tokens')->where('user_guid', $user->guid)->exists())->toBeFalse();
     expect(fn () => $auth->authenticate($session['access_token']))->toThrow(AuthenticationException::class);
     expect(fn () => $auth->refresh($session['refresh_token']))->toThrow(AuthenticationException::class);
@@ -59,78 +112,74 @@ it('resets once and revokes access, refresh, and device registrations', function
     expect($auth->login(['email' => $user->email, 'password' => 'new-password']))->toHaveKey('access_token');
 });
 
-it('rejects invalid and expired tokens without changing password or sessions', function () {
-    $user = User::factory()->create();
-    $auth = app(AuthService::class);
-    $session = $auth->login(['email' => $user->email, 'password' => 'password']);
-    $token = Password::createToken($user);
-    $payload = ['email' => $user->email, 'token' => 'invalid', 'password' => 'new-password', 'password_confirmation' => 'new-password'];
-    $invalid = $this->postJson('/api/v1/auth/reset-password', $payload)->assertUnprocessable();
-    $this->postJson('/api/v1/auth/reset-password', array_merge($payload, ['email' => 'missing@example.com']))
-        ->assertUnprocessable()->assertExactJson($invalid->json());
-    DB::table('password_reset_tokens')->where('email', $user->email)->update(['created_at' => now()->subMinutes(61)]);
-    $payload['token'] = $token;
-    $this->postJson('/api/v1/auth/reset-password', $payload)->assertUnprocessable();
-    expect(Hash::check('password', $user->fresh()->password))->toBeTrue()
-        ->and($auth->authenticate($session['access_token'])[0]->guid)->toBe($user->guid);
+it('rejects expired tickets and former broker reset tokens', function () {
+    [$user, $job] = resetChallenge();
+    $legacy = Password::createToken($user);
+    $this->postJson('/api/v1/auth/reset-password', ['email' => $user->email, 'token' => $legacy, 'password' => 'new-password', 'password_confirmation' => 'new-password'])->assertUnprocessable();
+    $ticket = resetTicket($user, $job->otp);
+    $this->travel(301)->seconds();
+    $this->postJson('/api/v1/auth/reset-password', ['email' => $user->email, 'reset_ticket' => $ticket, 'password' => 'new-password', 'password_confirmation' => 'new-password'])->assertUnprocessable();
+    expect(Hash::check('password', $user->fresh()->password))->toBeTrue();
 });
 
-it('encrypts queued password reset notification payloads', function () {
-    config(['queue.default' => 'database']);
+it('does not deliver stale jobs and encrypts queue payloads and failures', function () {
+    [$user, $old] = resetChallenge();
+    Notification::fake();
+    $this->travel(61)->seconds();
+    $this->postJson('/api/v1/auth/password-reset/resend-otp', ['email' => $user->email])->assertOk();
+    $old->handle();
+    Notification::assertNothingSent();
+});
+
+it('encrypts queue payloads and rejects insecure transports without leaking OTP in failed jobs', function () {
+    config(['queue.default' => 'database', 'mail.default' => 'log']);
     $user = User::factory()->create();
-    $token = 'sensitive-reset-token';
-    $user->sendPasswordResetNotification($token);
+    SendPasswordResetOtp::dispatch($user->guid, 'test-issuance', '012345');
     $payload = DB::table('jobs')->value('payload');
-    expect($payload)->toBeString()->not->toContain($token);
+    expect($payload)->not->toContain('012345');
 });
-
-it('processes queued notifications and records failures without exposing tokens', function () {
-    config(['queue.default' => 'database', 'api_tokens.password_reset_url' => 'https://client.example.org/reset-password']);
+it('does not dispatch after rollback and never stores plaintext in queue failures', function () {
+    config(['queue.default' => 'database', 'mail.default' => 'log']);
     $user = User::factory()->create();
-    $user->sendPasswordResetNotification('valid-test-token');
-    Artisan::call('queue:work', ['connection' => 'database', '--once' => true, '--tries' => 1]);
-    expect(DB::table('jobs')->count())->toBe(0)->and(DB::table('failed_jobs')->count())->toBe(0);
-
-    config(['api_tokens.password_reset_url' => 'http://invalid.example.org']);
-    $user->sendPasswordResetNotification('sensitive-failed-token');
-    Artisan::call('queue:work', ['connection' => 'database', '--once' => true, '--tries' => 1]);
-    expect(DB::table('jobs')->count())->toBe(0)
-        ->and(DB::table('failed_jobs')->count())->toBe(1)
-        ->and(DB::table('failed_jobs')->value('payload'))->not->toContain('sensitive-failed-token');
-
-    config(['api_tokens.password_reset_url' => 'https://client.example.org/reset-password']);
-    Artisan::call('queue:retry', ['id' => [DB::table('failed_jobs')->value('uuid')]]);
-    Artisan::call('queue:work', ['connection' => 'database', '--once' => true, '--tries' => 1]);
-    expect(DB::table('jobs')->count())->toBe(0)->and(DB::table('failed_jobs')->count())->toBe(0);
-});
-
-it('rolls back all changes if token consumption fails', function () {
-    if (DB::getDriverName() !== 'sqlite') {
-        $this->markTestSkipped('SQLite trigger injection only; MySQL DDL would commit the test transaction.');
+    DB::beginTransaction();
+    try {
+        app(PasswordResetOtpService::class)->issue($user->email);
+        expect(DB::table('jobs')->count())->toBe(0);
+    } finally {
+        DB::rollBack();
     }
-    $user = User::factory()->create();
+    expect(DB::table('password_reset_otps')->where('user_guid', $user->guid)->exists())->toBeFalse()
+        ->and(DB::table('jobs')->count())->toBe(0);
+
+    app(PasswordResetOtpService::class)->issue($user->email);
+    $payload = DB::table('jobs')->value('payload');
+    $command = json_decode($payload, true, 512, JSON_THROW_ON_ERROR)['data']['command'];
+    $job = unserialize(Crypt::decrypt($command));
+    expect($payload)->not->toContain($job->otp);
+    Artisan::call('queue:work', ['connection' => 'database', '--once' => true, '--tries' => 1]);
+    $failed = DB::table('failed_jobs')->first();
+    expect($failed)->not->toBeNull()->and($failed->payload)->not->toContain($job->otp)->and($failed->exception)->not->toContain($job->otp);
+});
+
+it('does not accept a registration OTP for a password reset', function () {
+    Queue::fake([SendEmailVerificationOtp::class, SendPasswordResetOtp::class]);
+    $this->postJson('/api/v1/auth/register', ['name' => 'User', 'email' => 'registration@example.org', 'password' => 'password123', 'password_confirmation' => 'password123'])->assertSuccessful();
+    $registration = Queue::pushed(SendEmailVerificationOtp::class)->first();
+    Queue::assertPushed(SendEmailVerificationOtp::class);
+    $this->postJson('/api/v1/auth/password-reset/verify-otp', ['email' => 'registration@example.org', 'otp' => $registration->otp])->assertUnprocessable();
+});
+it('rolls back ticket consumption and sessions when changing the password fails', function () {
+    [$user, $job] = resetChallenge();
     $auth = app(AuthService::class);
     $session = $auth->login(['email' => $user->email, 'password' => 'password']);
-    $token = Password::createToken($user);
-    DB::statement("CREATE TRIGGER prevent_reset_delete BEFORE DELETE ON password_reset_tokens BEGIN SELECT RAISE(ABORT, 'injected failure'); END");
+    $ticket = resetTicket($user, $job->otp);
+    DB::statement("CREATE TRIGGER fail_password_reset BEFORE UPDATE OF password ON users BEGIN SELECT RAISE(ABORT, 'injected failure'); END");
     try {
-        expect(fn () => app(AccountService::class)->reset(['email' => $user->email, 'token' => $token, 'password' => 'new-password']))->toThrow(QueryException::class);
+        expect(fn () => app(PasswordResetOtpService::class)->reset(['email' => $user->email, 'reset_ticket' => $ticket, 'password' => 'new-password']))->toThrow(QueryException::class);
     } finally {
-        DB::statement('DROP TRIGGER prevent_reset_delete');
+        DB::statement('DROP TRIGGER fail_password_reset');
     }
     expect(Hash::check('password', $user->fresh()->password))->toBeTrue()
-        ->and(Password::tokenExists($user, $token))->toBeTrue()
         ->and($auth->authenticate($session['access_token'])[0]->guid)->toBe($user->guid);
-});
-
-it('encodes link parameters and rejects unsafe configured URLs', function () {
-    $user = User::factory()->make(['email' => 'plus+test@example.com']);
-    $notification = new QueuedResetPassword('token+value');
-    config(['api_tokens.password_reset_url' => 'https://client.example.org/reset-password']);
-    $mail = $notification->toMail($user);
-    expect($mail->actionUrl)->toBe('https://client.example.org/reset-password?token=token%2Bvalue&email=plus%2Btest%40example.com');
-    foreach (['http://client.example.org/reset-password', 'https://YOUR-HTTPS-CLIENT-DOMAIN/reset-password', 'https://client.example.org/reset?token=x', 'https://client.example.org/reset#fragment'] as $url) {
-        config(['api_tokens.password_reset_url' => $url]);
-        expect(fn () => $notification->toMail($user))->toThrow(RuntimeException::class);
-    }
+    $this->postJson('/api/v1/auth/reset-password', ['email' => $user->email, 'reset_ticket' => $ticket, 'password' => 'new-password', 'password_confirmation' => 'new-password'])->assertOk();
 });

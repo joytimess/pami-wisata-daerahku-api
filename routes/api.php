@@ -12,6 +12,7 @@ use App\Http\Controllers\Api\V1\InboxController;
 use App\Http\Controllers\Api\V1\QuotaController;
 use App\Http\Controllers\Api\V1\VisitController;
 use App\Http\Middleware\AuthenticateApiToken;
+use App\Http\Middleware\ThrottlePasswordReset;
 use Illuminate\Support\Facades\Route;
 
 Route::prefix('v1')->group(function () {
@@ -22,8 +23,10 @@ Route::prefix('v1')->group(function () {
         Route::post('auth/login', [AuthController::class, 'login']);
         Route::post('auth/google', [AuthController::class, 'google']);
         Route::post('auth/refresh', [AuthController::class, 'refresh']);
-        Route::post('auth/forgot-password', [AccountController::class, 'forgot']);
-        Route::post('auth/reset-password', [AccountController::class, 'reset']);
+        Route::post('auth/forgot-password', [AccountController::class, 'forgot'])->middleware(ThrottlePasswordReset::class);
+        Route::post('auth/password-reset/resend-otp', [AccountController::class, 'forgot'])->middleware(ThrottlePasswordReset::class);
+        Route::post('auth/password-reset/verify-otp', [AccountController::class, 'verifyPasswordResetOtp'])->middleware(ThrottlePasswordReset::class);
+        Route::post('auth/reset-password', [AccountController::class, 'reset'])->middleware(ThrottlePasswordReset::class);
     });
     Route::get('auth/email/verify/{id}/{hash}', [AccountController::class, 'verify'])->middleware(['signed', 'throttle:6,1'])->name('verification.verify');
     Route::get('categories', [CategoryController::class, 'index'])->name('categories.index');

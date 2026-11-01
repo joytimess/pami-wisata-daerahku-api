@@ -5,14 +5,9 @@ namespace App\Services;
 use App\Models\User;
 use Illuminate\Auth\Access\AuthorizationException;
 use Illuminate\Auth\AuthenticationException;
-use Illuminate\Auth\Events\PasswordReset;
 use Illuminate\Auth\Events\Verified;
-use Illuminate\Auth\Passwords\DatabaseTokenRepository;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
-use Illuminate\Support\Facades\Log;
-use Illuminate\Support\Facades\Password;
-use Illuminate\Support\Str;
 use Illuminate\Validation\ValidationException;
 use Kreait\Firebase\JWT\IdTokenVerifier;
 
@@ -53,23 +48,6 @@ class AccountService
         }
     }
 
-    public function forgot(string $email): void
-    {
-        $this->assertPasswordBrokerConnection();
-        DB::transaction(function () use ($email) {
-            User::where('email', $email)->lockForUpdate()->first();
-            Password::sendResetLink(['email' => $email], function (User $user, string $token) {
-                DB::afterCommit(function () use ($user, $token) {
-                    try {
-                        $user->sendPasswordResetNotification($token);
-                    } catch (\Throwable $exception) {
-                        Log::error('Password reset notification dispatch failed.', ['exception_class' => $exception::class]);
-                    }
-                });
-            });
-        }, 3);
-    }
-
     public function close(User $user, array $data): void
     {
         $subject = null;
@@ -108,34 +86,5 @@ class AccountService
             DB::table('refresh_tokens')->where('user_guid', $user->guid)->whereNull('revoked_at')->update(['revoked_at' => now(), 'updated_at' => now()]);
             DB::table('device_tokens')->where('user_guid', $user->guid)->delete();
         }, 3);
-    }
-
-    public function reset(array $data): void
-    {
-        $this->assertPasswordBrokerConnection();
-        $result = DB::transaction(function () use ($data) {
-            User::where('email', $data['email'])->lockForUpdate()->first();
-
-            return Password::reset($data, function (User $user, string $password) {
-                $user->forceFill(['password' => $password, 'remember_token' => Str::random(60)])->save();
-                DB::table('refresh_tokens')->where('user_guid', $user->guid)->whereNull('revoked_at')->update(['revoked_at' => now(), 'updated_at' => now()]);
-                DB::table('device_tokens')->where('user_guid', $user->guid)->delete();
-                DB::afterCommit(fn () => event(new PasswordReset($user)));
-            });
-        }, 3);
-        if ($result !== Password::PASSWORD_RESET) {
-            throw ValidationException::withMessages(['email' => [__(Password::INVALID_TOKEN)]]);
-        }
-    }
-
-    private function assertPasswordBrokerConnection(): void
-    {
-        $repository = Password::broker()->getRepository();
-        $userConnection = (new User)->getConnection();
-        if (! $repository instanceof DatabaseTokenRepository
-            || $repository->getConnection() !== $userConnection
-            || DB::connection() !== $userConnection) {
-            throw new \RuntimeException('Password reset requires a shared database connection.');
-        }
     }
 }

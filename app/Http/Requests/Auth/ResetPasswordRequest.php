@@ -13,6 +13,6 @@ class ResetPasswordRequest extends FormRequest
 
     public function rules(): array
     {
-        return ['email' => ['required', 'email', 'max:255'], 'token' => ['required', 'string'], 'password' => ['required', 'string', 'min:8', 'confirmed']];
+        return ['email' => ['required', 'email', 'max:255'], 'reset_ticket' => ['required', 'string', 'size:64'], 'password' => ['required', 'string', 'min:8', 'confirmed']];
     }
 }
