@@ -30,9 +30,9 @@ class AuthService
     {
         return DB::transaction(function () use ($data) {
             $user = User::create(['name' => $data['name'], 'email' => $data['email'], 'password' => $data['password']]);
-            $user->sendEmailVerificationNotification();
+            app(EmailVerificationOtpService::class)->issue($user);
 
-            return $this->newSession($user, $data['device_name'] ?? null);
+            return $this->newSession($user, $data['device_name'] ?? null) + ['verification_required' => true];
         }, 3);
     }
 

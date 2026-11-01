@@ -17,6 +17,8 @@ use Illuminate\Support\Facades\Route;
 Route::prefix('v1')->group(function () {
     Route::middleware('throttle:10,1')->group(function () {
         Route::post('auth/register', [AuthController::class, 'register']);
+        Route::post('auth/email-verification/verify-otp', [AccountController::class, 'verifyOtp'])->middleware('throttle:verification-otp');
+        Route::post('auth/email-verification/resend-otp', [AccountController::class, 'resendOtp'])->middleware('throttle:verification-otp');
         Route::post('auth/login', [AuthController::class, 'login']);
         Route::post('auth/google', [AuthController::class, 'google']);
         Route::post('auth/refresh', [AuthController::class, 'refresh']);

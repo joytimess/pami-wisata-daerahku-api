@@ -14,6 +14,9 @@ class AuthenticateApiToken
     public function handle(Request $request, Closure $next): mixed
     {
         [$user, $session] = $this->auth->authenticate($request->bearerToken());
+        if ($user->role === 0 && ! $user->hasVerifiedEmail() && ! $request->is('api/v1/auth/me', 'api/v1/auth/logout', 'api/v1/auth/email/verification-notification')) {
+            abort(403, 'Email verification required.');
+        }
         Auth::setUser($user);
         $request->setUserResolver(fn () => $user);
         $request->attributes->set('api_session_guid', $session);

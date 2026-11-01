@@ -8,6 +8,8 @@ use App\Services\VisitService;
 use App\Support\BookingRules;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Facades\Password;
 use Illuminate\Support\Str;
 use Symfony\Component\Process\Process;
 
@@ -25,7 +27,7 @@ beforeEach(function () {
 });
 
 /** Starts every job, waits until all have booted, releases them together, returns decoded results. */
-function runConcurrently(array $jobs): array
+function runConcurrently(array $jobs, ?Closure $afterStart = null): array
 {
     $dir = sys_get_temp_dir().DIRECTORY_SEPARATOR.'wisata-conc-'.Str::random(8);
     mkdir($dir);
@@ -42,6 +44,9 @@ function runConcurrently(array $jobs): array
         usleep(20000);
     }
     touch($go);
+    if ($afterStart) {
+        $afterStart();
+    }
     $results = [];
     foreach ($processes as $i => $process) {
         $process->wait();
@@ -54,6 +59,42 @@ function runConcurrently(array $jobs): array
 
     return $results;
 }
+
+it('consumes a reset token exactly once under concurrent requests', function () {
+    for ($round = 0; $round < 3; $round++) {
+        $user = User::factory()->create();
+        $token = Password::createToken($user);
+        $jobs = [];
+        foreach (['first-password', 'second-password'] as $password) {
+            $jobs[] = ['action' => 'reset-password', 'user' => $user->guid, 'payload' => ['email' => $user->email, 'token' => $token, 'password' => $password]];
+        }
+        DB::beginTransaction();
+        User::whereKey($user->guid)->lockForUpdate()->firstOrFail();
+        try {
+            $results = runConcurrently($jobs, function () use ($user) {
+                $deadline = microtime(true) + 15;
+                do {
+                    $waiting = DB::selectOne("SELECT COUNT(*) AS total FROM information_schema.processlist WHERE ID <> CONNECTION_ID() AND INFO LIKE '%users%for update%' AND INFO LIKE ?", ['%'.$user->email.'%'])->total;
+                    if ($waiting >= 2) {
+                        break;
+                    }
+                    usleep(20000);
+                } while (microtime(true) < $deadline);
+                DB::commit();
+                expect($waiting)->toBeGreaterThanOrEqual(2, 'Both worker queries must reach the held user lock.');
+            });
+        } finally {
+            if (DB::transactionLevel()) {
+                DB::rollBack();
+            }
+        }
+        expect(array_column($results, 'ok'))->toContain(true)->toContain(false)
+            ->and($results[0]['ok'] !== $results[1]['ok'])->toBeTrue()
+            ->and($results[$results[0]['ok'] ? 1 : 0]['class'])->toBe('ValidationException')
+            ->and(Hash::check($jobs[$results[0]['ok'] ? 0 : 1]['payload']['password'], $user->fresh()->password))->toBeTrue()
+            ->and(DB::table('password_reset_tokens')->where('email', $user->email)->exists())->toBeFalse();
+    }
+});
 
 function mysqlSeed(int $capacity, int $price = 0): array
 {

@@ -9,6 +9,7 @@
 
 use App\Models\Destination;
 use App\Models\User;
+use App\Services\AccountService;
 use App\Services\BookingService;
 use App\Services\QuotaService;
 use App\Services\VisitService;
@@ -41,6 +42,7 @@ try {
         'quota' => app(QuotaService::class)->upsert(Destination::findOrFail($job['destination']), $job['fields']),
         'check-in' => app(VisitService::class)->checkIn($user, $job['guid']),
         'review' => app(VisitService::class)->review($user, $job['guid'], $job['fields']),
+        'reset-password' => app(AccountService::class)->reset($job['payload']),
     };
     echo json_encode(['ok' => true, 'guid' => $result->guid ?? null, 'status' => $result->status ?? null, 'capacity' => $result->capacity ?? null]);
 } catch (Throwable $e) {
