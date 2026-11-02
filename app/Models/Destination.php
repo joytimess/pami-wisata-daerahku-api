@@ -15,13 +15,15 @@ class Destination extends Model
 
     protected $primaryKey = 'guid';
 
+    protected $with = ['images'];
+
     protected $attributes = ['is_active' => true, 'currency' => 'IDR'];
 
     protected $fillable = ['destination_category_guid', 'name', 'location', 'description', 'ticket_price', 'currency', 'opening_hours', 'timezone', 'image_path', 'is_active'];
 
     protected function casts(): array
     {
-        return ['is_active' => 'boolean', 'ticket_price' => 'integer'];
+        return ['is_active' => 'boolean', 'ticket_price' => 'integer', 'gallery_version' => 'integer'];
     }
 
     public function newUniqueId(): string
@@ -32,6 +34,11 @@ class Destination extends Model
     public function category(): BelongsTo
     {
         return $this->belongsTo(DestinationCategory::class, 'destination_category_guid', 'guid');
+    }
+
+    public function images(): HasMany
+    {
+        return $this->hasMany(DestinationImage::class, 'destination_guid', 'guid')->orderBy('sequence');
     }
 
     public function reviews(): HasMany

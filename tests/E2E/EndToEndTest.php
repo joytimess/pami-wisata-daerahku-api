@@ -7,6 +7,8 @@ use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Schema;
+use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Str;
 use Symfony\Component\Process\Process;
 
 /*
@@ -31,6 +33,17 @@ beforeEach(function () {
 
 // The server writes real files (images, PDFs) to the project disk; remove what these tests created.
 afterEach(function () {
+    if (config('database.default') !== 'mysql' || ! str_ends_with((string) config('database.connections.mysql.database'), '_e2e')) {
+        return;
+    }
+    if (Schema::hasTable('destination_images')) {
+        foreach (DB::table('destination_images')->get() as $image) {
+            Storage::disk($image->storage_disk)->delete([$image->thumbnail_path, $image->display_path, $image->fullscreen_path]);
+        }
+        foreach (DB::table('destination_image_cleanups')->get() as $cleanup) {
+            Storage::disk($cleanup->storage_disk)->delete($cleanup->path);
+        }
+    }
     foreach ([['destinations', 'image_path'], ['invoices', 'pdf_path'], ['tickets', 'pdf_path']] as [$table, $column]) {
         if (! Schema::hasTable($table)) {
             continue;
@@ -72,7 +85,7 @@ function e2eQuota(string $token, string $destination, string $date, int $capacit
 
 function e2eDestination(string $adminToken, string $categoryGuid, int $price = 0, string $name = 'Pantai E2E'): string
 {
-    $response = e2e($adminToken)->post('destinations', [
+    $response = e2e($adminToken)->withHeaders(['Idempotency-Key' => (string) Str::uuid()])->attach('image', tinyPng(), 'destination.png')->post('destinations', [
         'destination_category_guid' => $categoryGuid, 'name' => $name, 'location' => 'Bali', 'description' => 'Indah',
         'ticket_price' => $price, 'opening_hours' => '08:00-17:00', 'timezone' => 'Asia/Makassar',
     ]);
@@ -251,11 +264,12 @@ it('Scenario C: administration to catalog to booking to deactivation stays consi
     $categoryGuid = $category->json('data.guid');
     $destination = e2eDestination($adminToken, $categoryGuid, 0, 'Candi E2E');
 
-    $upload = e2e($adminToken)->attach('image', tinyPng(), 'candi.png')->post("destinations/{$destination}/image");
+    $version = e2e($adminToken)->get("admin/destinations/{$destination}")->json('data.gallery_version');
+    $upload = e2e($adminToken)->withHeaders(['Idempotency-Key' => (string) Str::uuid()])->attach('image', tinyPng(), 'candi.png')->post("destinations/{$destination}/image", ['gallery_version' => $version]);
     expect($upload->status())->toBe(200)->and($upload->json('data.has_image'))->toBeTrue();
     $imageUrl = $upload->json('data.image_url');
-    expect($imageUrl)->toStartWith("destinations/{$destination}/image?v=")->and($upload->json('data'))->not->toHaveKey('image_path');
-    $bad = e2e($adminToken)->attach('image', 'not an image', 'x.png')->post("destinations/{$destination}/image");
+    expect($imageUrl)->toBe($upload->json('data.images.0.urls.display'))->and($upload->json('data'))->not->toHaveKey('image_path');
+    $bad = e2e($adminToken)->withHeaders(['Idempotency-Key' => (string) Str::uuid()])->attach('image', 'not an image', 'x.png')->post("destinations/{$destination}/image", ['gallery_version' => $upload->json('data.gallery_version')]);
     expect($bad->status())->toBe(422);
 
     $date = now()->addDays(7)->toDateString();
@@ -266,17 +280,19 @@ it('Scenario C: administration to catalog to booking to deactivation stays consi
     expect($entry['name'])->toBe('Candi E2E');
     // The user loads the picture through the API base URL, not through a storage path.
     $image = e2e()->get($entry['image_url']);
-    expect($image->status())->toBe(200)->and($image->header('Content-Type'))->toBe('image/png');
-    expect(strlen($image->body()))->toBe(strlen(tinyPng()));
+    expect($image->status())->toBe(200)->and($image->header('Content-Type'))->toBe('image/webp');
+    $dimensions = getimagesizefromstring($image->body());
+    expect([$dimensions[0], $dimensions[1]])->toBe([1, 1]);
 
     $booking = e2e($userToken)->withHeaders(['Idempotency-Key' => 'c-1'])->post('bookings', ['destination_guid' => $destination, 'visit_date' => $date, 'quantity' => 2, 'visitor_name' => 'V', 'visitor_email' => 'v@example.org', 'visitor_phone' => '+6281234567890']);
     expect($booking->status())->toBe(200);
     $guid = $booking->json('data.guid');
     expect(e2e($adminToken)->post("admin/bookings/{$guid}/approve")->json('data.status'))->toBe('confirmed');
 
-    // Replace the image: the new URL is versioned and the old file is gone.
-    $replace = e2e($adminToken)->attach('image', tinyPng(), 'baru.png')->post("destinations/{$destination}", ['_method' => 'PATCH', 'name' => 'Candi E2E Baru']);
+    // Replacement returns a new immutable image URL; physical cleanup runs after commit.
+    $replace = e2e($adminToken)->withHeaders(['Idempotency-Key' => (string) Str::uuid()])->attach('image', tinyPng(), 'baru.png')->post("destinations/{$destination}", ['_method' => 'PATCH', 'name' => 'Candi E2E Baru', 'gallery_version' => $upload->json('data.gallery_version')]);
     expect($replace->status())->toBe(200)->and($replace->json('data.name'))->toBe('Candi E2E Baru');
+    expect($replace->json('data.image_url'))->not->toBe($imageUrl);
     expect(e2e()->get($replace->json('data.image_url'))->status())->toBe(200);
     expect(e2e($userToken)->get("destinations/{$destination}")->json('data.name'))->toBe('Candi E2E Baru');
 

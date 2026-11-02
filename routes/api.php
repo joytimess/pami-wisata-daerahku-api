@@ -34,6 +34,7 @@ Route::prefix('v1')->group(function () {
     Route::get('destinations', [DestinationController::class, 'index'])->name('destinations.index');
     Route::get('destinations/{destination}', [DestinationController::class, 'show'])->name('destinations.show');
     Route::get('destinations/{destination}/reviews', [VisitController::class, 'destinationReviews'])->name('destinations.reviews');
+    Route::get('destinations/{destination}/images/{image}/{variant}', [DestinationController::class, 'galleryImage'])->whereIn('variant', ['thumbnail', 'display', 'fullscreen'])->name('destinations.gallery.image');
     Route::get('destinations/{destination}/image', [DestinationController::class, 'image'])->name('destinations.image');
     Route::middleware(AuthenticateApiToken::class)->group(function () {
         Route::get('facilities', [FacilityController::class, 'index'])->name('facilities.index');
@@ -53,14 +54,15 @@ Route::prefix('v1')->group(function () {
         Route::post('categories', [CategoryController::class, 'store'])->name('categories.store');
         Route::patch('categories/{category}', [CategoryController::class, 'update'])->name('categories.update');
         Route::delete('categories/{category}', [CategoryController::class, 'destroy'])->name('categories.destroy');
-        Route::post('destinations', [DestinationController::class, 'store'])->name('destinations.store');
-        Route::patch('destinations/{destination}', [DestinationController::class, 'update'])->name('destinations.update');
+        Route::post('destinations', [DestinationController::class, 'store'])->middleware('throttle:20,1')->name('destinations.store');
+        Route::patch('destinations/{destination}', [DestinationController::class, 'update'])->middleware('throttle:20,1')->name('destinations.update');
         Route::delete('destinations/{destination}', [DestinationController::class, 'destroy'])->name('destinations.destroy');
         Route::get('admin/categories', [CategoryController::class, 'adminIndex'])->name('admin.categories.index');
         Route::get('admin/destinations', [DestinationController::class, 'adminIndex'])->name('admin.destinations.index');
         Route::get('admin/destinations/{destination}', [DestinationController::class, 'adminShow'])->name('admin.destinations.show');
+        Route::get('admin/destinations/{destination}/images/{image}/{variant}', [DestinationController::class, 'galleryImage'])->whereIn('variant', ['thumbnail', 'display', 'fullscreen'])->name('admin.destinations.gallery.image');
         Route::get('admin/destinations/{destination}/image', [DestinationController::class, 'image'])->name('destinations.image.admin');
-        Route::post('destinations/{destination}/image', [DestinationController::class, 'updateImage'])->name('destinations.image.update');
+        Route::post('destinations/{destination}/image', [DestinationController::class, 'updateImage'])->middleware('throttle:20,1')->name('destinations.image.update');
         Route::get('destinations/{destination}/availability', [QuotaController::class, 'availability'])->name('destinations.availability');
         Route::get('destinations/{destination}/quotas', [QuotaController::class, 'index']);
         Route::put('destinations/{destination}/quotas', [QuotaController::class, 'upsert']);

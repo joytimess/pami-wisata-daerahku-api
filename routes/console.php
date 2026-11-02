@@ -11,3 +11,5 @@ Artisan::command('inspire', function () {
 Schedule::command('bookings:expire')->everyMinute();
 Schedule::command('notifications:dispatch')->everyMinute();
 Schedule::command('documents:dispatch')->everyMinute();
+
+Schedule::command('destinations:cleanup-images')->everyMinute()->withoutOverlapping();

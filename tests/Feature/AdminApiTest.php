@@ -4,17 +4,20 @@ use App\Models\Destination;
 use App\Models\DestinationCategory;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Http\UploadedFile;
+use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Str;
 
 uses(RefreshDatabase::class);
 
 function destinationFields(DestinationCategory $category, array $over = []): array
 {
-    return $over + ['destination_category_guid' => $category->guid, 'name' => 'Pantai Baru', 'location' => 'Bali', 'description' => 'Indah', 'ticket_price' => 15000, 'opening_hours' => '08:00-17:00', 'timezone' => 'Asia/Makassar'];
+    return $over + ['destination_category_guid' => $category->guid, 'name' => 'Pantai Baru', 'location' => 'Bali', 'description' => 'Indah', 'ticket_price' => 15000, 'opening_hours' => '08:00-17:00', 'timezone' => 'Asia/Makassar', 'image' => UploadedFile::fake()->image('destination.png'), 'operation_key' => (string) Str::uuid()];
 }
 
 it('manages categories with role 2 only and protects categories in use', function () {
+    Storage::fake('local');
     $super = makeUser(2);
     $admin = makeUser(1);
     $this->postJson('/api/v1/categories', ['name' => 'Alam', 'slug' => 'alam'], bearer($admin))->assertForbidden();
@@ -43,6 +46,7 @@ it('manages categories with role 2 only and protects categories in use', functio
 });
 
 it('creates, updates, deactivates and reactivates destinations with the full contract', function () {
+    Storage::fake('local');
     $admin = makeUser(1);
     $user = makeUser();
     $category = DestinationCategory::create(['name' => 'Alam', 'slug' => 'alam']);
@@ -53,7 +57,7 @@ it('creates, updates, deactivates and reactivates destinations with the full con
     $this->postJson('/api/v1/destinations', $body, bearer($admin))->assertUnprocessable()->assertJsonValidationErrors('timezone');
 
     $guid = $this->postJson('/api/v1/destinations', destinationFields($category), bearer($admin))->assertCreated()
-        ->assertJsonPath('data.timezone', 'Asia/Makassar')->assertJsonPath('data.has_image', false)->assertJsonPath('data.image_url', null)->json('data.guid');
+        ->assertJsonPath('data.timezone', 'Asia/Makassar')->assertJsonPath('data.has_image', true)->assertJsonCount(1, 'data.images')->json('data.guid');
     $this->patchJson("/api/v1/destinations/{$guid}", ['name' => 'Pantai Lama', 'ticket_price' => 0], bearer($admin))->assertOk();
     $this->getJson("/api/v1/destinations/{$guid}")->assertOk()->assertJsonPath('data.name', 'Pantai Lama');
 
@@ -82,23 +86,26 @@ it('serves destination images through an authorized media endpoint and replaces 
     $this->post("/api/v1/destinations/{$guid}/image", ['image' => UploadedFile::fake()->image('big.jpg')->size(5121)], bearer($admin) + ['Accept' => 'application/json'])->assertUnprocessable();
     $this->post("/api/v1/destinations/{$guid}/image", [], bearer($admin) + ['Accept' => 'application/json'])->assertUnprocessable();
 
-    $first = $this->post("/api/v1/destinations/{$guid}/image", ['image' => UploadedFile::fake()->image('a.png')], bearer($admin) + ['Accept' => 'application/json'])
+    $first = $this->post("/api/v1/destinations/{$guid}/image", ['image' => UploadedFile::fake()->image('a.png'), 'gallery_version' => Destination::find($guid)->gallery_version], bearer($admin) + ['Accept' => 'application/json', 'Idempotency-Key' => (string) Str::uuid()])
         ->assertOk()->assertJsonPath('data.has_image', true);
-    expect($first->json('data.image_url'))->toStartWith("destinations/{$guid}/image?v=")->not->toContain('destinations/'.basename(Destination::find($guid)->image_path));
+    expect($first->json('data.image_url'))->toBe($first->json('data.images.0.urls.display'))->not->toContain('destination-gallery/');
     $oldPath = Destination::find($guid)->image_path;
     Storage::disk('local')->assertExists($oldPath);
 
-    $this->get("/api/v1/destinations/{$guid}/image")->assertOk()->assertHeader('Content-Type', 'image/png');
-    $this->post("/api/v1/destinations/{$guid}/image", ['image' => UploadedFile::fake()->image('b.webp')], bearer($admin) + ['Accept' => 'application/json'])->assertOk();
+    $this->get("/api/v1/destinations/{$guid}/image")->assertOk()->assertHeader('Content-Type', 'image/webp');
+    $this->post("/api/v1/destinations/{$guid}/image", ['image' => UploadedFile::fake()->image('b.webp'), 'gallery_version' => Destination::find($guid)->gallery_version], bearer($admin) + ['Accept' => 'application/json', 'Idempotency-Key' => (string) Str::uuid()])->assertOk();
     $newPath = Destination::find($guid)->image_path;
     expect($newPath)->not->toBe($oldPath);
+    Storage::disk('local')->assertExists($oldPath);
+    Artisan::call('destinations:cleanup-images');
     Storage::disk('local')->assertMissing($oldPath);
     Storage::disk('local')->assertExists($newPath);
     $this->get("/api/v1/destinations/{$guid}/image")->assertOk();
 
     // Multipart edit through method spoofing keeps working for combined field + image updates.
-    $this->post("/api/v1/destinations/{$guid}", ['_method' => 'PATCH', 'name' => 'Edited', 'image' => UploadedFile::fake()->image('c.jpg')], bearer($admin) + ['Accept' => 'application/json'])
+    $this->post("/api/v1/destinations/{$guid}", ['_method' => 'PATCH', 'name' => 'Edited', 'image' => UploadedFile::fake()->image('c.jpg'), 'gallery_version' => Destination::find($guid)->gallery_version], bearer($admin) + ['Accept' => 'application/json', 'Idempotency-Key' => (string) Str::uuid()])
         ->assertOk()->assertJsonPath('data.name', 'Edited');
+    Artisan::call('destinations:cleanup-images');
     Storage::disk('local')->assertMissing($newPath);
 
     $this->deleteJson("/api/v1/destinations/{$guid}", [], bearer($admin))->assertOk();

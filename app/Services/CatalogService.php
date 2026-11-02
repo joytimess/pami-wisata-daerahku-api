@@ -45,7 +45,7 @@ class CatalogService
 
     public function destinations(array $filters)
     {
-        $query = Destination::with(['category', 'activeFacilities'])->withCount('reviews as rating_count')->withAvg('reviews as rating_average', 'rating')->where('is_active', true)->whereHas('category', fn ($q) => $q->where('is_active', true));
+        $query = Destination::with(['category', 'activeFacilities', 'images'])->withCount('reviews as rating_count')->withAvg('reviews as rating_average', 'rating')->where('is_active', true)->whereHas('category', fn ($q) => $q->where('is_active', true));
         $this->applyFilters($query, $filters);
 
         return $query->paginate($filters['per_page'] ?? 15);
@@ -54,7 +54,7 @@ class CatalogService
     /** Administrative listing including deactivated destinations. */
     public function adminDestinations(array $filters)
     {
-        $query = Destination::with(['category', 'activeFacilities'])->withCount('reviews as rating_count')->withAvg('reviews as rating_average', 'rating');
+        $query = Destination::with(['category', 'activeFacilities', 'images'])->withCount('reviews as rating_count')->withAvg('reviews as rating_average', 'rating');
         $this->applyStatus($query, $filters['status'] ?? 'all');
         $this->applyFilters($query, $filters);
 
@@ -84,7 +84,7 @@ class CatalogService
 
     public function destination(Destination $destination): Destination
     {
-        $destination->load(['category', 'activeFacilities'])->loadCount('reviews as rating_count')->loadAvg('reviews as rating_average', 'rating');
+        $destination->load(['category', 'activeFacilities', 'images'])->loadCount('reviews as rating_count')->loadAvg('reviews as rating_average', 'rating');
         abort_unless($destination->is_active && $destination->category->is_active, 404);
 
         return $destination;
@@ -122,7 +122,7 @@ class CatalogService
             Storage::delete($oldPath);
         }
 
-        return $destination->load(['category', 'activeFacilities'])->loadCount('reviews as rating_count')->loadAvg('reviews as rating_average', 'rating');
+        return $destination->load(['category', 'activeFacilities', 'images'])->loadCount('reviews as rating_count')->loadAvg('reviews as rating_average', 'rating');
     }
 
     public function deactivate(Destination|DestinationCategory $model): Destination|DestinationCategory
@@ -149,8 +149,9 @@ class CatalogService
         if (! $admin) {
             $this->destination($destination);
         }
-        $path = $destination->image_path;
-        $disk = Storage::disk();
+        $cover = $destination->images->first();
+        $path = $cover?->display_path ?? $destination->image_path;
+        $disk = Storage::disk($cover?->storage_disk);
         if (! $path || ! $disk->exists($path)) {
             throw new ModelNotFoundException;
         }
