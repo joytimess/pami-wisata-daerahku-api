@@ -23,7 +23,7 @@ it('does not lower quota below held or confirmed visitors', function () {
     $service = app(QuotaService::class);
     $input = ['visit_date' => '2027-01-01', 'capacity' => 6, 'booking_opens_at' => '2026-12-01T00:00:00Z', 'booking_closes_at' => '2026-12-31T00:00:00Z'];
     $quota = $service->upsert($destination, $input);
-    DB::table('bookings')->insert(['guid' => (string) Str::uuid(), 'user_guid' => $user->guid, 'destination_quota_guid' => $quota->guid, 'booking_number' => 'B-1', 'quantity' => 4, 'visitor_name' => 'Visitor', 'visitor_email' => 'v@example.com', 'visitor_phone' => '123', 'destination_name_snapshot' => 'Park', 'unit_price' => 1000, 'total_amount' => 4000, 'currency' => 'IDR', 'status' => 'payment_review', 'approval_expires_at' => now(), 'created_at' => now(), 'updated_at' => now()]);
+    DB::table('bookings')->insert(['guid' => (string) Str::uuid(), 'user_guid' => $user->guid, 'destination_quota_guid' => $quota->guid, 'booking_number' => 'B-1', 'quantity' => 4, 'visitor_name' => 'Visitor', 'visitor_email' => 'v@example.com', 'visitor_phone' => '+6281234567890', 'destination_name_snapshot' => 'Park', 'unit_price' => 1000, 'total_amount' => 4000, 'currency' => 'IDR', 'status' => 'payment_review', 'approval_expires_at' => now(), 'created_at' => now(), 'updated_at' => now()]);
     expect(fn () => $service->upsert($destination, array_replace($input, ['capacity' => 3])))->toThrow(ValidationException::class);
     expect($quota->fresh()->capacity)->toBe(6);
     expect($service->upsert($destination, array_replace($input, ['capacity' => 4]))->capacity)->toBe(4);

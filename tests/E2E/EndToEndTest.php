@@ -152,7 +152,7 @@ it('Scenario A: user books, admin sees and decides, user sees the server status'
     $availability = e2e($userToken)->get("destinations/{$paid}/availability", ['visit_date' => $date])->json('data.0');
     expect($availability['status'])->toBe('open')->and($availability['remaining'])->toBe(10);
 
-    $payload = ['destination_guid' => $paid, 'visit_date' => $date, 'quantity' => 3, 'visitor_name' => 'Budi', 'visitor_email' => 'budi@example.org', 'visitor_phone' => '0812'];
+    $payload = ['destination_guid' => $paid, 'visit_date' => $date, 'quantity' => 3, 'visitor_name' => 'Budi', 'visitor_email' => 'budi@example.org', 'visitor_phone' => '+6281234567890'];
     $created = e2e($userToken)->withHeaders(['Idempotency-Key' => 'e2e-a-1'])->post('bookings', $payload);
     expect($created->status())->toBe(200)->and($created->json('data.status'))->toBe('pending_approval');
     $guid = $created->json('data.guid');
@@ -202,7 +202,7 @@ it('Scenario B: quota is never exceeded and cancellation releases capacity', fun
     $destination = e2eDestination($adminToken, $category);
     $date = now()->addDays(6)->toDateString();
     e2eQuota($adminToken, $destination, $date, 5);
-    $make = fn (int $quantity) => ['destination_guid' => $destination, 'visit_date' => $date, 'quantity' => $quantity, 'visitor_name' => 'V', 'visitor_email' => 'v@example.org', 'visitor_phone' => '1'];
+    $make = fn (int $quantity) => ['destination_guid' => $destination, 'visit_date' => $date, 'quantity' => $quantity, 'visitor_name' => 'V', 'visitor_email' => 'v@example.org', 'visitor_phone' => '+6281234567890'];
     $remaining = fn (string $token) => e2e($token)->get("destinations/{$destination}/availability", ['visit_date' => $date])->json('data.0.remaining');
 
     $a = makeUser();
@@ -269,7 +269,7 @@ it('Scenario C: administration to catalog to booking to deactivation stays consi
     expect($image->status())->toBe(200)->and($image->header('Content-Type'))->toBe('image/png');
     expect(strlen($image->body()))->toBe(strlen(tinyPng()));
 
-    $booking = e2e($userToken)->withHeaders(['Idempotency-Key' => 'c-1'])->post('bookings', ['destination_guid' => $destination, 'visit_date' => $date, 'quantity' => 2, 'visitor_name' => 'V', 'visitor_email' => 'v@example.org', 'visitor_phone' => '1']);
+    $booking = e2e($userToken)->withHeaders(['Idempotency-Key' => 'c-1'])->post('bookings', ['destination_guid' => $destination, 'visit_date' => $date, 'quantity' => 2, 'visitor_name' => 'V', 'visitor_email' => 'v@example.org', 'visitor_phone' => '+6281234567890']);
     expect($booking->status())->toBe(200);
     $guid = $booking->json('data.guid');
     expect(e2e($adminToken)->post("admin/bookings/{$guid}/approve")->json('data.status'))->toBe('confirmed');
@@ -310,7 +310,7 @@ it('Scenario D: authorization, isolation and session revocation hold over HTTP',
     $destination = e2eDestination($adminToken, $category);
     $date = now()->addDays(6)->toDateString();
     e2eQuota($adminToken, $destination, $date, 10);
-    $guid = e2e($tokenA)->withHeaders(['Idempotency-Key' => 'd-1'])->post('bookings', ['destination_guid' => $destination, 'visit_date' => $date, 'quantity' => 1, 'visitor_name' => 'A', 'visitor_email' => 'a@example.org', 'visitor_phone' => '1'])->json('data.guid');
+    $guid = e2e($tokenA)->withHeaders(['Idempotency-Key' => 'd-1'])->post('bookings', ['destination_guid' => $destination, 'visit_date' => $date, 'quantity' => 1, 'visitor_name' => 'A', 'visitor_email' => 'a@example.org', 'visitor_phone' => '+6281234567890'])->json('data.guid');
 
     // 1. Role 0 against every admin surface.
     foreach ([['get', 'admin/bookings'], ['get', "admin/bookings/{$guid}"], ['post', "admin/bookings/{$guid}/approve"], ['get', 'admin/destinations'], ['get', 'admin/categories'], ['get', 'admin/accounts'], ['post', 'categories'], ['post', 'destinations'], ['put', "destinations/{$destination}/quotas"], ['get', "destinations/{$destination}/quotas"]] as [$method, $path]) {

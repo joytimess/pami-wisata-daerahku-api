@@ -4,6 +4,7 @@ namespace App\Services;
 
 use App\Exceptions\BookingException;
 use App\Models\User;
+use App\Support\BookingPhone;
 use App\Support\BookingRules;
 use Carbon\CarbonImmutable;
 use Illuminate\Auth\Access\AuthorizationException;
@@ -19,15 +20,17 @@ class BookingService
 
     public function create(User $user, array $input): object
     {
+        $phone = BookingPhone::normalize($input['visitor_phone'] ?? null);
         $key = $input['idempotency_key'];
         unset($input['idempotency_key']);
         $input['quantity'] = (int) $input['quantity'];
         $input['notes'] = $input['notes'] ?? null;
         ksort($input);
         $hash = hash('sha256', json_encode($input, JSON_THROW_ON_ERROR));
+        // Keep existing request fingerprints stable; only the persisted contact is canonicalized.
+        $input['visitor_phone'] = $phone;
 
-        // Claimed in its own autocommit statement: INSERT IGNORE on a duplicate key takes a shared lock, and
-        // upgrading it to FOR UPDATE inside one transaction deadlocks concurrent retries on MySQL.
+        // Commit the key claim before taking its exclusive lock in the booking transaction.
         $this->claimKey($user, $key, $hash, 'processing');
 
         return DB::transaction(function () use ($user, $input, $key, $hash) {
@@ -94,6 +97,10 @@ class BookingService
                 'created_at' => $now, 'updated_at' => $now,
             ]);
             $this->history($guid, $user->guid, null, 'pending_approval');
+            // MySQL TRIM alone does not recognize tabs or line breaks in legacy empty profiles.
+            DB::table('users')->where('guid', $user->guid)
+                ->where(fn ($query) => $query->whereNull('phone')->orWhereRaw("TRIM(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(phone, CHAR(9), ''), CHAR(10), ''), CHAR(11), ''), CHAR(12), ''), CHAR(13), '')) = ''"))
+                ->update(['phone' => $input['visitor_phone'], 'updated_at' => $now]);
             $this->notifications->record($guid, $user->guid, 'created');
             $booking = $this->find($guid);
             DB::table('idempotency_records')->where('guid', $record->guid)->update([
@@ -298,12 +305,19 @@ class BookingService
 
     private function claimKey(User $user, string $key, string $hash, string $status): void
     {
-        $now = now();
-        DB::table('idempotency_records')->insertOrIgnore([
-            'guid' => (string) Str::uuid(), 'user_guid' => $user->guid, 'operation' => 'booking.create',
-            'key' => $key, 'request_hash' => $hash, 'status' => $status,
-            'expires_at' => $now->copy()->addDays(BookingRules::IDEMPOTENCY_DAYS), 'created_at' => $now, 'updated_at' => $now,
-        ]);
+        DB::transaction(function () use ($user, $key, $hash, $status) {
+            // Duplicate INSERTs take a user FK shared lock that can deadlock with profile CAS.
+            if (DB::table('idempotency_records')->where('user_guid', $user->guid)
+                ->where('operation', 'booking.create')->where('key', $key)->exists()) {
+                return;
+            }
+            $now = now();
+            DB::table('idempotency_records')->insertOrIgnore([
+                'guid' => (string) Str::uuid(), 'user_guid' => $user->guid, 'operation' => 'booking.create',
+                'key' => $key, 'request_hash' => $hash, 'status' => $status,
+                'expires_at' => $now->copy()->addDays(BookingRules::IDEMPOTENCY_DAYS), 'created_at' => $now, 'updated_at' => $now,
+            ]);
+        }, 3);
     }
 
     private function history(string $guid, ?string $actor, ?string $old, string $new, ?string $reason = null): void

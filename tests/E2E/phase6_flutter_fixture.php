@@ -26,7 +26,7 @@ $date = now()->addDays(6)->toDateString();
 $quota = (string) Str::uuid();
 DB::table('destination_quotas')->insert(['guid' => $quota, 'destination_guid' => $destination->guid, 'visit_date' => $date, 'capacity' => 10, 'booking_opens_at' => now()->subDay(), 'booking_closes_at' => now()->addDay(), 'created_at' => now(), 'updated_at' => now()]);
 $service = app(BookingService::class);
-$booking = $service->create($owner, ['destination_guid' => $destination->guid, 'visit_date' => $date, 'quantity' => 1, 'visitor_name' => 'Flutter Fixture', 'visitor_email' => $owner->email, 'visitor_phone' => '081234', 'notes' => null, 'idempotency_key' => 'flutter-'.Str::uuid()]);
+$booking = $service->create($owner, ['destination_guid' => $destination->guid, 'visit_date' => $date, 'quantity' => 1, 'visitor_name' => 'Flutter Fixture', 'visitor_email' => $owner->email, 'visitor_phone' => '+6281234567890', 'notes' => null, 'idempotency_key' => 'flutter-'.Str::uuid()]);
 $service->decide($admin, $booking->guid, true);
 // The fixture reaches visit day without changing the application's real clock.
 DB::table('destination_quotas')->where('guid', $quota)->update(['visit_date' => now($destination->timezone)->toDateString()]);

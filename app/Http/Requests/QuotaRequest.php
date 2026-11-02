@@ -19,6 +19,8 @@ class QuotaRequest extends FormRequest
     {
         if ($this->routeIs('destinations.availability')) {
             return [
+                'month' => ['required_with:quantity', 'date_format:Y-m', 'prohibits:visit_date,from,to'],
+                'quantity' => ['sometimes', 'required', 'integer', 'min:1', 'max:1000000'],
                 'visit_date' => ['sometimes', 'date_format:Y-m-d'],
                 'from' => ['sometimes', 'date_format:Y-m-d'],
                 'to' => ['sometimes', 'date_format:Y-m-d', 'after_or_equal:from'],

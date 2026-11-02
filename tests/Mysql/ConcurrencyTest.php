@@ -1,9 +1,11 @@
 <?php
 
 use App\Models\Destination;
+use App\Models\Facility;
 use App\Models\User;
 use App\Services\BookingService;
 use App\Services\CatalogService;
+use App\Services\QuotaService;
 use App\Services\VisitService;
 use App\Support\BookingRules;
 use Illuminate\Support\Facades\Artisan;
@@ -31,31 +33,44 @@ function runConcurrently(array $jobs, ?Closure $afterStart = null): array
     mkdir($dir);
     $go = $dir.DIRECTORY_SEPARATOR.'go';
     $processes = [];
-    foreach ($jobs as $i => $job) {
-        $process = new Process([PHP_BINARY, __DIR__.'/worker.php', $dir.DIRECTORY_SEPARATOR."ready-$i", $go, json_encode($job)], base_path());
-        $process->setTimeout(120);
-        $process->start();
-        $processes[$i] = $process;
-    }
-    $deadline = microtime(true) + 90;
-    while (count(glob($dir.DIRECTORY_SEPARATOR.'ready-*')) < count($jobs) && microtime(true) < $deadline) {
-        usleep(20000);
-    }
-    touch($go);
-    if ($afterStart) {
-        $afterStart();
-    }
-    $results = [];
-    foreach ($processes as $i => $process) {
-        $process->wait();
-        $decoded = json_decode(trim($process->getOutput()), true);
-        expect($decoded)->not->toBeNull('worker output: '.$process->getOutput().$process->getErrorOutput());
-        $results[$i] = $decoded;
-    }
-    array_map('unlink', glob($dir.DIRECTORY_SEPARATOR.'*'));
-    rmdir($dir);
+    try {
+        foreach ($jobs as $i => $job) {
+            $process = new Process([PHP_BINARY, __DIR__.'/worker.php', $dir.DIRECTORY_SEPARATOR."ready-$i", $go, json_encode($job), $dir.DIRECTORY_SEPARATOR."result-$i.json"], base_path());
+            // Result files avoid Windows subprocess output-handle exhaustion under high contention.
+            $process->disableOutput();
+            $process->setTimeout(120);
+            $process->start();
+            $processes[$i] = $process;
+        }
+        $deadline = microtime(true) + 30;
+        while (count(glob($dir.DIRECTORY_SEPARATOR.'ready-*')) < count($jobs) && microtime(true) < $deadline) {
+            usleep(20000);
+        }
+        expect(count(glob($dir.DIRECTORY_SEPARATOR.'ready-*')))->toBe(count($jobs), 'All workers must reach the barrier before release.');
+        expect(collect($processes)->every(fn ($process) => $process->isRunning()))->toBeTrue('Workers must still be running at barrier release.');
+        touch($go);
+        if ($afterStart) {
+            $afterStart();
+        }
+        $results = [];
+        foreach ($processes as $i => $process) {
+            $process->wait();
+            $resultPath = $dir.DIRECTORY_SEPARATOR."result-$i.json";
+            $decoded = file_exists($resultPath) ? json_decode(file_get_contents($resultPath), true) : null;
+            expect($decoded)->not->toBeNull('worker failed with exit code '.$process->getExitCode());
+            $results[$i] = $decoded;
+        }
 
-    return $results;
+        return $results;
+    } finally {
+        foreach ($processes as $process) {
+            if ($process->isRunning()) {
+                $process->stop();
+            }
+        }
+        array_map('unlink', glob($dir.DIRECTORY_SEPARATOR.'*'));
+        rmdir($dir);
+    }
 }
 
 function mysqlSeed(int $capacity, int $price = 0): array
@@ -136,7 +151,7 @@ it('creates exactly one booking when the same idempotency key is sent concurrent
     $job = createJob($user, $destination, $date, 2, 'same-key');
 
     $results = collect(runConcurrently(array_fill(0, 8, $job)));
-    expect($results->where('ok', true))->toHaveCount(8)->and($results->pluck('guid')->unique())->toHaveCount(1);
+    expect($results->where('ok', true))->toHaveCount(8, $results->toJson())->and($results->pluck('guid')->unique())->toHaveCount(1);
     expect(DB::table('bookings')->count())->toBe(1)->and(held($quota))->toBe(2);
     expect(DB::table('idempotency_records')->count())->toBe(1);
 });
@@ -213,4 +228,52 @@ it('serves a freed seat to exactly one competitor after a cancellation', functio
     $results = collect(runConcurrently($jobs));
     expect(held($quota))->toBeLessThanOrEqual(1);
     expect($results->slice(1)->where('ok', true)->count())->toBeLessThanOrEqual(1);
+});
+
+it('fills an empty phone once under parallel bookings on different quotas and preserves both snapshots', function () {
+    [$first, $firstDate] = mysqlSeed(10);
+    [$second, $secondDate] = mysqlSeed(10);
+    $user = makeUser();
+    $a = createJob($user, $first, $firstDate);
+    $b = createJob($user, $second, $secondDate);
+    $a['payload']['visitor_phone'] = '+6289655862781';
+    $b['payload']['visitor_phone'] = '+14155552671';
+
+    $results = collect(runConcurrently([$a, $b]));
+    expect($results->where('ok', true))->toHaveCount(2);
+    $phone = $user->fresh()->phone;
+    expect($phone)->toBeIn(['+6289655862781', '+14155552671']);
+    expect(DB::table('bookings')->orderBy('visitor_phone')->pluck('visitor_phone')->all())->toBe(['+14155552671', '+6289655862781']);
+    $retry = createJob($user->fresh(), $first, $firstDate);
+    $retry['payload']['visitor_phone'] = $phone === '+6289655862781' ? '+14155552671' : '+6289655862781';
+    expect(runConcurrently([$retry])[0]['ok'])->toBeTrue();
+    expect($user->fresh()->phone)->toBe($phone);
+});
+
+it('serializes concurrent facility replacements without duplicates or partial lists', function () {
+    [$destination] = mysqlSeed(10);
+    $admin = makeUser(1);
+    $a = Facility::factory()->create(['name' => 'Parkir', 'slug' => 'parkir']);
+    $b = Facility::factory()->create(['name' => 'Toilet', 'slug' => 'toilet']);
+    $jobs = collect(range(1, 8))->map(fn ($i) => ['action' => 'facilities', 'user' => $admin->guid, 'destination' => $destination->guid, 'guids' => $i % 2 ? [$a->guid, $b->guid] : [$a->guid]])->all();
+
+    $results = collect(runConcurrently($jobs));
+    expect($results->where('ok', true))->toHaveCount(8);
+    $guids = DB::table('destination_facilities')->where('destination_guid', $destination->guid)->pluck('facility_guid')->all();
+    expect(count($guids))->toBeIn([1, 2]);
+    expect(count(array_unique($guids)))->toBe(count($guids));
+    expect($guids)->toContain($a->guid);
+});
+
+it('treats monthly availability as a snapshot and rechecks capacity during competing bookings', function () {
+    [$destination, $date, $quota] = mysqlSeed(1);
+    $calendar = app(QuotaService::class)->monthlyAvailability($destination, ['month' => substr($date, 0, 7)]);
+    expect(collect($calendar['dates'])->firstWhere('date', $date)['bookable'])->toBeTrue();
+
+    $results = collect(runConcurrently([createJob(makeUser(), $destination, $date), createJob(makeUser(), $destination, $date)]));
+    expect($results->where('ok', true))->toHaveCount(1);
+    expect($results->where('ok', false)->pluck('code')->all())->toBe(['insufficient_capacity']);
+    expect(held($quota))->toBe(1);
+    $calendar = app(QuotaService::class)->monthlyAvailability($destination, ['month' => substr($date, 0, 7)]);
+    expect(collect($calendar['dates'])->firstWhere('date', $date))->toMatchArray(['remaining' => 0, 'status' => 'sold_out', 'bookable' => false]);
 });

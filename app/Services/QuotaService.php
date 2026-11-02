@@ -12,6 +12,47 @@ use Illuminate\Validation\ValidationException;
 
 class QuotaService
 {
+    public function monthlyAvailability(Destination $destination, array $filters): array
+    {
+        $start = CarbonImmutable::createFromFormat('!Y-m', $filters['month'], $destination->timezone);
+        $end = $start->endOfMonth();
+        $quantity = (int) ($filters['quantity'] ?? 1);
+        $quotas = DestinationQuota::where('destination_guid', $destination->guid)
+            ->whereBetween('visit_date', [$start->toDateString(), $end->toDateString()])
+            ->select('destination_quotas.*')->selectSub($this->allocatedSub(), 'allocated')
+            ->get()->keyBy(fn ($quota) => $quota->visit_date->format('Y-m-d'));
+        $now = CarbonImmutable::now();
+        $dates = [];
+        for ($day = $start; $day->lte($end); $day = $day->addDay()) {
+            $date = $day->toDateString();
+            $quota = $quotas->get($date);
+            $capacity = $quota ? (int) $quota->capacity : null;
+            $remaining = $quota ? max(0, $capacity - (int) $quota->allocated) : null;
+            $percent = $capacity > 0 ? ($remaining / $capacity) * 100 : null;
+            $level = match (true) {
+                $percent === null || $remaining === 0 => 'none',
+                $percent > 60 => 'high',
+                $percent >= 35 => 'medium',
+                default => 'low',
+            };
+            $status = match (true) {
+                ! $quota => 'unconfigured',
+                $capacity === 0 => 'unavailable',
+                $remaining === 0 => 'sold_out',
+                $now->lt($quota->booking_opens_at),
+                $now->gte($quota->booking_closes_at),
+                BookingRules::tooCloseToCreate($now, BookingRules::visitStart($date, $destination->timezone)) => 'closed',
+                $remaining < $quantity => 'insufficient_quantity',
+                default => 'available',
+            };
+            $dates[] = ['date' => $date, 'capacity' => $capacity, 'remaining' => $remaining,
+                'remaining_percent' => $percent, 'level' => $level, 'status' => $status, 'bookable' => $status === 'available'];
+        }
+
+        return ['destination_guid' => $destination->guid, 'month' => $filters['month'],
+            'timezone' => $destination->timezone, 'requested_quantity' => $quantity, 'dates' => $dates];
+    }
+
     public function list(Destination $destination, array $filters)
     {
         return DestinationQuota::where('destination_guid', $destination->guid)

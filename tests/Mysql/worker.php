@@ -4,17 +4,19 @@
  * Child process used by the MySQL concurrency tests: boots the real application, waits on a start
  * barrier so every worker hits the database at once, runs one service call and prints a JSON result.
  *
- * Usage: php worker.php <ready-file> <go-file> <job-json>
+ * Usage: php worker.php <ready-file> <go-file> <job-json> [result-file]
  */
 
 use App\Models\Destination;
 use App\Models\User;
 use App\Services\BookingService;
+use App\Services\FacilityService;
 use App\Services\QuotaService;
 use App\Services\VisitService;
 use Illuminate\Contracts\Console\Kernel;
 
 require __DIR__.'/../../vendor/autoload.php';
+$resultFile = $argv[4] ?? null;
 $app = require __DIR__.'/../../bootstrap/app.php';
 $app->make(Kernel::class)->bootstrap();
 
@@ -32,9 +34,14 @@ $deadline = microtime(true) + 60;
 while (! file_exists($goFile) && microtime(true) < $deadline) {
     usleep(500);
 }
+if (! file_exists($goFile)) {
+    fwrite(STDERR, "Barrier was not released.\n");
+    exit(3);
+}
 
 try {
     $result = match ($job['action']) {
+        'facilities' => app(FacilityService::class)->assign(Destination::findOrFail($job['destination']), $job['guids']),
         'create' => $bookings->create($user, $job['payload'] + ['idempotency_key' => $job['key']]),
         'cancel' => $bookings->cancel($user, $job['guid']),
         'decide' => $bookings->decide($user, $job['guid'], $job['approve']),
@@ -42,7 +49,13 @@ try {
         'check-in' => app(VisitService::class)->checkIn($user, $job['guid']),
         'review' => app(VisitService::class)->review($user, $job['guid'], $job['fields']),
     };
-    echo json_encode(['ok' => true, 'guid' => $result->guid ?? null, 'status' => $result->status ?? null, 'capacity' => $result->capacity ?? null]);
+    $output = json_encode(['ok' => true, 'guid' => $result->guid ?? null, 'status' => $result->status ?? null, 'capacity' => $result->capacity ?? null]);
 } catch (Throwable $e) {
-    echo json_encode(['ok' => false, 'class' => class_basename($e), 'code' => $e->errorCode ?? null, 'message' => $e->getMessage()]);
+    $output = json_encode(['ok' => false, 'class' => class_basename($e), 'code' => $e->errorCode ?? null, 'message' => $e->getMessage()]);
+}
+
+if ($resultFile !== null) {
+    file_put_contents($resultFile, $output);
+} else {
+    echo $output;
 }

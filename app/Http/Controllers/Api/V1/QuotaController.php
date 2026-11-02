@@ -22,6 +22,10 @@ class QuotaController extends Controller
     {
         abort_unless($destination->is_active && $destination->category()->value('is_active'), 404);
 
+        if ($request->has('month')) {
+            return new AvailabilityResource($this->service->monthlyAvailability($destination, $request->validated()));
+        }
+
         return AvailabilityResource::collection(collect($this->service->availability($destination, $request->validated())));
     }
 

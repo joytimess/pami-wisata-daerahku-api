@@ -7,6 +7,7 @@ use App\Http\Controllers\Api\V1\BookingController;
 use App\Http\Controllers\Api\V1\BookingDocumentController;
 use App\Http\Controllers\Api\V1\CategoryController;
 use App\Http\Controllers\Api\V1\DestinationController;
+use App\Http\Controllers\Api\V1\FacilityController;
 use App\Http\Controllers\Api\V1\FavoriteController;
 use App\Http\Controllers\Api\V1\InboxController;
 use App\Http\Controllers\Api\V1\QuotaController;
@@ -35,6 +36,12 @@ Route::prefix('v1')->group(function () {
     Route::get('destinations/{destination}/reviews', [VisitController::class, 'destinationReviews'])->name('destinations.reviews');
     Route::get('destinations/{destination}/image', [DestinationController::class, 'image'])->name('destinations.image');
     Route::middleware(AuthenticateApiToken::class)->group(function () {
+        Route::get('facilities', [FacilityController::class, 'index'])->name('facilities.index');
+        Route::get('superadmin/facilities', [FacilityController::class, 'index'])->name('superadmin.facilities.index');
+        Route::post('superadmin/facilities', [FacilityController::class, 'store'])->name('superadmin.facilities.store');
+        Route::patch('superadmin/facilities/{facility}', [FacilityController::class, 'update'])->name('superadmin.facilities.update');
+        Route::delete('superadmin/facilities/{facility}', [FacilityController::class, 'destroy'])->name('superadmin.facilities.destroy');
+        Route::put('admin/destinations/{destination}/facilities', [FacilityController::class, 'assign'])->name('admin.destinations.facilities');
         Route::get('auth/me', [AuthController::class, 'me']);
         Route::post('auth/logout', [AuthController::class, 'logout']);
         Route::post('profile/close', [AccountController::class, 'close'])->middleware('throttle:6,1');

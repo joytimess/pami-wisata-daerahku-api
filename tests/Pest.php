@@ -78,5 +78,5 @@ function seedDestination(int $capacity = 10, int $price = 0, int $days = 5, arra
 
 function bookingPayload(Destination $destination, string $date, int $quantity = 1): array
 {
-    return ['destination_guid' => $destination->guid, 'visit_date' => $date, 'quantity' => $quantity, 'visitor_name' => 'Visitor', 'visitor_email' => 'visitor@example.com', 'visitor_phone' => '0812'];
+    return ['destination_guid' => $destination->guid, 'visit_date' => $date, 'quantity' => $quantity, 'visitor_name' => 'Visitor', 'visitor_email' => 'visitor@example.com', 'visitor_phone' => '+6281234567890'];
 }

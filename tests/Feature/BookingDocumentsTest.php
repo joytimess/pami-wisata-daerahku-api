@@ -21,7 +21,7 @@ it('generates private documents once for confirmed bookings and restricts access
     $destination = Destination::create(['destination_category_guid' => $category->guid, 'name' => 'Park', 'location' => 'Town', 'description' => 'Park', 'ticket_price' => 0, 'currency' => 'IDR', 'opening_hours' => '08:00-17:00', 'timezone' => 'Asia/Jakarta']);
     $quota = DestinationQuota::create(['destination_guid' => $destination->guid, 'visit_date' => '2027-01-01', 'capacity' => 6, 'booking_opens_at' => now(), 'booking_closes_at' => now()->addDay()]);
     $guid = (string) Str::uuid();
-    DB::table('bookings')->insert(['guid' => $guid, 'user_guid' => $user->guid, 'destination_quota_guid' => $quota->guid, 'booking_number' => 'B-1', 'quantity' => 4, 'visitor_name' => 'Visitor', 'visitor_email' => 'v@example.com', 'visitor_phone' => '123', 'destination_name_snapshot' => 'Park', 'unit_price' => 0, 'total_amount' => 0, 'currency' => 'IDR', 'status' => 'pending_approval', 'approval_expires_at' => now(), 'created_at' => now(), 'updated_at' => now()]);
+    DB::table('bookings')->insert(['guid' => $guid, 'user_guid' => $user->guid, 'destination_quota_guid' => $quota->guid, 'booking_number' => 'B-1', 'quantity' => 4, 'visitor_name' => 'Visitor', 'visitor_email' => 'v@example.com', 'visitor_phone' => '+6281234567890', 'destination_name_snapshot' => 'Park', 'unit_price' => 0, 'total_amount' => 0, 'currency' => 'IDR', 'status' => 'pending_approval', 'approval_expires_at' => now(), 'created_at' => now(), 'updated_at' => now()]);
     $service = app(BookingDocumentService::class);
     $service->generate($guid);
     expect(DB::table('invoices')->count())->toBe(0);
