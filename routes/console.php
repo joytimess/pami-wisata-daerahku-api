@@ -13,3 +13,4 @@ Schedule::command('notifications:dispatch')->everyMinute();
 Schedule::command('documents:dispatch')->everyMinute();
 
 Schedule::command('destinations:cleanup-images')->everyMinute()->withoutOverlapping();
+Schedule::command('avatars:cleanup')->everyMinute()->withoutOverlapping();

@@ -86,6 +86,12 @@ class AuthService
             return $user;
         }, 3);
 
+        $this->assertGoogleAllowed($user);
+        if ($user->status !== 'active') {
+            throw new AuthenticationException('Account unavailable.');
+        }
+        app(AvatarService::class)->snapshotGoogle($user, is_string($claims['picture'] ?? null) ? $claims['picture'] : null);
+
         return DB::transaction(function () use ($user, $data) {
             $user = User::whereKey($user->guid)->lockForUpdate()->firstOrFail();
             // Authorization uses the role stored in Laravel's database, never client input.

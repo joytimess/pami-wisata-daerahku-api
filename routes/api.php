@@ -3,6 +3,7 @@
 use App\Http\Controllers\Api\V1\AccountController;
 use App\Http\Controllers\Api\V1\AdminAccountController;
 use App\Http\Controllers\Api\V1\AuthController;
+use App\Http\Controllers\Api\V1\AvatarController;
 use App\Http\Controllers\Api\V1\BookingController;
 use App\Http\Controllers\Api\V1\BookingDocumentController;
 use App\Http\Controllers\Api\V1\CategoryController;
@@ -47,6 +48,9 @@ Route::prefix('v1')->group(function () {
         Route::post('auth/logout', [AuthController::class, 'logout']);
         Route::post('profile/close', [AccountController::class, 'close'])->middleware('throttle:6,1');
         Route::patch('profile', [AccountController::class, 'update']);
+        Route::post('profile/avatar', [AvatarController::class, 'upload'])->middleware('throttle:20,1');
+        Route::put('profile/avatar/preference', [AvatarController::class, 'preference'])->middleware('throttle:20,1');
+        Route::get('profile/avatar', [AvatarController::class, 'show'])->name('profile.avatar');
         Route::get('profile/statistics', [VisitController::class, 'statistics']);
         Route::get('reviews', [VisitController::class, 'history']);
         Route::post('auth/email/verification-notification', [AccountController::class, 'resend'])->middleware('throttle:6,1');

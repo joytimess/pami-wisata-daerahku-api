@@ -14,7 +14,7 @@ use Illuminate\Notifications\Notifiable;
 use Illuminate\Support\Str;
 
 #[Fillable(['name', 'email', 'phone', 'password'])]
-#[Hidden(['password', 'remember_token'])]
+#[Hidden(['password', 'remember_token', 'avatar_custom_path', 'google_avatar_snapshot_path'])]
 class User extends Authenticatable implements MustVerifyEmail
 {
     public function sendEmailVerificationNotification(): void
@@ -27,7 +27,7 @@ class User extends Authenticatable implements MustVerifyEmail
         throw new \LogicException('Password reset links are disabled.');
     }
 
-    protected $attributes = ['role' => 0, 'status' => 'active'];
+    protected $attributes = ['role' => 0, 'status' => 'active', 'avatar_source' => 'default', 'avatar_manual_choice' => false, 'avatar_version' => 0];
 
     protected $primaryKey = 'guid';
 
@@ -56,6 +56,8 @@ class User extends Authenticatable implements MustVerifyEmail
             'email_verified_at' => 'datetime',
             'password' => 'hashed',
             'role' => 'integer',
+            'avatar_manual_choice' => 'boolean',
+            'avatar_version' => 'integer',
         ];
     }
 }
