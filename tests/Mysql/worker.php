@@ -11,9 +11,13 @@ use App\Models\Destination;
 use App\Models\User;
 use App\Services\BookingService;
 use App\Services\FacilityService;
+use App\Services\PaymentEligibility;
 use App\Services\QuotaService;
+use App\Services\TicketCheckInService;
 use App\Services\VisitService;
 use Illuminate\Contracts\Console\Kernel;
+use Illuminate\Support\Facades\Crypt;
+use Illuminate\Support\Facades\DB;
 
 require __DIR__.'/../../vendor/autoload.php';
 $resultFile = $argv[4] ?? null;
@@ -40,13 +44,22 @@ if (! file_exists($goFile)) {
 }
 
 try {
+    if ($job['action'] === 'check-in') {
+        $app->instance(PaymentEligibility::class, new class extends PaymentEligibility
+        {
+            public function status(object $booking): string
+            {
+                return 'paid';
+            }
+        });
+    }
     $result = match ($job['action']) {
         'facilities' => app(FacilityService::class)->assign(Destination::findOrFail($job['destination']), $job['guids']),
         'create' => $bookings->create($user, $job['payload'] + ['idempotency_key' => $job['key']]),
         'cancel' => $bookings->cancel($user, $job['guid']),
         'decide' => $bookings->decide($user, $job['guid'], $job['approve']),
         'quota' => app(QuotaService::class)->upsert(Destination::findOrFail($job['destination']), $job['fields']),
-        'check-in' => app(VisitService::class)->checkIn($user, $job['guid']),
+        'check-in' => app(TicketCheckInService::class)->confirm($user, Crypt::decryptString(DB::table('booking_tickets')->where('guid', $job['ticket_guid'])->value('qr_token_encrypted')), $job['key']),
         'review' => app(VisitService::class)->review($user, $job['guid'], $job['fields']),
     };
     $output = json_encode(['ok' => true, 'guid' => $result->guid ?? null, 'status' => $result->status ?? null, 'capacity' => $result->capacity ?? null]);

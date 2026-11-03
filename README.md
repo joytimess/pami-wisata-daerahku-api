@@ -97,7 +97,7 @@ Seluruh kemampuan pengguna, ditambah:
 - Membuat, mengubah, menonaktifkan destinasi dan mengunggah gambar destinasi (JPG/PNG/WebP, maks 5 MB).
 - Melihat destinasi termasuk yang nonaktif, mengatur kuota per tanggal (`PUT /destinations/{destination}/quotas`).
 - Melihat semua booking (filter `status`, `search`), menyetujui atau menolak booking.
-- Melakukan check-in untuk booking pengguna lain.
+- Memindai QR per tiket, melihat preview, lalu mengonfirmasi check-in untuk destinasi yang ditugaskan (Superadmin memiliki scope global).
 - Mengakses dokumen booking milik pengguna mana pun.
 - Menerima notifikasi booking baru, pembatalan, dan `payment_review`.
 
@@ -251,7 +251,7 @@ Penutupan akun (`POST /profile/close`) memerlukan `password` atau `id_token` Goo
 | Role | Nilai | Hak akses tambahan |
 | --- | --- | --- |
 | User | 0 | Endpoint bertanda terautentikasi; hanya data milik sendiri |
-| Admin | 1 | Kelola destinasi, kuota, gambar; lihat/putuskan booking; check-in untuk pengguna lain |
+| Admin | 1 | Kelola destinasi, kuota, gambar; lihat/putuskan booking; scan/check-in tiket pada destinasi yang ditugaskan |
 | Superadmin | 2 | Kelola kategori dan akun admin |
 
 Role selalu dibaca dari database Laravel, tidak pernah dari input klien (`role` dan `status` ditolak pada register dan update profil). Pembuatan superadmin pertama hanya lewat command `app:bootstrap-superadmin`.
@@ -309,7 +309,10 @@ Kode berlaku 10 menit dan maksimal lima kesalahan per penerbitan. Rate limit ber
 | Booking intent | `GET /booking-intents/{key}`, `POST /booking-intents/{key}/abandon` | Terautentikasi |
 | Admin booking | `GET /admin/bookings`, `GET /admin/bookings/{booking}`, `POST /admin/bookings/{booking}/approve`, `/reject` | Admin+ |
 | Dokumen | `GET /bookings/{booking}/documents`, `GET /bookings/{booking}/documents/{invoice\|ticket}` | Pemilik atau Admin+ |
-| Kunjungan | `POST /bookings/{booking}/check-in`, `POST /bookings/{booking}/review`, `GET /reviews` | Terautentikasi |
+| Tiket QR | `GET /bookings/{booking}/tickets`, `GET /bookings/{booking}/tickets/{ticket}/qr` | Pemilik booking; payment/approval/date guard |
+| Scanner | `GET /admin/ticket-check-ins/scope`, `POST /admin/ticket-check-ins/preview`, `/confirm` | Admin assigned / Superadmin global |
+| Penugasan scanner | `GET`/`PUT /admin/destinations/{destination}/admins` | Superadmin |
+| Kunjungan | `POST /bookings/{booking}/review`, `GET /reviews`; endpoint `/check-in` lama dinonaktifkan | Terautentikasi |
 | Notifikasi | `GET /notifications`, `GET /notifications/unread-count`, `PATCH /notifications/{guid}/read` | Terautentikasi |
 | Perangkat | `PUT`/`DELETE /devices` (`token`, `platform`: `android`\|`ios`) | Terautentikasi |
 | Akun admin | `GET`/`POST /admin/accounts`, `PATCH /admin/accounts/{user}` | Superadmin |
@@ -350,7 +353,7 @@ Invoke-RestMethod -Method Post -Uri "$base/bookings" -Headers $h -ContentType 'a
 
 Harga (`unit_price`, `total_amount`) dihitung server dari `ticket_price` destinasi; klien tidak mengirim harga.
 
-Review: `POST /bookings/{guid}/review` dengan `rating` (1–5) dan `comment` (maks 2000 karakter), hanya untuk booking `confirmed` yang sudah check-in.
+Review: `POST /bookings/{guid}/review` dengan `rating` (1–5) dan `comment` (maks 2000 karakter), satu per booking setelah minimal satu tiket check-in yang sah; kunjungan legacy mempertahankan eligibility historis. Lihat [kontrak Smart Ticket, migrasi, dan dependency pembayaran](docs/smart-ticket-qr-checkin-v1.md).
 
 ## 11. Queue, Scheduler & Notifications
 
@@ -481,7 +484,7 @@ Berdasarkan kode dan dokumen handoff pada repository ini:
 
 - **Pembayaran belum ada.** Tidak ada payment provider, endpoint checkout, webhook, rekonsiliasi, maupun refund. Satu-satunya jalur ke `confirmed` di kode saat ini adalah persetujuan admin atas booking gratis (`total_amount = 0`); booking berbayar berhenti di `awaiting_payment` → `payment_verification` → `payment_review` dan tidak dapat dikonfirmasi lewat API. Alokasi kapasitas tidak dilepas pada status tersebut.
 - **Pembatalan** hanya untuk booking `pending_approval`; kebijakan pembatalan/refund untuk booking terproses belum tersedia (409 `booking_not_cancellable`).
-- **Cutoff kunjungan bersifat sementara** (25 j 15 m untuk create, 1 j 15 m untuk approve); persetujuan produk atas kebijakan final adalah syarat rilis. Durasi dan prosedur `payment_review`, semantik invoice final, serta aturan eligibility check-in/review juga masih keputusan terbuka.
+- **Cutoff booking existing** (25 j 15 m untuk create, 1 j 15 m untuk approve) tetap dipertahankan. Smart Ticket memakai aturan QR H-5 dan scan hari H sesuai timezone destinasi. Guard pembayaran fail-closed sampai adapter otoritatif tersedia; `confirmed` tidak berarti lunas. Durasi/prosedur `payment_review` dan semantik invoice final belum termasuk integrasi payment.
 - **Belum diverifikasi dengan layanan nyata:** Google Sign-In dengan Firebase ID token nyata (test memakai verifier yang dimock), pengiriman FCM ke perangkat, SMTP, worker/scheduler di lingkungan target, monitoring/alerting, dan deployment. Repository tidak memuat konfigurasi deployment.
 - **Email notifikasi** tidak akan terkirim selama `MAIL_MAILER` bernilai `log`, `array`, atau `null`.
 - **Dokumen PDF:** crash worker setelah file ditulis tetapi sebelum commit dapat meninggalkan file privat yatim; file yang dihapus setelah record dibuat tidak diregenerasi otomatis.

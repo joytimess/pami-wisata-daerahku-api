@@ -3,6 +3,7 @@
 namespace App\Services;
 
 use App\Exceptions\BookingException;
+use App\Exceptions\TicketException;
 use App\Models\Destination;
 use App\Models\User;
 use Illuminate\Database\Eloquent\ModelNotFoundException;
@@ -12,32 +13,11 @@ use Illuminate\Support\Str;
 
 class VisitService
 {
-    public function __construct(private BookingService $bookings) {}
+    public function __construct(private PaymentEligibility $payments) {}
 
-    public function checkIn(User $actor, string $guid): object
+    public function checkIn(User $actor, string $guid): never
     {
-        return DB::transaction(function () use ($actor, $guid) {
-            $booking = $this->lockBooking($actor, $guid, allowAdmin: true);
-            if (DB::table('check_ins')->where('booking_guid', $guid)->exists()) {
-                throw new BookingException('This booking has already checked in.', 'check_in_duplicate');
-            }
-            if ($booking->status !== 'confirmed') {
-                throw new BookingException('Only a confirmed booking may check in.', 'check_in_not_eligible');
-            }
-            $quota = DB::table('destination_quotas')->where('guid', $booking->destination_quota_guid)->first();
-            $timezone = DB::table('destinations')->where('guid', $quota->destination_guid)->value('timezone');
-            if (substr((string) $quota->visit_date, 0, 10) !== now($timezone)->toDateString()) {
-                throw new BookingException('Check-in is available only on the visit date at the destination.', 'check_in_wrong_date');
-            }
-            DB::table('check_ins')->insert([
-                'guid' => (string) Str::uuid(), 'booking_guid' => $guid,
-                'actor_guid' => $actor->guid, 'checked_in_at' => now(),
-            ]);
-
-            return $actor->guid === $booking->user_guid
-                ? $this->bookings->show($actor, $guid)
-                : $this->bookings->adminShow($actor, $guid);
-        }, 3);
+        throw new TicketException('legacy_check_in_disabled', 'Gunakan pemindaian QR oleh petugas untuk check-in.', 410);
     }
 
     public function review(User $actor, string $guid, array $data): object
@@ -47,7 +27,11 @@ class VisitService
             if (DB::table('reviews')->where('booking_guid', $guid)->exists()) {
                 throw new BookingException('This booking already has a review.', 'review_duplicate');
             }
-            if ($booking->status !== 'confirmed' || ! DB::table('check_ins')->where('booking_guid', $guid)->exists()) {
+            $legacy = DB::table('check_ins')->where('booking_guid', $guid)->exists();
+            $hasTickets = DB::table('booking_tickets')->where('booking_guid', $guid)->exists();
+            $checked = DB::table('booking_tickets')->where('booking_guid', $guid)->whereNotNull('checked_in_at')->exists()
+                || (! $hasTickets && $legacy);
+            if ($booking->status !== 'confirmed' || ! $checked || (! $legacy && $this->payments->status($booking) !== 'paid')) {
                 throw new BookingException('A confirmed, checked-in visit is required before reviewing.', 'review_not_eligible');
             }
             $destination = DB::table('destination_quotas')->where('guid', $booking->destination_quota_guid)->value('destination_guid');
@@ -91,8 +75,13 @@ class VisitService
         return [
             'bookings' => DB::table('bookings')->where('user_guid', $actor->guid)->count(),
             'reviews' => DB::table('reviews')->where('user_guid', $actor->guid)->count(),
-            'visits' => DB::table('check_ins')->join('bookings', 'bookings.guid', '=', 'check_ins.booking_guid')
-                ->where('bookings.user_guid', $actor->guid)->count(),
+            'visits' => DB::table('bookings')->where('user_guid', $actor->guid)->where(function ($query) {
+                $query->whereExists(fn ($tickets) => $tickets->selectRaw('1')->from('booking_tickets')
+                    ->whereColumn('booking_tickets.booking_guid', 'bookings.guid')->whereNotNull('checked_in_at'))
+                    ->orWhere(fn ($legacy) => $legacy->whereNotExists(fn ($tickets) => $tickets->selectRaw('1')->from('booking_tickets')
+                        ->whereColumn('booking_tickets.booking_guid', 'bookings.guid'))
+                        ->whereExists(fn ($checkIns) => $checkIns->selectRaw('1')->from('check_ins')->whereColumn('check_ins.booking_guid', 'bookings.guid')));
+            })->count(),
         ];
     }
 

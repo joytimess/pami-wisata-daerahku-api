@@ -5,8 +5,9 @@ use App\Models\Facility;
 use App\Models\User;
 use App\Services\BookingService;
 use App\Services\CatalogService;
+use App\Services\PaymentEligibility;
 use App\Services\QuotaService;
-use App\Services\VisitService;
+use App\Services\TicketService;
 use App\Support\BookingRules;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
@@ -90,20 +91,30 @@ function held(string $quota): int
     return (int) DB::table('bookings')->where('destination_quota_guid', $quota)->whereIn('status', BookingRules::HELD)->sum('quantity');
 }
 
-it('records exactly one check-in under concurrent owner and staff requests', function () {
+it('records exactly one ticket check-in under concurrent staff requests', function () {
     [$destination, $date, $quota] = mysqlSeed(10);
     $owner = makeUser();
-    $staff = makeUser(1);
+    $staff = makeUser(2);
+    $secondStaff = makeUser(2);
     $service = app(BookingService::class);
     $booking = $service->create($owner, bookingPayload($destination, $date) + ['idempotency_key' => 'checkin-race']);
     $service->decide($staff, $booking->guid, true);
     DB::table('destination_quotas')->where('guid', $quota)->update(['visit_date' => now($destination->timezone)->toDateString()]);
-    $jobs = collect(range(1, 8))->map(fn ($i) => ['action' => 'check-in', 'user' => $i % 2 ? $owner->guid : $staff->guid, 'guid' => $booking->guid])->all();
+    app()->instance(PaymentEligibility::class, new class extends PaymentEligibility
+    {
+        public function status(object $booking): string
+        {
+            return 'paid';
+        }
+    });
+    app(TicketService::class)->listing($owner, $booking->guid);
+    $ticket = DB::table('booking_tickets')->where('booking_guid', $booking->guid)->first();
+    $jobs = collect(range(1, 8))->map(fn ($i) => ['action' => 'check-in', 'user' => $i % 2 ? $secondStaff->guid : $staff->guid, 'ticket_guid' => $ticket->guid, 'key' => (string) Str::uuid()])->all();
 
     $results = collect(runConcurrently($jobs));
     expect($results->where('ok', true))->toHaveCount(1)
-        ->and($results->where('ok', false)->pluck('code')->unique()->all())->toBe(['check_in_duplicate']);
-    expect(DB::table('check_ins')->where('booking_guid', $booking->guid)->count())->toBe(1)
+        ->and($results->where('ok', false)->pluck('code')->unique()->all())->toBe(['ticket_already_checked_in']);
+    expect(DB::table('ticket_check_ins')->where('booking_guid', $booking->guid)->count())->toBe(1)
         ->and(DB::table('bookings')->where('guid', $booking->guid)->value('status'))->toBe('confirmed')
         ->and(held($quota))->toBe(1);
 });
@@ -115,7 +126,8 @@ it('records exactly one review and one aggregate contribution under concurrent r
     $booking = $service->create($owner, bookingPayload($destination, $date) + ['idempotency_key' => 'review-race']);
     $service->decide(makeUser(1), $booking->guid, true);
     DB::table('destination_quotas')->where('guid', $quota)->update(['visit_date' => now($destination->timezone)->toDateString()]);
-    app(VisitService::class)->checkIn($owner, $booking->guid);
+    DB::table('check_ins')->insert(['guid' => (string) Str::uuid(), 'booking_guid' => $booking->guid, 'actor_guid' => $owner->guid, 'checked_in_at' => now()]);
+    app(TicketService::class)->backfill();
     $job = ['action' => 'review', 'user' => $owner->guid, 'guid' => $booking->guid, 'fields' => ['rating' => 4, 'comment' => 'Real visit']];
 
     $results = collect(runConcurrently(array_fill(0, 8, $job)));

@@ -14,3 +14,5 @@ Schedule::command('documents:dispatch')->everyMinute();
 
 Schedule::command('destinations:cleanup-images')->everyMinute()->withoutOverlapping();
 Schedule::command('avatars:cleanup')->everyMinute()->withoutOverlapping();
+
+Schedule::command('tickets:issue-qr')->everyMinute()->withoutOverlapping();

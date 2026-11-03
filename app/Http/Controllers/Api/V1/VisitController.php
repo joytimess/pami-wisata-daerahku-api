@@ -4,7 +4,6 @@ namespace App\Http\Controllers\Api\V1;
 
 use App\Http\Controllers\Controller;
 use App\Http\Requests\ReviewRequest;
-use App\Http\Resources\BookingResource;
 use App\Http\Resources\ProfileStatisticsResource;
 use App\Http\Resources\ReviewResource;
 use App\Models\Destination;
@@ -15,9 +14,9 @@ class VisitController extends Controller
 {
     public function __construct(private VisitService $visits) {}
 
-    public function checkIn(Request $request, string $booking): BookingResource
+    public function checkIn(Request $request, string $booking): never
     {
-        return new BookingResource($this->visits->checkIn($request->user(), $booking));
+        $this->visits->checkIn($request->user(), $booking);
     }
 
     public function review(ReviewRequest $request, string $booking): ReviewResource

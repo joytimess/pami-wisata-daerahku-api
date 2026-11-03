@@ -16,7 +16,7 @@ use Illuminate\Support\Str;
 
 class BookingService
 {
-    public function __construct(private BookingNotificationService $notifications) {}
+    public function __construct(private BookingNotificationService $notifications, private TicketService $tickets, private PaymentEligibility $payments) {}
 
     public function create(User $user, array $input): object
     {
@@ -92,10 +92,12 @@ class BookingService
                 'booking_number' => 'BK-'.strtoupper(str_replace('-', '', $guid)), 'quantity' => $input['quantity'],
                 'visitor_name' => $input['visitor_name'], 'visitor_email' => $input['visitor_email'],
                 'visitor_phone' => $input['visitor_phone'], 'destination_name_snapshot' => $destination->name,
+                'destination_timezone_snapshot' => $destination->timezone,
                 'unit_price' => $price, 'total_amount' => $price * $input['quantity'], 'currency' => $destination->currency,
                 'notes' => $input['notes'], 'status' => 'pending_approval', 'approval_expires_at' => $now->copy()->addDay(),
                 'created_at' => $now, 'updated_at' => $now,
             ]);
+            $this->tickets->initialize((object) ['guid' => $guid, 'quantity' => $input['quantity']]);
             $this->history($guid, $user->guid, null, 'pending_approval');
             // MySQL TRIM alone does not recognize tabs or line breaks in legacy empty profiles.
             DB::table('users')->where('guid', $user->guid)
@@ -333,9 +335,11 @@ class BookingService
         return DB::table('bookings')->join('destination_quotas', 'destination_quotas.guid', '=', 'bookings.destination_quota_guid')
             ->join('destinations', 'destinations.guid', '=', 'destination_quotas.destination_guid')
             ->leftJoin('check_ins', 'check_ins.booking_guid', '=', 'bookings.guid')
+            ->leftJoinSub(DB::table('booking_tickets')->select('booking_guid')->selectRaw('COUNT(*) as ticket_rows, COUNT(checked_in_at) as ticket_checked_in_count, MIN(checked_in_at) as first_checked_in_at')->groupBy('booking_guid'), 'ticket_summary', 'ticket_summary.booking_guid', '=', 'bookings.guid')
             ->leftJoin('reviews', 'reviews.booking_guid', '=', 'bookings.guid')
             ->select('bookings.*', 'destination_quotas.destination_guid', 'destination_quotas.visit_date',
-                'destinations.timezone as destination_timezone', 'check_ins.checked_in_at',
+                'destinations.timezone as destination_timezone', 'check_ins.checked_in_at as legacy_checked_in_at',
+                'ticket_summary.ticket_rows', 'ticket_summary.ticket_checked_in_count', 'ticket_summary.first_checked_in_at',
                 'reviews.guid as review_guid', 'reviews.rating as review_rating',
                 'reviews.comment as review_comment', 'reviews.created_at as review_created_at');
     }
@@ -353,10 +357,20 @@ class BookingService
         $booking->visit_date = substr((string) $booking->visit_date, 0, 10);
         $booking->cancellable = $booking->status === 'pending_approval'
             && CarbonImmutable::parse($booking->approval_expires_at)->isFuture();
-        $booking->checked_in_at = $booking->checked_in_at ? CarbonImmutable::parse($booking->checked_in_at, 'UTC')->toIso8601String() : null;
-        $booking->can_check_in = $booking->status === 'confirmed' && $booking->checked_in_at === null
-            && $booking->visit_date === now($booking->destination_timezone)->toDateString();
-        $booking->can_review = $booking->status === 'confirmed' && $booking->checked_in_at !== null && $booking->review_guid === null;
+        $booking->destination_timezone = $booking->destination_timezone_snapshot ?? $booking->destination_timezone;
+        $booking->ticket_count = (int) $booking->quantity;
+        $booking->checked_in_count = $booking->ticket_rows ? (int) $booking->ticket_checked_in_count
+            : ($booking->legacy_checked_in_at ? (int) $booking->quantity : 0);
+        $checkedAt = $booking->ticket_rows ? $booking->first_checked_in_at : $booking->legacy_checked_in_at;
+        $booking->checked_in_at = $checkedAt ? CarbonImmutable::parse($checkedAt, 'UTC')->toIso8601String() : null;
+        $booking->has_checked_in = $booking->checked_in_count > 0;
+        $booking->is_fully_checked_in = $booking->checked_in_count === $booking->ticket_count;
+        $booking->is_partially_checked_in = $booking->has_checked_in && ! $booking->is_fully_checked_in;
+        $booking->all_checked_in = $booking->is_fully_checked_in;
+        $booking->can_check_in = false;
+        $booking->payment_status = $this->payments->status($booking);
+        $booking->can_review = $booking->status === 'confirmed' && $booking->has_checked_in && $booking->review_guid === null
+            && ($booking->legacy_checked_in_at !== null || $booking->payment_status === 'paid');
         $booking->review = $booking->review_guid === null ? null : (object) [
             'guid' => $booking->review_guid, 'booking_guid' => $booking->guid,
             'destination_guid' => $booking->destination_guid, 'destination_name' => $booking->destination_name_snapshot,

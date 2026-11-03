@@ -13,6 +13,8 @@ use App\Http\Controllers\Api\V1\FavoriteController;
 use App\Http\Controllers\Api\V1\InboxController;
 use App\Http\Controllers\Api\V1\LocationGeocodingController;
 use App\Http\Controllers\Api\V1\QuotaController;
+use App\Http\Controllers\Api\V1\TicketCheckInController;
+use App\Http\Controllers\Api\V1\TicketController;
 use App\Http\Controllers\Api\V1\VisitController;
 use App\Http\Middleware\AuthenticateApiToken;
 use App\Http\Middleware\ThrottlePasswordReset;
@@ -20,7 +22,7 @@ use Illuminate\Support\Facades\Route;
 
 /*
 |--------------------------------------------------------------------------
-| API V1 — Wisata Daerahku
+| API V1 â€” Wisata Daerahku
 |--------------------------------------------------------------------------
 | Routes are grouped by feature. Public and authenticated endpoints remain
 | within their respective feature prefixes. Existing URI, HTTP method,
@@ -195,6 +197,10 @@ Route::prefix('v1')->group(function () {
                 Route::get('{type}', 'download')->whereIn('type', ['invoice', 'ticket']);
             });
 
+        // Private per-unit tickets; legacy check-in remains explicitly disabled.
+        Route::get('{booking}/tickets', [TicketController::class, 'index'])->name('tickets.index');
+        Route::get('{booking}/tickets/{ticket}/qr', [TicketController::class, 'qr'])->name('tickets.qr');
+
         Route::post('{booking}/check-in', [VisitController::class, 'checkIn']);
         Route::post('{booking}/review', [VisitController::class, 'review']);
     });
@@ -231,10 +237,17 @@ Route::prefix('v1')->group(function () {
 
     /*
     |--------------------------------------------------------------------------
-    | Admin — Accounts, Catalog, Facilities & Booking Approvals
+    | Admin â€” Accounts, Catalog, Facilities & Booking Approvals
     |--------------------------------------------------------------------------
     */
     Route::prefix('admin')->middleware(AuthenticateApiToken::class)->group(function () {
+        // Online staff scanner: preview never commits; confirm requires Idempotency-Key.
+        Route::prefix('ticket-check-ins')->controller(TicketCheckInController::class)->group(function () {
+            Route::get('scope', 'scope');
+            Route::post('preview', 'preview')->middleware('throttle:ticket-scans')->name('admin.ticket-check-ins.preview');
+            Route::post('confirm', 'confirm')->middleware('throttle:ticket-scans')->name('admin.ticket-check-ins.confirm');
+        });
+
         Route::get('geocoding/reverse', LocationGeocodingController::class)
             ->middleware('throttle:30,1')->name('admin.geocoding.reverse');
 
@@ -258,6 +271,10 @@ Route::prefix('v1')->group(function () {
                     ->name('admin.destinations.gallery.image');
             });
 
+            // Assignment management is authorized for Superadmin in request/service.
+            Route::get('{destination}/admins', [TicketCheckInController::class, 'admins']);
+            Route::put('{destination}/admins', [TicketCheckInController::class, 'assign']);
+
             Route::put('{destination}/facilities', [FacilityController::class, 'assign'])
                 ->name('admin.destinations.facilities');
         });
@@ -272,7 +289,7 @@ Route::prefix('v1')->group(function () {
 
     /*
     |--------------------------------------------------------------------------
-    | Superadmin — Facility Master Data
+    | Superadmin â€” Facility Master Data
     |--------------------------------------------------------------------------
     */
     Route::prefix('superadmin')

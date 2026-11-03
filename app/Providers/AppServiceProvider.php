@@ -22,6 +22,11 @@ class AppServiceProvider extends ServiceProvider
      */
     public function boot(): void
     {
+        RateLimiter::for('ticket-scans', fn (Request $request) => [
+            Limit::perMinute(120)->by('ticket-actor:'.$request->user()?->guid),
+            Limit::perMinute(240)->by('ticket-ip:'.$request->ip()),
+        ]);
+
         RateLimiter::for('verification-otp', function (Request $request) {
             $email = is_string($request->input('email')) ? strtolower(trim($request->input('email'))) : '';
 
