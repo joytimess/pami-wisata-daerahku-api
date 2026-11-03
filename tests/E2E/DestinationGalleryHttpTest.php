@@ -33,6 +33,7 @@ it('saves and replays real multipart galleries over HTTP and serves optimized me
         ->post('destinations', [
             'destination_category_guid' => $category->guid, 'name' => 'HTTP Gallery',
             'location' => 'Local', 'description' => 'Real multipart parser and MySQL integration',
+            'latitude' => '-7.8012345', 'longitude' => '110.3645678',
             'ticket_price' => '0', 'opening_hours' => '08:00-17:00', 'timezone' => 'Asia/Jakarta',
         ]);
     expect($created->status())->toBe(201, $created->body());

@@ -45,9 +45,13 @@ class CatalogRequest extends FormRequest
             ];
         }
 
+        $coordinatesRequired = $this->routeIs('destinations.store') || $this->hasAny(['latitude', 'longitude']);
+
         return [
             'destination_category_guid' => [$required, 'uuid', Rule::exists('destination_categories', 'guid')],
             'name' => [$required, 'string', 'max:255'], 'location' => [$required, 'string', 'max:255'],
+            'latitude' => [$coordinatesRequired ? 'required' : 'sometimes', 'numeric', 'between:-90,90'],
+            'longitude' => [$coordinatesRequired ? 'required' : 'sometimes', 'numeric', 'between:-180,180'],
             'description' => [$required, 'string'], 'ticket_price' => [$required, 'integer', 'min:0', 'max:1000000000000'],
             'currency' => ['sometimes', Rule::in(['IDR'])], 'opening_hours' => [$required, 'string'],
             'timezone' => [$required, 'timezone'], 'image' => ['sometimes', 'image', 'mimes:jpg,jpeg,png,webp', 'max:5120'],

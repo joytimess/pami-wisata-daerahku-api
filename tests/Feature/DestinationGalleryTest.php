@@ -20,7 +20,7 @@ function galleryFields(): array
 {
     $category = DestinationCategory::create(['name' => 'Gallery nature', 'slug' => 'gallery-'.Str::random(8)]);
 
-    return ['destination_category_guid' => $category->guid, 'name' => 'Gallery park', 'location' => 'Town', 'description' => 'Gallery description', 'ticket_price' => 1000, 'opening_hours' => '08:00-17:00', 'timezone' => 'Asia/Jakarta'];
+    return ['destination_category_guid' => $category->guid, 'name' => 'Gallery park', 'location' => 'Town', 'latitude' => -7.8012345, 'longitude' => 110.3645678, 'description' => 'Gallery description', 'ticket_price' => 1000, 'opening_hours' => '08:00-17:00', 'timezone' => 'Asia/Jakarta'];
 }
 
 function galleryHeaders(User $user, ?string $key = null): array

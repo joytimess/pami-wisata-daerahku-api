@@ -87,6 +87,7 @@ function e2eDestination(string $adminToken, string $categoryGuid, int $price = 0
 {
     $response = e2e($adminToken)->withHeaders(['Idempotency-Key' => (string) Str::uuid()])->attach('image', tinyPng(), 'destination.png')->post('destinations', [
         'destination_category_guid' => $categoryGuid, 'name' => $name, 'location' => 'Bali', 'description' => 'Indah',
+        'latitude' => '-8.4095178', 'longitude' => '115.188916',
         'ticket_price' => $price, 'opening_hours' => '08:00-17:00', 'timezone' => 'Asia/Makassar',
     ]);
     expect($response->status())->toBe(201);

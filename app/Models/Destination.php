@@ -19,11 +19,11 @@ class Destination extends Model
 
     protected $attributes = ['is_active' => true, 'currency' => 'IDR'];
 
-    protected $fillable = ['destination_category_guid', 'name', 'location', 'description', 'ticket_price', 'currency', 'opening_hours', 'timezone', 'image_path', 'is_active'];
+    protected $fillable = ['destination_category_guid', 'name', 'location', 'latitude', 'longitude', 'description', 'ticket_price', 'currency', 'opening_hours', 'timezone', 'image_path', 'is_active'];
 
     protected function casts(): array
     {
-        return ['is_active' => 'boolean', 'ticket_price' => 'integer', 'gallery_version' => 'integer'];
+        return ['is_active' => 'boolean', 'ticket_price' => 'integer', 'gallery_version' => 'integer', 'latitude' => 'decimal:7', 'longitude' => 'decimal:7'];
     }
 
     public function newUniqueId(): string

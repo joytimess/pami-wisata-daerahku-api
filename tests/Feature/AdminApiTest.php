@@ -13,7 +13,7 @@ uses(RefreshDatabase::class);
 
 function destinationFields(DestinationCategory $category, array $over = []): array
 {
-    return $over + ['destination_category_guid' => $category->guid, 'name' => 'Pantai Baru', 'location' => 'Bali', 'description' => 'Indah', 'ticket_price' => 15000, 'opening_hours' => '08:00-17:00', 'timezone' => 'Asia/Makassar', 'image' => UploadedFile::fake()->image('destination.png'), 'operation_key' => (string) Str::uuid()];
+    return $over + ['destination_category_guid' => $category->guid, 'name' => 'Pantai Baru', 'location' => 'Bali', 'latitude' => -8.4095178, 'longitude' => 115.188916, 'description' => 'Indah', 'ticket_price' => 15000, 'opening_hours' => '08:00-17:00', 'timezone' => 'Asia/Makassar', 'image' => UploadedFile::fake()->image('destination.png'), 'operation_key' => (string) Str::uuid()];
 }
 
 it('manages categories with role 2 only and protects categories in use', function () {

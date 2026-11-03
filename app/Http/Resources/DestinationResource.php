@@ -17,6 +17,8 @@ class DestinationResource extends JsonResource
             'guid' => $this->guid, 'destination_category_guid' => $this->destination_category_guid,
             'category' => new CategoryResource($this->whenLoaded('category')), 'name' => $this->name,
             'location' => $this->location, 'description' => $this->description, 'ticket_price' => $this->ticket_price,
+            'latitude' => $this->latitude === null ? null : (float) $this->latitude,
+            'longitude' => $this->longitude === null ? null : (float) $this->longitude,
             'currency' => $this->currency, 'opening_hours' => $this->opening_hours, 'timezone' => $this->timezone,
             // Storage paths are internal. Clients load the picture from `image_url`, a path relative to the
             // API base URL (…/api/v1/) that is versioned so a replaced image is never served stale.

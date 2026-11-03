@@ -11,89 +11,278 @@ use App\Http\Controllers\Api\V1\DestinationController;
 use App\Http\Controllers\Api\V1\FacilityController;
 use App\Http\Controllers\Api\V1\FavoriteController;
 use App\Http\Controllers\Api\V1\InboxController;
+use App\Http\Controllers\Api\V1\LocationGeocodingController;
 use App\Http\Controllers\Api\V1\QuotaController;
 use App\Http\Controllers\Api\V1\VisitController;
 use App\Http\Middleware\AuthenticateApiToken;
 use App\Http\Middleware\ThrottlePasswordReset;
 use Illuminate\Support\Facades\Route;
 
+/*
+|--------------------------------------------------------------------------
+| API V1 — Wisata Daerahku
+|--------------------------------------------------------------------------
+| Routes are grouped by feature. Public and authenticated endpoints remain
+| within their respective feature prefixes. Existing URI, HTTP method,
+| controller action, middleware, rate limits and route names are preserved.
+| See docs/API-ROUTES.md for the endpoint inventory and conventions.
+*/
 Route::prefix('v1')->group(function () {
-    Route::middleware('throttle:10,1')->group(function () {
-        Route::post('auth/register', [AuthController::class, 'register']);
-        Route::post('auth/email-verification/verify-otp', [AccountController::class, 'verifyOtp'])->middleware('throttle:verification-otp');
-        Route::post('auth/email-verification/resend-otp', [AccountController::class, 'resendOtp'])->middleware('throttle:verification-otp');
-        Route::post('auth/login', [AuthController::class, 'login']);
-        Route::post('auth/google', [AuthController::class, 'google']);
-        Route::post('auth/refresh', [AuthController::class, 'refresh']);
-        Route::post('auth/forgot-password', [AccountController::class, 'forgot'])->middleware(ThrottlePasswordReset::class);
-        Route::post('auth/password-reset/resend-otp', [AccountController::class, 'forgot'])->middleware(ThrottlePasswordReset::class);
-        Route::post('auth/password-reset/verify-otp', [AccountController::class, 'verifyPasswordResetOtp'])->middleware(ThrottlePasswordReset::class);
-        Route::post('auth/reset-password', [AccountController::class, 'reset'])->middleware(ThrottlePasswordReset::class);
-    });
-    Route::get('auth/email/verify/{id}/{hash}', [AccountController::class, 'verify'])->middleware(['signed', 'throttle:6,1'])->name('verification.verify');
-    Route::get('categories', [CategoryController::class, 'index'])->name('categories.index');
-    Route::get('destinations', [DestinationController::class, 'index'])->name('destinations.index');
-    Route::get('destinations/{destination}', [DestinationController::class, 'show'])->name('destinations.show');
-    Route::get('destinations/{destination}/reviews', [VisitController::class, 'destinationReviews'])->name('destinations.reviews');
-    Route::get('destinations/{destination}/images/{image}/{variant}', [DestinationController::class, 'galleryImage'])->whereIn('variant', ['thumbnail', 'display', 'fullscreen'])->name('destinations.gallery.image');
-    Route::get('destinations/{destination}/image', [DestinationController::class, 'image'])->name('destinations.image');
-    Route::middleware(AuthenticateApiToken::class)->group(function () {
-        Route::get('facilities', [FacilityController::class, 'index'])->name('facilities.index');
-        Route::get('superadmin/facilities', [FacilityController::class, 'index'])->name('superadmin.facilities.index');
-        Route::post('superadmin/facilities', [FacilityController::class, 'store'])->name('superadmin.facilities.store');
-        Route::patch('superadmin/facilities/{facility}', [FacilityController::class, 'update'])->name('superadmin.facilities.update');
-        Route::delete('superadmin/facilities/{facility}', [FacilityController::class, 'destroy'])->name('superadmin.facilities.destroy');
-        Route::put('admin/destinations/{destination}/facilities', [FacilityController::class, 'assign'])->name('admin.destinations.facilities');
-        Route::get('auth/me', [AuthController::class, 'me']);
-        Route::post('auth/logout', [AuthController::class, 'logout']);
-        Route::post('profile/close', [AccountController::class, 'close'])->middleware('throttle:6,1');
-        Route::patch('profile', [AccountController::class, 'update']);
-        Route::post('profile/avatar', [AvatarController::class, 'upload'])->middleware('throttle:20,1');
-        Route::put('profile/avatar/preference', [AvatarController::class, 'preference'])->middleware('throttle:20,1');
-        Route::get('profile/avatar', [AvatarController::class, 'show'])->name('profile.avatar');
-        Route::get('profile/statistics', [VisitController::class, 'statistics']);
-        Route::get('reviews', [VisitController::class, 'history']);
-        Route::post('auth/email/verification-notification', [AccountController::class, 'resend'])->middleware('throttle:6,1');
 
-        Route::post('categories', [CategoryController::class, 'store'])->name('categories.store');
-        Route::patch('categories/{category}', [CategoryController::class, 'update'])->name('categories.update');
-        Route::delete('categories/{category}', [CategoryController::class, 'destroy'])->name('categories.destroy');
-        Route::post('destinations', [DestinationController::class, 'store'])->middleware('throttle:20,1')->name('destinations.store');
-        Route::patch('destinations/{destination}', [DestinationController::class, 'update'])->middleware('throttle:20,1')->name('destinations.update');
-        Route::delete('destinations/{destination}', [DestinationController::class, 'destroy'])->name('destinations.destroy');
-        Route::get('admin/categories', [CategoryController::class, 'adminIndex'])->name('admin.categories.index');
-        Route::get('admin/destinations', [DestinationController::class, 'adminIndex'])->name('admin.destinations.index');
-        Route::get('admin/destinations/{destination}', [DestinationController::class, 'adminShow'])->name('admin.destinations.show');
-        Route::get('admin/destinations/{destination}/images/{image}/{variant}', [DestinationController::class, 'galleryImage'])->whereIn('variant', ['thumbnail', 'display', 'fullscreen'])->name('admin.destinations.gallery.image');
-        Route::get('admin/destinations/{destination}/image', [DestinationController::class, 'image'])->name('destinations.image.admin');
-        Route::post('destinations/{destination}/image', [DestinationController::class, 'updateImage'])->middleware('throttle:20,1')->name('destinations.image.update');
-        Route::get('destinations/{destination}/availability', [QuotaController::class, 'availability'])->name('destinations.availability');
-        Route::get('destinations/{destination}/quotas', [QuotaController::class, 'index']);
-        Route::put('destinations/{destination}/quotas', [QuotaController::class, 'upsert']);
-        Route::get('favorites', [FavoriteController::class, 'index']);
-        Route::put('favorites/{destination}', [FavoriteController::class, 'store']);
-        Route::delete('favorites/{destination}', [FavoriteController::class, 'destroy']);
-        Route::get('bookings', [BookingController::class, 'index'])->name('bookings.index');
-        Route::post('bookings', [BookingController::class, 'store']);
-        Route::get('booking-intents/{key}', [BookingController::class, 'intent']);
-        Route::post('booking-intents/{key}/abandon', [BookingController::class, 'abandonIntent']);
-        Route::post('bookings/{booking}/cancel', [BookingController::class, 'cancel']);
-        Route::get('bookings/{booking}/documents', [BookingDocumentController::class, 'show']);
-        Route::get('bookings/{booking}/documents/{type}', [BookingDocumentController::class, 'download'])->whereIn('type', ['invoice', 'ticket']);
-        Route::get('bookings/{booking}', [BookingController::class, 'show']);
-        Route::post('bookings/{booking}/check-in', [VisitController::class, 'checkIn']);
-        Route::post('bookings/{booking}/review', [VisitController::class, 'review']);
-        Route::get('admin/accounts', [AdminAccountController::class, 'index']);
-        Route::post('admin/accounts', [AdminAccountController::class, 'store']);
-        Route::patch('admin/accounts/{user}', [AdminAccountController::class, 'update']);
-        Route::get('admin/bookings', [BookingController::class, 'adminIndex'])->name('admin.bookings.index');
-        Route::get('admin/bookings/{booking}', [BookingController::class, 'adminShow'])->name('admin.bookings.show');
-        Route::post('admin/bookings/{booking}/approve', [BookingController::class, 'approve']);
-        Route::post('admin/bookings/{booking}/reject', [BookingController::class, 'reject']);
-        Route::get('notifications', [InboxController::class, 'index']);
-        Route::get('notifications/unread-count', [InboxController::class, 'unread']);
-        Route::patch('notifications/{guid}/read', [InboxController::class, 'read']);
-        Route::put('devices', [InboxController::class, 'register']);
-        Route::delete('devices', [InboxController::class, 'unregister']);
+    /*
+    |--------------------------------------------------------------------------
+    | Authentication & Email Verification
+    |--------------------------------------------------------------------------
+    */
+    Route::prefix('auth')->group(function () {
+        Route::middleware('throttle:10,1')->group(function () {
+            Route::post('register', [AuthController::class, 'register']);
+            Route::post('login', [AuthController::class, 'login']);
+            Route::post('google', [AuthController::class, 'google']);
+            Route::post('refresh', [AuthController::class, 'refresh']);
+
+            Route::prefix('email-verification')->controller(AccountController::class)->group(function () {
+                Route::post('verify-otp', 'verifyOtp')->middleware('throttle:verification-otp');
+                Route::post('resend-otp', 'resendOtp')->middleware('throttle:verification-otp');
+            });
+
+            Route::post('forgot-password', [AccountController::class, 'forgot'])
+                ->middleware(ThrottlePasswordReset::class);
+            Route::post('reset-password', [AccountController::class, 'reset'])
+                ->middleware(ThrottlePasswordReset::class);
+
+            Route::prefix('password-reset')->controller(AccountController::class)->group(function () {
+                Route::post('resend-otp', 'forgot')->middleware(ThrottlePasswordReset::class);
+                Route::post('verify-otp', 'verifyPasswordResetOtp')->middleware(ThrottlePasswordReset::class);
+            });
+        });
+
+        Route::get('email/verify/{id}/{hash}', [AccountController::class, 'verify'])
+            ->middleware(['signed', 'throttle:6,1'])
+            ->name('verification.verify');
+
+        Route::middleware(AuthenticateApiToken::class)->group(function () {
+            Route::get('me', [AuthController::class, 'me']);
+            Route::post('logout', [AuthController::class, 'logout']);
+            Route::post('email/verification-notification', [AccountController::class, 'resend'])
+                ->middleware('throttle:6,1');
+        });
     });
+
+    /*
+    |--------------------------------------------------------------------------
+    | Profile & Avatar
+    |--------------------------------------------------------------------------
+    */
+    Route::prefix('profile')->middleware(AuthenticateApiToken::class)->group(function () {
+        Route::patch('/', [AccountController::class, 'update']);
+        Route::post('close', [AccountController::class, 'close'])->middleware('throttle:6,1');
+        Route::get('statistics', [VisitController::class, 'statistics']);
+
+        Route::prefix('avatar')->controller(AvatarController::class)->group(function () {
+            Route::get('/', 'show')->name('profile.avatar');
+            Route::post('/', 'upload')->middleware('throttle:20,1');
+            Route::put('preference', 'preference')->middleware('throttle:20,1');
+        });
+    });
+
+    /*
+    |--------------------------------------------------------------------------
+    | Destination Categories
+    |--------------------------------------------------------------------------
+    */
+    Route::prefix('categories')->controller(CategoryController::class)->group(function () {
+        Route::get('/', 'index')->name('categories.index');
+
+        Route::middleware(AuthenticateApiToken::class)->group(function () {
+            Route::post('/', 'store')->name('categories.store');
+            Route::patch('{category}', 'update')->name('categories.update');
+            Route::delete('{category}', 'destroy')->name('categories.destroy');
+        });
+    });
+
+    /*
+    |--------------------------------------------------------------------------
+    | Destination Catalog, Gallery & Quotas
+    |--------------------------------------------------------------------------
+    */
+    Route::prefix('destinations')->group(function () {
+        Route::controller(DestinationController::class)->group(function () {
+            Route::get('/', 'index')->name('destinations.index');
+            Route::get('{destination}', 'show')->name('destinations.show');
+            Route::get('{destination}/image', 'image')->name('destinations.image');
+            Route::get('{destination}/images/{image}/{variant}', 'galleryImage')
+                ->whereIn('variant', ['thumbnail', 'display', 'fullscreen'])
+                ->name('destinations.gallery.image');
+        });
+
+        Route::get('{destination}/reviews', [VisitController::class, 'destinationReviews'])
+            ->name('destinations.reviews');
+
+        Route::middleware(AuthenticateApiToken::class)->group(function () {
+            Route::controller(DestinationController::class)->group(function () {
+                Route::post('/', 'store')->middleware('throttle:20,1')->name('destinations.store');
+                Route::patch('{destination}', 'update')->middleware('throttle:20,1')->name('destinations.update');
+                Route::delete('{destination}', 'destroy')->name('destinations.destroy');
+                Route::post('{destination}/image', 'updateImage')
+                    ->middleware('throttle:20,1')->name('destinations.image.update');
+            });
+
+            Route::prefix('{destination}')->controller(QuotaController::class)->group(function () {
+                Route::get('availability', 'availability')->name('destinations.availability');
+                Route::get('quotas', 'index');
+                Route::put('quotas', 'upsert');
+            });
+        });
+    });
+
+    /*
+    |--------------------------------------------------------------------------
+    | Facilities (Authenticated Catalog)
+    |--------------------------------------------------------------------------
+    */
+    Route::prefix('facilities')
+        ->middleware(AuthenticateApiToken::class)
+        ->controller(FacilityController::class)
+        ->group(function () {
+            Route::get('/', 'index')->name('facilities.index');
+        });
+
+    /*
+    |--------------------------------------------------------------------------
+    | Favorites
+    |--------------------------------------------------------------------------
+    */
+    Route::prefix('favorites')
+        ->middleware(AuthenticateApiToken::class)
+        ->controller(FavoriteController::class)
+        ->group(function () {
+            Route::get('/', 'index');
+            Route::put('{destination}', 'store');
+            Route::delete('{destination}', 'destroy');
+        });
+
+    /*
+    |--------------------------------------------------------------------------
+    | Booking Intents & Idempotency
+    |--------------------------------------------------------------------------
+    */
+    Route::prefix('booking-intents')
+        ->middleware(AuthenticateApiToken::class)
+        ->controller(BookingController::class)
+        ->group(function () {
+            Route::get('{key}', 'intent');
+            Route::post('{key}/abandon', 'abandonIntent');
+        });
+
+    /*
+    |--------------------------------------------------------------------------
+    | Bookings, Private Documents, Check-in & Reviews
+    |--------------------------------------------------------------------------
+    */
+    Route::prefix('bookings')->middleware(AuthenticateApiToken::class)->group(function () {
+        Route::controller(BookingController::class)->group(function () {
+            Route::get('/', 'index')->name('bookings.index');
+            Route::post('/', 'store');
+            Route::get('{booking}', 'show');
+            Route::post('{booking}/cancel', 'cancel');
+        });
+
+        Route::prefix('{booking}/documents')
+            ->controller(BookingDocumentController::class)
+            ->group(function () {
+                Route::get('/', 'show');
+                Route::get('{type}', 'download')->whereIn('type', ['invoice', 'ticket']);
+            });
+
+        Route::post('{booking}/check-in', [VisitController::class, 'checkIn']);
+        Route::post('{booking}/review', [VisitController::class, 'review']);
+    });
+
+    /*
+    |--------------------------------------------------------------------------
+    | Review History
+    |--------------------------------------------------------------------------
+    */
+    Route::prefix('reviews')
+        ->middleware(AuthenticateApiToken::class)
+        ->controller(VisitController::class)
+        ->group(function () {
+            Route::get('/', 'history');
+        });
+
+    /*
+    |--------------------------------------------------------------------------
+    | Notifications & FCM Devices
+    |--------------------------------------------------------------------------
+    */
+    Route::middleware(AuthenticateApiToken::class)->group(function () {
+        Route::prefix('notifications')->controller(InboxController::class)->group(function () {
+            Route::get('/', 'index');
+            Route::get('unread-count', 'unread');
+            Route::patch('{guid}/read', 'read');
+        });
+
+        Route::prefix('devices')->controller(InboxController::class)->group(function () {
+            Route::put('/', 'register');
+            Route::delete('/', 'unregister');
+        });
+    });
+
+    /*
+    |--------------------------------------------------------------------------
+    | Admin — Accounts, Catalog, Facilities & Booking Approvals
+    |--------------------------------------------------------------------------
+    */
+    Route::prefix('admin')->middleware(AuthenticateApiToken::class)->group(function () {
+        Route::get('geocoding/reverse', LocationGeocodingController::class)
+            ->middleware('throttle:30,1')->name('admin.geocoding.reverse');
+
+        Route::prefix('accounts')->controller(AdminAccountController::class)->group(function () {
+            Route::get('/', 'index');
+            Route::post('/', 'store');
+            Route::patch('{user}', 'update');
+        });
+
+        Route::prefix('categories')->controller(CategoryController::class)->group(function () {
+            Route::get('/', 'adminIndex')->name('admin.categories.index');
+        });
+
+        Route::prefix('destinations')->group(function () {
+            Route::controller(DestinationController::class)->group(function () {
+                Route::get('/', 'adminIndex')->name('admin.destinations.index');
+                Route::get('{destination}', 'adminShow')->name('admin.destinations.show');
+                Route::get('{destination}/image', 'image')->name('destinations.image.admin');
+                Route::get('{destination}/images/{image}/{variant}', 'galleryImage')
+                    ->whereIn('variant', ['thumbnail', 'display', 'fullscreen'])
+                    ->name('admin.destinations.gallery.image');
+            });
+
+            Route::put('{destination}/facilities', [FacilityController::class, 'assign'])
+                ->name('admin.destinations.facilities');
+        });
+
+        Route::prefix('bookings')->controller(BookingController::class)->group(function () {
+            Route::get('/', 'adminIndex')->name('admin.bookings.index');
+            Route::get('{booking}', 'adminShow')->name('admin.bookings.show');
+            Route::post('{booking}/approve', 'approve');
+            Route::post('{booking}/reject', 'reject');
+        });
+    });
+
+    /*
+    |--------------------------------------------------------------------------
+    | Superadmin — Facility Master Data
+    |--------------------------------------------------------------------------
+    */
+    Route::prefix('superadmin')
+        ->middleware(AuthenticateApiToken::class)
+        ->group(function () {
+            Route::prefix('facilities')->controller(FacilityController::class)->group(function () {
+                Route::get('/', 'index')->name('superadmin.facilities.index');
+                Route::post('/', 'store')->name('superadmin.facilities.store');
+                Route::patch('{facility}', 'update')->name('superadmin.facilities.update');
+                Route::delete('{facility}', 'destroy')->name('superadmin.facilities.destroy');
+            });
+        });
 });
