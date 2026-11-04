@@ -80,3 +80,11 @@ function bookingPayload(Destination $destination, string $date, int $quantity = 
 {
     return ['destination_guid' => $destination->guid, 'visit_date' => $date, 'quantity' => $quantity, 'visitor_name' => 'Visitor', 'visitor_email' => 'visitor@example.com', 'visitor_phone' => '+6281234567890'];
 }
+
+function assignTestDestination(User $admin, Destination $destination): void
+{
+    DB::table('destination_admin_assignments')->insertOrIgnore([
+        'guid' => (string) Str::uuid(), 'destination_guid' => $destination->guid,
+        'user_guid' => $admin->guid, 'assigned_by_user_guid' => $admin->guid, 'created_at' => now(),
+    ]);
+}

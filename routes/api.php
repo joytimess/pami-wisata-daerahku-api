@@ -2,6 +2,7 @@
 
 use App\Http\Controllers\Api\V1\AccountController;
 use App\Http\Controllers\Api\V1\AdminAccountController;
+use App\Http\Controllers\Api\V1\ApprovalQueueController;
 use App\Http\Controllers\Api\V1\AuthController;
 use App\Http\Controllers\Api\V1\AvatarController;
 use App\Http\Controllers\Api\V1\BookingController;
@@ -12,6 +13,8 @@ use App\Http\Controllers\Api\V1\FacilityController;
 use App\Http\Controllers\Api\V1\FavoriteController;
 use App\Http\Controllers\Api\V1\InboxController;
 use App\Http\Controllers\Api\V1\LocationGeocodingController;
+use App\Http\Controllers\Api\V1\OperationalDashboardController;
+use App\Http\Controllers\Api\V1\PaymentPreviewController;
 use App\Http\Controllers\Api\V1\QuotaController;
 use App\Http\Controllers\Api\V1\TicketCheckInController;
 use App\Http\Controllers\Api\V1\TicketController;
@@ -30,6 +33,15 @@ use Illuminate\Support\Facades\Route;
 | See docs/API-ROUTES.md for the endpoint inventory and conventions.
 */
 Route::prefix('v1')->group(function () {
+    Route::middleware(AuthenticateApiToken::class)->group(function () {
+        Route::get('bookings/{booking}/payment-preview', PaymentPreviewController::class);
+        Route::get('admin/dashboard/{section}', OperationalDashboardController::class)
+            ->whereIn('section', ['overview', 'approvals', 'destinations', 'visitors', 'action-center'])->name('admin.dashboard');
+        Route::get('admin/approval-queue', OperationalDashboardController::class)->name('admin.approval-queue');
+        Route::post('admin/bookings/{booking}/claim', [ApprovalQueueController::class, 'claim'])->middleware('throttle:60,1');
+        Route::post('admin/bookings/{booking}/release', [ApprovalQueueController::class, 'release'])->middleware('throttle:60,1');
+        Route::post('superadmin/bookings/{booking}/reassign', [ApprovalQueueController::class, 'reassign'])->middleware('throttle:60,1')->name('superadmin.bookings.reassign');
+    });
 
     /*
     |--------------------------------------------------------------------------

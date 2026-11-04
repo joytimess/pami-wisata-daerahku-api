@@ -9,6 +9,7 @@ use App\Models\User;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Gate;
+use Illuminate\Support\Str;
 use Illuminate\Validation\ValidationException;
 
 class DestinationGalleryService
@@ -31,6 +32,8 @@ class DestinationGalleryService
         if ($key) {
             $operation = DB::table('destination_gallery_operations')->where('actor_guid', $actor->guid)->where('operation_key', $key)->first();
             if ($operation) {
+                $saved = json_decode($operation->response, true, flags: JSON_THROW_ON_ERROR);
+                app(AdminDestinationScopeService::class)->authorize($actor, $destination?->guid ?? $saved['guid']);
                 $currentActor = User::whereKey($actor->guid)->firstOrFail();
                 abort_unless($currentActor->status === 'active' && (int) $currentActor->role >= 1, 403);
                 if ($destination) {
@@ -50,11 +53,19 @@ class DestinationGalleryService
             }
 
             return DB::transaction(function () use ($data, $actor, $destination, $manifest, $hash, $key, $staged): array {
+                if ($destination) {
+                    app(AdminDestinationScopeService::class)->lockDestination($destination->guid);
+                }
                 $lockedActor = User::whereKey($actor->guid)->lockForUpdate()->firstOrFail();
+                if ($destination) {
+                    app(AdminDestinationScopeService::class)->authorize($lockedActor, $destination->guid, true);
+                }
                 abort_unless($lockedActor->status === 'active' && (int) $lockedActor->role >= 1, 403);
                 if ($key) {
                     $operation = DB::table('destination_gallery_operations')->where('actor_guid', $actor->guid)->where('operation_key', $key)->first();
                     if ($operation) {
+                        $saved = json_decode($operation->response, true, flags: JSON_THROW_ON_ERROR);
+                        app(AdminDestinationScopeService::class)->authorize($lockedActor, $destination?->guid ?? $saved['guid']);
                         if ($operation->payload_hash !== $hash) {
                             throw new BookingException('Idempotency key belongs to a different save.', 'gallery_idempotency_conflict');
                         }
@@ -79,6 +90,10 @@ class DestinationGalleryService
                 }
                 app(CatalogService::class)->destinationSave(Arr::except($data, ['new_images', 'images', 'image', 'gallery_manifest', 'gallery_version', 'operation_key']), $model);
                 $model->refresh();
+                if (! $destination && (int) $lockedActor->role === 1) {
+                    DB::table('destination_admin_assignments')->insert(['guid' => (string) Str::uuid(), 'destination_guid' => $model->guid, 'user_guid' => $lockedActor->guid, 'assigned_by_user_guid' => $lockedActor->guid, 'created_at' => now()]);
+                    DB::table('destination_admin_assignment_histories')->insert(['guid' => (string) Str::uuid(), 'destination_guid' => $model->guid, 'user_guid' => $lockedActor->guid, 'actor_guid' => $lockedActor->guid, 'action' => 'assigned', 'created_at' => now()]);
+                }
                 $model->images()->increment('sequence', 100);
                 foreach ($manifest as $index => $entry) {
                     if (isset($entry['image_guid'])) {

@@ -18,7 +18,11 @@ class BookingNotificationService
             'payment_review' => ['Pembayaran perlu ditinjau', 'Status pembayaran booking perlu ditinjau.', true],
         };
         $users = $admin
-            ? DB::table('users')->where('role', '>=', 1)->where('status', 'active')->pluck('guid')
+            ? DB::table('users')->where('status', 'active')->where(fn ($users) => $users->where('role', 2)->orWhere(fn ($users) => $users->where('role', 1)
+                ->whereExists(fn ($assigned) => $assigned->selectRaw('1')->from('destination_admin_assignments')
+                    ->join('destination_quotas', 'destination_quotas.destination_guid', '=', 'destination_admin_assignments.destination_guid')
+                    ->join('bookings', 'bookings.destination_quota_guid', '=', 'destination_quotas.guid')
+                    ->where('bookings.guid', $bookingGuid)->whereColumn('destination_admin_assignments.user_guid', 'users.guid'))))->pluck('guid')
             : collect([$ownerGuid]);
         foreach ($users as $userGuid) {
             $now = now();

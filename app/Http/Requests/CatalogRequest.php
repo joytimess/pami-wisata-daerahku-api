@@ -2,6 +2,8 @@
 
 namespace App\Http\Requests;
 
+use App\Models\Destination;
+use App\Services\AdminDestinationScopeService;
 use Illuminate\Foundation\Http\FormRequest;
 use Illuminate\Validation\Rule;
 
@@ -20,7 +22,14 @@ class CatalogRequest extends FormRequest
         }
         $role = $this->user()?->role;
 
-        return $role !== null && (int) $role >= $this->requiredRole();
+        if ($role === null || (int) $role < $this->requiredRole() || $this->user()->status !== 'active') {
+            return false;
+        }
+        if ($this->route('destination') instanceof Destination) {
+            return app(AdminDestinationScopeService::class)->allows($this->user(), $this->route('destination')->guid);
+        }
+
+        return true;
     }
 
     public function rules(): array

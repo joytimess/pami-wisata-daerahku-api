@@ -2,6 +2,8 @@
 
 namespace App\Jobs;
 
+use App\Models\User;
+use App\Services\AdminDestinationScopeService;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Queue\Queueable;
 use Illuminate\Support\Facades\DB;
@@ -33,12 +35,19 @@ class DeliverBookingNotification implements ShouldQueue
         $delivery = DB::table('notification_deliveries')->join('notifications', 'notifications.guid', '=', 'notification_deliveries.notification_guid')
             ->join('users', 'users.guid', '=', 'notifications.user_guid')
             ->where('notification_deliveries.guid', $this->deliveryGuid)
-            ->select('notification_deliveries.*', 'notifications.user_guid', 'notifications.booking_guid', 'notifications.title', 'notifications.body', 'users.email', 'users.status as user_status')->first();
+            ->select('notification_deliveries.*', 'notifications.user_guid', 'notifications.booking_guid', 'notifications.title', 'notifications.body', 'notifications.type', 'users.email', 'users.status as user_status')->first();
         if (! $delivery) {
             return;
         }
         try {
-            if ($delivery->user_status !== 'active') {
+            $authorized = true;
+            if ($delivery->booking_guid && in_array($delivery->type, ['booking.created', 'booking.cancelled', 'booking.payment_review'], true)) {
+                $user = User::find($delivery->user_guid);
+                $destination = DB::table('bookings')->join('destination_quotas', 'destination_quotas.guid', '=', 'bookings.destination_quota_guid')->where('bookings.guid', $delivery->booking_guid)->value('destination_quotas.destination_guid');
+                $authorized = $user && $destination && $user->status === 'active' && in_array((int) $user->role, [1, 2], true)
+                    && app(AdminDestinationScopeService::class)->allows($user, $destination);
+            }
+            if ($delivery->user_status !== 'active' || ! $authorized) {
                 $status = 'cancelled';
             } elseif ($delivery->channel === 'fcm') {
                 $device = DB::table('device_tokens')->where('guid', $delivery->target_key)->where('user_guid', $delivery->user_guid)->first();

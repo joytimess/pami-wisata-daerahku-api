@@ -24,6 +24,7 @@ function fcmDeliveryFixture(): array
     $category = DestinationCategory::create(['name' => 'Nature', 'slug' => 'nature']);
     $destination = Destination::create(['destination_category_guid' => $category->guid, 'name' => 'Park', 'location' => 'Town', 'description' => 'Park', 'ticket_price' => 0, 'currency' => 'IDR', 'opening_hours' => '08:00-17:00', 'timezone' => 'Asia/Jakarta']);
     $date = now()->addDays(5)->toDateString();
+    assignTestDestination($admin, $destination);
     DB::table('destination_quotas')->insert(['guid' => (string) Str::uuid(), 'destination_guid' => $destination->guid, 'visit_date' => $date, 'capacity' => 6, 'booking_opens_at' => now()->subDay(), 'booking_closes_at' => now()->addDay(), 'created_at' => now(), 'updated_at' => now()]);
     $booking = app(BookingService::class)->create($owner, ['idempotency_key' => 'fcm', 'destination_guid' => $destination->guid, 'visit_date' => $date, 'quantity' => 1, 'visitor_name' => 'Visitor', 'visitor_email' => 'visitor@example.com', 'visitor_phone' => '+6281234567890']);
 

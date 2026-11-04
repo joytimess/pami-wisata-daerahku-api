@@ -43,6 +43,7 @@ it('rejects approval at the deadline and expires the hold', function () {
     $service = app(BookingService::class);
     $input = ['idempotency_key' => 'first', 'destination_guid' => $destination->guid, 'visit_date' => $date, 'quantity' => 1, 'visitor_name' => 'Visitor', 'visitor_email' => 'visitor@example.com', 'visitor_phone' => '+6281234567890'];
     $booking = $service->create($user, $input);
+    assignTestDestination($admin, $destination);
     $this->travel(24)->hours();
     expect(fn () => $service->decide($admin, $booking->guid, true))->toThrow(BookingException::class);
     $service->expireDue();

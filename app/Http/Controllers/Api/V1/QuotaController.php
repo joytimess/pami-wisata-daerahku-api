@@ -15,7 +15,7 @@ class QuotaController extends Controller
 
     public function index(QuotaRequest $request, Destination $destination)
     {
-        return QuotaResource::collection($this->service->list($destination, $request->validated()));
+        return QuotaResource::collection($this->service->list($destination, $request->validated(), $request->user()));
     }
 
     public function availability(QuotaRequest $request, Destination $destination)
@@ -31,6 +31,6 @@ class QuotaController extends Controller
 
     public function upsert(QuotaRequest $request, Destination $destination)
     {
-        return new QuotaResource($this->service->upsert($destination, $request->validated()));
+        return new QuotaResource($this->service->upsert($destination, $request->validated(), $request->user()));
     }
 }

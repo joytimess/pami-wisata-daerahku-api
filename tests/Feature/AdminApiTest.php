@@ -118,6 +118,7 @@ it('exposes total, allocated and remaining quota with strict window validation',
     $admin = makeUser(1);
     $user = makeUser();
     [$destination, $date, $quota] = seedDestination(capacity: 10);
+    assignTestDestination($admin, $destination);
     $path = "/api/v1/destinations/{$destination->guid}/quotas";
     $visit = now()->addDays(20)->toDateString();
     $valid = ['visit_date' => $visit, 'capacity' => 8, 'booking_opens_at' => now()->toIso8601String(), 'booking_closes_at' => now()->addDays(10)->toIso8601String()];

@@ -1,7 +1,9 @@
 <?php
 
 use App\Exceptions\BookingException;
+use Illuminate\Auth\Access\AuthorizationException;
 use Illuminate\Auth\AuthenticationException;
+use Illuminate\Database\Eloquent\ModelNotFoundException;
 use Illuminate\Foundation\Application;
 use Illuminate\Foundation\Configuration\Exceptions;
 use Illuminate\Foundation\Configuration\Middleware;
@@ -40,6 +42,26 @@ return Application::configure(basePath: dirname(__DIR__))
             return response()->json(['message' => $status >= 500 ? 'Layanan tiket sedang tidak tersedia.' : 'Permintaan tiket tidak diizinkan atau tidak ditemukan.',
                 'code' => $status >= 500 ? 'ticket_service_unavailable' : 'ticket_request_denied'], $status)
                 ->header('Cache-Control', 'private, no-store');
+        });
+        $exceptions->render(function (Throwable $exception, Request $request) {
+            if (! $request->is('api/v1/admin/dashboard/*', 'api/v1/admin/approval-queue', 'api/v1/admin/bookings/*/claim', 'api/v1/admin/bookings/*/release', 'api/v1/superadmin/bookings/*/reassign', 'api/v1/bookings/*/payment-preview') || $exception instanceof BookingException) {
+                return null;
+            }
+            if ($exception instanceof ValidationException) {
+                return response()->json(['message' => 'Invalid request data.', 'code' => 'validation_failed', 'errors' => $exception->errors()], 422);
+            }
+            $status = match (true) {
+                $exception instanceof AuthenticationException => 401,
+                $exception instanceof AuthorizationException => 403,
+                $exception instanceof ModelNotFoundException => 404,
+                $exception instanceof HttpExceptionInterface => $exception->getStatusCode(),
+                default => 500,
+            };
+            $code = match ($status) {
+                401 => 'unauthenticated', 403 => 'forbidden', 404 => 'not_found', 422 => 'validation_failed', 429 => 'rate_limited', default => 'service_unavailable'
+            };
+
+            return response()->json(['message' => $status >= 500 ? 'Service unavailable.' : 'Request not allowed or resource unavailable.', 'code' => $code], $status)->header('Cache-Control', 'private, no-store');
         });
         $exceptions->shouldRenderJsonWhen(fn (Request $request) => $request->is('api/*') || $request->expectsJson());
         $exceptions->render(fn (BookingException $exception, Request $request) => $request->is('api/*') ? response()->json(['message' => $exception->getMessage(), 'code' => $exception->errorCode] + ($exception->context ? ['context' => $exception->context] : []), 409) : null);

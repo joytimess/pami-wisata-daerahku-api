@@ -16,7 +16,7 @@ use Illuminate\Support\Str;
 
 class BookingService
 {
-    public function __construct(private BookingNotificationService $notifications, private TicketService $tickets, private PaymentEligibility $payments) {}
+    public function __construct(private BookingNotificationService $notifications, private TicketService $tickets, private PaymentEligibility $payments, private AdminDestinationScopeService $scope, private ApprovalQueueService $claims) {}
 
     public function create(User $user, array $input): object
     {
@@ -168,6 +168,9 @@ class BookingService
             throw new AuthorizationException;
         }
         $query = $this->query()->orderByDesc('bookings.created_at')->orderBy('bookings.guid');
+        if ($admin) {
+            $this->scope->apply($query, $user, 'destination_quotas.destination_guid');
+        }
         if (! $admin) {
             $query->where('bookings.user_guid', $user->guid);
         }
@@ -199,7 +202,7 @@ class BookingService
             throw new AuthorizationException;
         }
 
-        return $this->format($this->query()->where('bookings.guid', $guid)->first() ?? throw new ModelNotFoundException);
+        return $this->format($this->scope->apply($this->query(), $actor, 'destination_quotas.destination_guid')->where('bookings.guid', $guid)->first() ?? throw new ModelNotFoundException);
     }
 
     /** Owner-only cancellation; only a booking still awaiting a decision may be released. */
@@ -222,6 +225,7 @@ class BookingService
             }
             DB::table('bookings')->where('guid', $guid)->update(['status' => 'cancelled', 'updated_at' => $now]);
             $this->history($guid, $user->guid, 'pending_approval', 'cancelled');
+            $this->claims->close($guid, $user->guid, 'expired', 'booking_cancelled');
             $this->notifications->record($guid, $booking->user_guid, 'cancelled');
 
             return $this->find($guid);
@@ -239,8 +243,11 @@ class BookingService
             if (! $ref) {
                 throw new ModelNotFoundException;
             }
+            $destinationGuid = DB::table('destination_quotas')->where('guid', $ref->destination_quota_guid)->value('destination_guid');
+            $this->scope->lockDestination($destinationGuid);
             $quota = DB::table('destination_quotas')->where('guid', $ref->destination_quota_guid)->lockForUpdate()->first();
             $booking = DB::table('bookings')->where('guid', $guid)->lockForUpdate()->first();
+            $actor = $this->scope->authorize($actor, $quota->destination_guid, true);
             $now = now();
             if ($booking->status !== 'pending_approval') {
                 throw new BookingException('Booking is no longer awaiting approval.', 'booking_not_pending', ['status' => $booking->status]);
@@ -253,6 +260,7 @@ class BookingService
             if ($approve && $now->copy()->addMinutes(BookingRules::APPROVE_LEAD_MINUTES)->gte($visitStart)) {
                 throw new BookingException('The visit date is too close for approval.', 'visit_date_too_close');
             }
+            $this->claims->decision($actor, $booking);
             $status = ! $approve ? 'rejected' : ($booking->total_amount == 0 ? 'confirmed' : 'awaiting_payment');
             $updates = ['status' => $status, 'updated_at' => $now];
             if ($status === 'awaiting_payment') {
@@ -261,6 +269,7 @@ class BookingService
             }
             DB::table('bookings')->where('guid', $guid)->update($updates);
             $this->history($guid, $actor->guid, 'pending_approval', $status, $reason);
+            $this->claims->close($guid, $actor->guid, 'completed');
             $this->notifications->record($guid, $booking->user_guid, $approve ? 'approved' : 'rejected');
 
             return $this->find($guid);
@@ -298,6 +307,9 @@ class BookingService
             if ($next) {
                 DB::table('bookings')->where('guid', $guid)->update(['status' => $next, 'updated_at' => $now]);
                 $this->history($guid, null, $booking->status, $next);
+                if ($next === 'expired') {
+                    $this->claims->close($guid, null, 'expired', 'booking_expired');
+                }
                 if (in_array($next, ['expired', 'payment_review'], true)) {
                     $this->notifications->record($guid, $booking->user_guid, $next);
                 }

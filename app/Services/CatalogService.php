@@ -5,6 +5,7 @@ namespace App\Services;
 use App\Exceptions\BookingException;
 use App\Models\Destination;
 use App\Models\DestinationCategory;
+use App\Models\User;
 use Illuminate\Database\Eloquent\ModelNotFoundException;
 use Illuminate\Http\UploadedFile;
 use Illuminate\Support\Facades\DB;
@@ -52,9 +53,10 @@ class CatalogService
     }
 
     /** Administrative listing including deactivated destinations. */
-    public function adminDestinations(array $filters)
+    public function adminDestinations(array $filters, User $actor)
     {
         $query = Destination::with(['category', 'activeFacilities', 'images'])->withCount('reviews as rating_count')->withAvg('reviews as rating_average', 'rating');
+        app(AdminDestinationScopeService::class)->apply($query, $actor, 'destinations.guid');
         $this->applyStatus($query, $filters['status'] ?? 'all');
         $this->applyFilters($query, $filters);
 
@@ -88,6 +90,16 @@ class CatalogService
         abort_unless($destination->is_active && $destination->category->is_active, 404);
 
         return $destination;
+    }
+
+    public function adminSave(User $actor, Destination $destination, array $data): Destination
+    {
+        return DB::transaction(function () use ($actor, $destination, $data) {
+            app(AdminDestinationScopeService::class)->lockDestination($destination->guid);
+            app(AdminDestinationScopeService::class)->authorize($actor, $destination->guid, true);
+
+            return $this->destinationSave($data, $destination->fresh());
+        }, 3);
     }
 
     public function destinationSave(array $data, ?Destination $destination = null): Destination

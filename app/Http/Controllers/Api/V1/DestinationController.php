@@ -38,17 +38,17 @@ class DestinationController extends Controller
             return response()->json(['data' => $this->gallery->save($request->validated(), $request->user(), $destination)]);
         }
 
-        return new DestinationResource($this->service->destinationSave($request->validated(), $destination));
+        return new DestinationResource($this->service->adminSave($request->user(), $destination, $request->validated()));
     }
 
     public function destroy(CatalogRequest $request, Destination $destination)
     {
-        return new DestinationResource($this->service->deactivate($destination));
+        return new DestinationResource($this->service->adminSave($request->user(), $destination, ['is_active' => false]));
     }
 
     public function adminIndex(CatalogRequest $request)
     {
-        return DestinationResource::collection($this->service->adminDestinations($request->validated()));
+        return DestinationResource::collection($this->service->adminDestinations($request->validated(), $request->user()));
     }
 
     public function adminShow(CatalogRequest $request, Destination $destination)

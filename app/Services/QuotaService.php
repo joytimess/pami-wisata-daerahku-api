@@ -4,6 +4,7 @@ namespace App\Services;
 
 use App\Models\Destination;
 use App\Models\DestinationQuota;
+use App\Models\User;
 use App\Support\BookingRules;
 use Carbon\CarbonImmutable;
 use Illuminate\Database\Query\Builder;
@@ -53,8 +54,12 @@ class QuotaService
             'timezone' => $destination->timezone, 'requested_quantity' => $quantity, 'dates' => $dates];
     }
 
-    public function list(Destination $destination, array $filters)
+    public function list(Destination $destination, array $filters, ?User $actor = null)
     {
+        if ($actor) {
+            app(AdminDestinationScopeService::class)->authorize($actor, $destination->guid);
+        }
+
         return DestinationQuota::where('destination_guid', $destination->guid)
             ->select('destination_quotas.*')->selectSub($this->allocatedSub(), 'allocated')
             ->orderBy('visit_date')->paginate($filters['per_page'] ?? 15);
@@ -112,7 +117,7 @@ class QuotaService
         ];
     }
 
-    public function upsert(Destination $destination, array $data): DestinationQuota
+    public function upsert(Destination $destination, array $data, ?User $actor = null): DestinationQuota
     {
         $data['booking_opens_at'] = CarbonImmutable::parse($data['booking_opens_at'])->utc();
         $data['booking_closes_at'] = CarbonImmutable::parse($data['booking_closes_at'])->utc();
@@ -120,10 +125,13 @@ class QuotaService
             throw ValidationException::withMessages(['booking_closes_at' => 'The booking window must close before the visit day starts.']);
         }
 
-        return DB::transaction(function () use ($destination, $data) {
+        return DB::transaction(function () use ($destination, $data, $actor) {
             // Serializes creation of a previously absent quota row.
             Destination::whereKey($destination->guid)->lockForUpdate()->firstOrFail();
             $quota = DestinationQuota::where('destination_guid', $destination->guid)->whereDate('visit_date', $data['visit_date'])->lockForUpdate()->first();
+            if ($actor) {
+                app(AdminDestinationScopeService::class)->authorize($actor, $destination->guid, true);
+            }
             $allocated = 0;
             if ($quota) {
                 $allocated = (int) DB::table('bookings')->where('destination_quota_guid', $quota->guid)

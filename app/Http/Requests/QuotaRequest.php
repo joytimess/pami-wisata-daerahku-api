@@ -2,6 +2,7 @@
 
 namespace App\Http\Requests;
 
+use App\Services\AdminDestinationScopeService;
 use Illuminate\Foundation\Http\FormRequest;
 
 class QuotaRequest extends FormRequest
@@ -12,7 +13,7 @@ class QuotaRequest extends FormRequest
             return $this->user() !== null;
         }
 
-        return $this->user() && (int) $this->user()->role >= 1;
+        return $this->user() && app(AdminDestinationScopeService::class)->allows($this->user(), $this->route('destination')->guid);
     }
 
     public function rules(): array

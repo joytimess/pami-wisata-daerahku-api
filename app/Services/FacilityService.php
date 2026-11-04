@@ -4,6 +4,7 @@ namespace App\Services;
 
 use App\Models\Destination;
 use App\Models\Facility;
+use App\Models\User;
 use Illuminate\Contracts\Pagination\LengthAwarePaginator;
 use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Support\Facades\DB;
@@ -40,10 +41,13 @@ class FacilityService
         }
     }
 
-    public function assign(Destination $destination, array $guids): Destination
+    public function assign(Destination $destination, array $guids, ?User $actor = null): Destination
     {
-        return DB::transaction(function () use ($destination, $guids) {
+        return DB::transaction(function () use ($destination, $guids, $actor) {
             $destination = Destination::whereKey($destination->guid)->lockForUpdate()->firstOrFail();
+            if ($actor) {
+                app(AdminDestinationScopeService::class)->authorize($actor, $destination->guid, true);
+            }
             $facilities = Facility::whereIn('guid', $guids)->orderBy('guid')->lockForUpdate()->get();
             if ($facilities->count() !== count($guids) || $facilities->contains(fn (Facility $facility) => ! $facility->is_active)) {
                 throw ValidationException::withMessages(['facility_guids' => 'Every facility must exist and be active.']);

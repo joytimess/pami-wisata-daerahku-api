@@ -146,7 +146,9 @@ it('restricts facility master changes to superadmins and preserves historical de
     [$destination] = seedDestination();
     [$other] = seedDestination();
     $super = bearer(makeUser(2));
-    $admin = bearer(makeUser(1));
+    $adminUser = makeUser(1);
+    assignTestDestination($adminUser, $destination);
+    $admin = bearer($adminUser);
     $user = bearer(makeUser());
     $master = '/api/v1/superadmin/facilities';
     $assign = "/api/v1/admin/destinations/{$destination->guid}/facilities";
@@ -184,7 +186,9 @@ it('restricts facility master changes to superadmins and preserves historical de
 it('rejects invalid facility replacements atomically and clears only on explicit empty assignment', function () {
     [$destination] = seedDestination();
     $super = bearer(makeUser(2));
-    $admin = bearer(makeUser(1));
+    $adminUser = makeUser(1);
+    assignTestDestination($adminUser, $destination);
+    $admin = bearer($adminUser);
     $guid = $this->postJson('/api/v1/superadmin/facilities', ['name' => 'Toilet'], $super)->assertCreated()->json('data.guid');
     $path = "/api/v1/admin/destinations/{$destination->guid}/facilities";
     $this->putJson($path, ['facility_guids' => [$guid]], $admin)->assertOk();

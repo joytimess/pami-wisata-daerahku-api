@@ -65,9 +65,12 @@ class BookingDocumentService
 
     private function booking(User $user, string $guid): object
     {
-        $query = DB::table('bookings')->where('guid', $guid);
-        if ($user->role < 1) {
-            $query->where('user_guid', $user->guid);
+        $query = DB::table('bookings')->where('bookings.guid', $guid)->select('bookings.*');
+        if ((int) $user->role < 1) {
+            $query->where('bookings.user_guid', $user->guid);
+        } else {
+            $query->join('destination_quotas', 'destination_quotas.guid', '=', 'bookings.destination_quota_guid');
+            app(AdminDestinationScopeService::class)->apply($query, $user, 'destination_quotas.destination_guid');
         }
 
         return $query->first() ?? throw new ModelNotFoundException;

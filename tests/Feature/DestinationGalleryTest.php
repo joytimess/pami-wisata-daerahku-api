@@ -100,6 +100,7 @@ it('requires the operation key and update version even on the legacy upload rout
     Storage::fake('local');
     $admin = makeUser(1);
     [$destination] = seedDestination();
+    assignTestDestination($admin, $destination);
     $url = '/api/v1/destinations/'.$destination->guid.'/image';
 
     $this->post($url, ['image' => UploadedFile::fake()->image('photo.png')], bearer($admin) + ['Accept' => 'application/json'])->assertUnprocessable()->assertJsonValidationErrors(['gallery_version', 'operation_key']);
@@ -201,6 +202,8 @@ it('rejects foreign duplicate empty and mismatched manifests with 422', function
 it('rejects malformed gallery upload and manifest shapes with 422 instead of crashing', function (string $case) {
     Storage::fake('local');
     [$destination] = seedDestination();
+    $admin = makeUser(1);
+    assignTestDestination($admin, $destination);
     $payload = ['_method' => 'PATCH', 'gallery_version' => 0, 'gallery_manifest' => json_encode([['upload_key' => 'new-a']])];
     $error = 'gallery_manifest.0';
     if ($case === 'scalar-file') {
@@ -217,7 +220,7 @@ it('rejects malformed gallery upload and manifest shapes with 422 instead of cra
         }]);
     }
 
-    $this->post('/api/v1/destinations/'.$destination->guid, $payload, galleryHeaders(makeUser(1)))->assertUnprocessable()->assertJsonValidationErrors($error);
+    $this->post('/api/v1/destinations/'.$destination->guid, $payload, galleryHeaders($admin))->assertUnprocessable()->assertJsonValidationErrors($error);
 
     $this->assertDatabaseCount('destination_images', 0);
     $this->assertDatabaseCount('destination_gallery_operations', 0);
@@ -279,6 +282,7 @@ it('rolls back metadata and gallery when database persistence fails after stagin
     Storage::fake('local');
     $admin = makeUser(1);
     [$destination] = seedDestination();
+    assignTestDestination($admin, $destination);
     $name = $destination->name;
     DB::statement("CREATE TRIGGER gallery_failure BEFORE INSERT ON destination_images BEGIN SELECT RAISE(ABORT, 'gallery storage unavailable'); END");
 

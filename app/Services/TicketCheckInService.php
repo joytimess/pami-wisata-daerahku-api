@@ -49,6 +49,8 @@ class TicketCheckInService
                 throw new TicketException('idempotency_conflict', 'Idempotency-Key telah digunakan untuk tiket berbeda.');
             }
             $ticket = $this->lookup($payload);
+            $reference = $this->tickets->booking($ticket->booking_guid);
+            app(AdminDestinationScopeService::class)->lockDestination($reference->destination_guid);
             $booking = $this->tickets->booking($ticket->booking_guid, true);
             $locked = DB::table('booking_tickets')->where('guid', $ticket->guid)->lockForUpdate()->first();
             $actor = $this->staff($actor, true);
@@ -168,9 +170,9 @@ class TicketCheckInService
         $this->superadmin($actor);
 
         return DB::transaction(function () use ($actor, $destination, $guids) {
+            DB::table('destinations')->where('guid', $destination->guid)->lockForUpdate()->first();
             $actor = $this->staff($actor, true);
             $this->superadmin($actor);
-            DB::table('destinations')->where('guid', $destination->guid)->lockForUpdate()->first();
             if (DB::table('users')->whereIn('guid', $guids)->where('role', 1)->where('status', 'active')->sharedLock()->get(['guid'])->count() !== count($guids)) {
                 throw new TicketException('invalid_assignment', 'Penugasan hanya untuk Admin aktif.', 422);
             }

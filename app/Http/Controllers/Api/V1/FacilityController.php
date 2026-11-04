@@ -38,6 +38,6 @@ class FacilityController extends Controller
 
     public function assign(DestinationFacilitiesRequest $request, Destination $destination): DestinationResource
     {
-        return new DestinationResource($this->service->assign($destination, $request->validated('facility_guids')));
+        return new DestinationResource($this->service->assign($destination, $request->validated('facility_guids'), $request->user()));
     }
 }

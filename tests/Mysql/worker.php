@@ -9,6 +9,7 @@
 
 use App\Models\Destination;
 use App\Models\User;
+use App\Services\ApprovalQueueService;
 use App\Services\BookingService;
 use App\Services\FacilityService;
 use App\Services\PaymentEligibility;
@@ -54,6 +55,8 @@ try {
         });
     }
     $result = match ($job['action']) {
+        'claim' => app(ApprovalQueueService::class)->mutate($user, $job['guid'], 'claim', $job['key']),
+        'assign' => app(TicketCheckInService::class)->assign($user, Destination::findOrFail($job['destination']), $job['guids']),
         'facilities' => app(FacilityService::class)->assign(Destination::findOrFail($job['destination']), $job['guids']),
         'create' => $bookings->create($user, $job['payload'] + ['idempotency_key' => $job['key']]),
         'cancel' => $bookings->cancel($user, $job['guid']),
@@ -62,7 +65,9 @@ try {
         'check-in' => app(TicketCheckInService::class)->confirm($user, Crypt::decryptString(DB::table('booking_tickets')->where('guid', $job['ticket_guid'])->value('qr_token_encrypted')), $job['key']),
         'review' => app(VisitService::class)->review($user, $job['guid'], $job['fields']),
     };
-    $output = json_encode(['ok' => true, 'guid' => $result->guid ?? null, 'status' => $result->status ?? null, 'capacity' => $result->capacity ?? null]);
+    $output = json_encode(['ok' => true, 'guid' => $result->guid ?? null, 'status' => $result->status ?? null, 'capacity' => $result->capacity ?? null,
+        'owner_user_guid' => is_array($result) ? ($result['owner_user_guid'] ?? null) : null,
+        'state' => is_array($result) ? ($result['state'] ?? null) : null]);
 } catch (Throwable $e) {
     $output = json_encode(['ok' => false, 'class' => class_basename($e), 'code' => $e->errorCode ?? null, 'message' => $e->getMessage()]);
 }

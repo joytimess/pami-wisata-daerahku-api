@@ -80,6 +80,7 @@ it('replays an identical request to the current booking state and never duplicat
     [$destination, $date] = seedDestination(capacity: 5);
     $user = makeUser();
     $admin = makeUser(1);
+    assignTestDestination($admin, $destination);
     $first = postBooking($this, $user, bookingPayload($destination, $date, 2))->assertOk()->assertJsonPath('data.status', 'pending_approval');
     $guid = $first->json('data.guid');
     $this->postJson("/api/v1/admin/bookings/{$guid}/approve", [], bearer($admin))->assertOk();
@@ -137,6 +138,7 @@ it('cancels only the owner pending booking and releases capacity exactly once', 
     $user = makeUser();
     $other = makeUser();
     $admin = makeUser(1);
+    assignTestDestination($admin, $destination);
     $guid = postBooking($this, $user, bookingPayload($destination, $date, 3))->assertOk()->assertJsonPath('data.cancellable', true)->json('data.guid');
     $path = "/api/v1/destinations/{$destination->guid}/availability?visit_date={$date}";
 
@@ -156,6 +158,7 @@ it('refuses to cancel processed bookings because no payment contract exists', fu
     [$destination, $date] = seedDestination(capacity: 5, price: 1000);
     $user = makeUser();
     $admin = makeUser(1);
+    assignTestDestination($admin, $destination);
     $guid = postBooking($this, $user, bookingPayload($destination, $date))->assertOk()->json('data.guid');
     $this->postJson("/api/v1/admin/bookings/{$guid}/approve", [], bearer($admin))->assertOk()->assertJsonPath('data.status', 'awaiting_payment');
     $this->postJson("/api/v1/bookings/{$guid}/cancel", [], bearer($user))->assertStatus(409)->assertJsonPath('code', 'booking_not_cancellable');
@@ -167,6 +170,7 @@ it('isolates booking data between users and filters history by status', function
     $a = makeUser();
     $b = makeUser();
     $admin = makeUser(1);
+    assignTestDestination($admin, $destination);
     $guidA = postBooking($this, $a, bookingPayload($destination, $date), 'a-1')->assertOk()->json('data.guid');
     postBooking($this, $a, bookingPayload($destination, $date), 'a-2')->assertOk();
     postBooking($this, $b, bookingPayload($destination, $date), 'b-1')->assertOk();
@@ -179,10 +183,11 @@ it('isolates booking data between users and filters history by status', function
     $this->getJson("/api/v1/bookings/{$guidA}/documents", bearer($b))->assertNotFound();
 });
 
-it('lets admins list, filter, paginate and read any booking while users cannot', function () {
+it('lets admins list, filter, paginate and read assigned bookings while users cannot', function () {
     [$destination, $date] = seedDestination(capacity: 30);
     $user = makeUser();
     $admin = makeUser(1);
+    assignTestDestination($admin, $destination);
     foreach (range(1, 5) as $i) {
         postBooking($this, $user, bookingPayload($destination, $date), "k-$i")->assertOk();
     }
@@ -206,6 +211,8 @@ it('applies decisions once and reports distinct codes for stale decisions', func
     [$paid, $paidDate] = seedDestination(capacity: 10, price: 5000);
     $user = makeUser();
     $admin = makeUser(1);
+    assignTestDestination($admin, $free);
+    assignTestDestination($admin, $paid);
     $freeGuid = postBooking($this, $user, bookingPayload($free, $date), 'f')->json('data.guid');
     $paidGuid = postBooking($this, $user, bookingPayload($paid, $paidDate, 2), 'p')->json('data.guid');
     $rejectGuid = postBooking($this, $user, bookingPayload($free, $date), 'r')->json('data.guid');
@@ -224,6 +231,7 @@ it('reports a lapsed approval deadline with its own code', function () {
     [$destination, $date] = seedDestination(capacity: 10, days: 9);
     $user = makeUser();
     $admin = makeUser(1);
+    assignTestDestination($admin, $destination);
     $guid = postBooking($this, $user, bookingPayload($destination, $date))->json('data.guid');
     DB::table('destination_quotas')->update(['booking_closes_at' => now()->addDays(3)]);
     $this->travel(25)->hours();
@@ -235,6 +243,7 @@ it('revokes access immediately when role or status changes', function () {
     [$destination, $date] = seedDestination(capacity: 10);
     $super = makeUser(2);
     $admin = makeUser(1);
+    assignTestDestination($admin, $destination);
     $headers = bearer($admin);
     $this->getJson('/api/v1/admin/bookings', $headers)->assertOk();
     $this->patchJson("/api/v1/admin/accounts/{$admin->guid}", ['role' => 0], bearer($super))->assertOk();
