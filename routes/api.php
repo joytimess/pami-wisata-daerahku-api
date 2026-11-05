@@ -11,9 +11,11 @@ use App\Http\Controllers\Api\V1\CategoryController;
 use App\Http\Controllers\Api\V1\DestinationController;
 use App\Http\Controllers\Api\V1\FacilityController;
 use App\Http\Controllers\Api\V1\FavoriteController;
+use App\Http\Controllers\Api\V1\FinancialDashboardController;
 use App\Http\Controllers\Api\V1\InboxController;
 use App\Http\Controllers\Api\V1\LocationGeocodingController;
 use App\Http\Controllers\Api\V1\OperationalDashboardController;
+use App\Http\Controllers\Api\V1\PaymentController;
 use App\Http\Controllers\Api\V1\PaymentPreviewController;
 use App\Http\Controllers\Api\V1\QuotaController;
 use App\Http\Controllers\Api\V1\TicketCheckInController;
@@ -34,7 +36,12 @@ use Illuminate\Support\Facades\Route;
 */
 Route::prefix('v1')->group(function () {
     Route::middleware(AuthenticateApiToken::class)->group(function () {
+        Route::get('payments/methods', [PaymentController::class, 'methods'])->middleware('throttle:60,1');
+        Route::get('bookings/{booking}/payment-intent', [PaymentController::class, 'show'])->middleware('throttle:60,1');
+        Route::post('bookings/{booking}/demo-payment', [PaymentController::class, 'initiateDemo'])->middleware('throttle:30,1')->name('payments.demo.initiate');
+        Route::post('bookings/{booking}/demo-payment/simulate', [PaymentController::class, 'simulateDemo'])->middleware('throttle:30,1')->name('payments.demo.simulate');
         Route::get('bookings/{booking}/payment-preview', PaymentPreviewController::class);
+        Route::get('admin/dashboard/financial', FinancialDashboardController::class)->middleware('throttle:60,1')->name('admin.dashboard.financial');
         Route::get('admin/dashboard/{section}', OperationalDashboardController::class)
             ->whereIn('section', ['overview', 'approvals', 'destinations', 'visitors', 'action-center'])->name('admin.dashboard');
         Route::get('admin/approval-queue', OperationalDashboardController::class)->name('admin.approval-queue');

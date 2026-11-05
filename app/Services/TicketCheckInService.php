@@ -25,7 +25,7 @@ class TicketCheckInService
             'destination_name' => $booking->destination_name_snapshot, 'visit_date' => $booking->visit_date,
             'timezone' => $booking->destination_timezone, 'booker_name' => $booking->visitor_name,
             'payment_status' => 'paid', 'booking_status' => 'confirmed', 'check_in_status' => 'not_checked_in', 'can_confirm' => true,
-        ];
+        ] + $this->payments->provenance($booking);
     }
 
     public function confirm(User $actor, string $payload, string $key): array
@@ -72,7 +72,7 @@ class TicketCheckInService
                 'quantity' => (int) $booking->quantity, 'status' => 'checked_in',
                 'checked_in_count' => DB::table('booking_tickets')->where('booking_guid', $booking->guid)->lockForUpdate()->get(['checked_in_at'])->whereNotNull('checked_in_at')->count(),
                 'checked_in_at' => $now->toIso8601String(), 'checked_in_by' => $actor->guid,
-            ];
+            ] + $this->payments->provenance($booking);
             DB::table('idempotency_records')->where('guid', $record->guid)->update([
                 'status' => 'completed', 'response_reference' => $locked->guid,
                 'response_body' => json_encode($result, JSON_THROW_ON_ERROR), 'updated_at' => $now,

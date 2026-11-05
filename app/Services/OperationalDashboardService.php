@@ -10,14 +10,14 @@ use Illuminate\Support\Facades\DB;
 
 class OperationalDashboardService
 {
-    public function __construct(private AdminDestinationScopeService $scope) {}
+    public function __construct(private AdminDestinationScopeService $scope, private FinancialAnalyticsService $finance) {}
 
     public function metadata(User $actor, array $filters): array
     {
         $actor = $this->scope->actor($actor);
 
         return ['generated_at' => now()->utc()->toIso8601String(), 'last_updated_at' => now()->utc()->toIso8601String(),
-            'financial' => $this->financial(),
+            'financial' => $this->finance->summary($actor, $filters),
             'scope' => ['mode' => (int) $actor->role === 2 ? 'global' : 'assigned_destinations', 'destination_guid' => $filters['destination_guid'] ?? null],
             'period' => $this->period($filters), 'metric_bases' => ['decisions' => 'decision_utc', 'pending_and_workload' => 'current_snapshot', 'booking_trend' => 'created_utc', 'capacity_and_visitors' => 'visit_destination_local_calendar_date'], 'admin_filter_applies_to' => isset($filters['admin_guid']) ? 'decision_metrics_only' : null];
     }
@@ -37,7 +37,7 @@ class OperationalDashboardService
         return match ($section) {
             'queue', 'action-center' => $this->queue($actor, $filters, $section === 'action-center'),
             'destinations' => $this->destinations($actor, $filters),
-            'visitors' => $this->metadata($actor, $filters) + ['metrics' => $this->visitors($actor, $filters), 'financial' => $this->financial()],
+            'visitors' => $this->metadata($actor, $filters) + ['metrics' => $this->visitors($actor, $filters)],
             'approvals' => $this->approvals($actor, $filters),
             default => $this->overview($actor, $filters),
         };
@@ -140,8 +140,7 @@ class OperationalDashboardService
 
         return $this->metadata($actor, $filters) + ['metrics' => $metrics, 'personal' => $this->decisionMetrics($this->decisions($actor, $filters, true)),
             'assigned_workload' => $workload, 'visitors' => $this->visitors($actor, $filters),
-            'booking_trend' => $this->between($this->bookings($actor, $filters), 'b.created_at', $filters)->selectRaw('DATE(b.created_at) as date, COUNT(*) as bookings, SUM(b.quantity) as quantity_requested')->groupByRaw('DATE(b.created_at)')->orderBy('date')->get()->all(),
-            'financial' => $this->financial()];
+            'booking_trend' => $this->between($this->bookings($actor, $filters), 'b.created_at', $filters)->selectRaw('DATE(b.created_at) as date, COUNT(*) as bookings, SUM(b.quantity) as quantity_requested')->groupByRaw('DATE(b.created_at)')->orderBy('date')->get()->all()];
     }
 
     private function visitors(User $actor, array $filters): array
@@ -236,11 +235,5 @@ class OperationalDashboardService
 
                 return $row;
             });
-    }
-
-    private function financial(): array
-    {
-        return ['availability' => 'unavailable', 'reason' => 'payment_gateway_not_integrated', 'gross_revenue' => null, 'net_revenue' => null,
-            'gateway_fees' => null, 'refunds' => null, 'settlement' => null];
     }
 }

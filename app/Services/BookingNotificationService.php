@@ -16,6 +16,7 @@ class BookingNotificationService
             'cancelled' => ['Booking dibatalkan', 'Booking dibatalkan oleh pemesan.', true],
             'expired' => ['Booking kedaluwarsa', 'Booking Anda telah kedaluwarsa.', false],
             'payment_review' => ['Pembayaran perlu ditinjau', 'Status pembayaran booking perlu ditinjau.', true],
+            'demo_paid' => ['DEMO pembayaran berhasil', 'Simulasi DEMO berhasil. Tidak ada pembayaran uang nyata.', false],
         };
         $users = $admin
             ? DB::table('users')->where('status', 'active')->where(fn ($users) => $users->where('role', 2)->orWhere(fn ($users) => $users->where('role', 1)
@@ -33,6 +34,9 @@ class BookingNotificationService
                 'title' => $title, 'body' => $body, 'created_at' => $now, 'updated_at' => $now,
             ]);
             if (! $inserted) {
+                continue;
+            }
+            if ($event === 'demo_paid') {
                 continue;
             }
             $targets = [['channel' => 'email', 'target_key' => $userGuid]];

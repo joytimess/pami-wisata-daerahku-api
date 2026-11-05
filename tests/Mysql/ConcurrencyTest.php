@@ -124,7 +124,9 @@ it('records exactly one review and one aggregate contribution under concurrent r
     $owner = makeUser();
     $service = app(BookingService::class);
     $booking = $service->create($owner, bookingPayload($destination, $date) + ['idempotency_key' => 'review-race']);
-    $service->decide(makeUser(1), $booking->guid, true);
+    $admin = makeUser(1);
+    assignTestDestination($admin, $destination);
+    $service->decide($admin, $booking->guid, true);
     DB::table('destination_quotas')->where('guid', $quota)->update(['visit_date' => now($destination->timezone)->toDateString()]);
     DB::table('check_ins')->insert(['guid' => (string) Str::uuid(), 'booking_guid' => $booking->guid, 'actor_guid' => $owner->guid, 'checked_in_at' => now()]);
     app(TicketService::class)->backfill();
@@ -185,6 +187,7 @@ it('lets exactly one of approve, reject and cancel win a race on the same bookin
     [$destination, $date, $quota] = mysqlSeed(40);
     $service = app(BookingService::class);
     $admin = makeUser(1);
+    assignTestDestination($admin, $destination);
     $admin2 = makeUser(2);
     $rounds = [];
     foreach (range(1, 4) as $i) {

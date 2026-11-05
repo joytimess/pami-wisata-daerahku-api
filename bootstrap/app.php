@@ -44,11 +44,11 @@ return Application::configure(basePath: dirname(__DIR__))
                 ->header('Cache-Control', 'private, no-store');
         });
         $exceptions->render(function (Throwable $exception, Request $request) {
-            if (! $request->is('api/v1/admin/dashboard/*', 'api/v1/admin/approval-queue', 'api/v1/admin/bookings/*/claim', 'api/v1/admin/bookings/*/release', 'api/v1/superadmin/bookings/*/reassign', 'api/v1/bookings/*/payment-preview') || $exception instanceof BookingException) {
+            if (! $request->is('api/v1/admin/dashboard/*', 'api/v1/admin/approval-queue', 'api/v1/admin/bookings/*/claim', 'api/v1/admin/bookings/*/release', 'api/v1/superadmin/bookings/*/reassign', 'api/v1/bookings/*/payment-preview', 'api/v1/bookings/*/payment-intent', 'api/v1/bookings/*/demo-payment', 'api/v1/bookings/*/demo-payment/*', 'api/v1/payments/*') || $exception instanceof BookingException) {
                 return null;
             }
             if ($exception instanceof ValidationException) {
-                return response()->json(['message' => 'Invalid request data.', 'code' => 'validation_failed', 'errors' => $exception->errors()], 422);
+                return response()->json(['message' => 'Invalid request data.', 'code' => 'validation_failed', 'errors' => $exception->errors()], 422)->header('Cache-Control', 'private, no-store');
             }
             $status = match (true) {
                 $exception instanceof AuthenticationException => 401,
@@ -64,5 +64,5 @@ return Application::configure(basePath: dirname(__DIR__))
             return response()->json(['message' => $status >= 500 ? 'Service unavailable.' : 'Request not allowed or resource unavailable.', 'code' => $code], $status)->header('Cache-Control', 'private, no-store');
         });
         $exceptions->shouldRenderJsonWhen(fn (Request $request) => $request->is('api/*') || $request->expectsJson());
-        $exceptions->render(fn (BookingException $exception, Request $request) => $request->is('api/*') ? response()->json(['message' => $exception->getMessage(), 'code' => $exception->errorCode] + ($exception->context ? ['context' => $exception->context] : []), 409) : null);
+        $exceptions->render(fn (BookingException $exception, Request $request) => $request->is('api/*') ? response()->json(['message' => $exception->getMessage(), 'code' => $exception->errorCode] + ($exception->context ? ['context' => $exception->context] : []), 409)->header('Cache-Control', 'private, no-store') : null);
     })->create();

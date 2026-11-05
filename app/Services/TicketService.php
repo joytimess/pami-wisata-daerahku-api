@@ -185,7 +185,7 @@ class TicketService
                     && $ticket->qr_token_encrypted !== null && $ticket->qr_revoked_at === null && $ticket->checked_in_at === null,
                 'checked_in_at' => $ticket->checked_in_at ? CarbonImmutable::parse($ticket->checked_in_at, 'UTC')->toIso8601String() : null,
             ])->all(),
-        ];
+        ] + $this->payments->provenance($booking);
     }
 
     public function backfill(): int

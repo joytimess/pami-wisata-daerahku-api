@@ -353,7 +353,8 @@ class BookingService
                 'destinations.timezone as destination_timezone', 'check_ins.checked_in_at as legacy_checked_in_at',
                 'ticket_summary.ticket_rows', 'ticket_summary.ticket_checked_in_count', 'ticket_summary.first_checked_in_at',
                 'reviews.guid as review_guid', 'reviews.rating as review_rating',
-                'reviews.comment as review_comment', 'reviews.created_at as review_created_at');
+                'reviews.comment as review_comment', 'reviews.created_at as review_created_at')
+            ->selectRaw("EXISTS (SELECT 1 FROM payment_intents demo_payment WHERE demo_payment.booking_guid=bookings.guid AND demo_payment.provider='demo' AND demo_payment.environment='demo') AS has_demo_payment");
     }
 
     private function find(string $guid): object
@@ -381,6 +382,9 @@ class BookingService
         $booking->all_checked_in = $booking->is_fully_checked_in;
         $booking->can_check_in = false;
         $booking->payment_status = $this->payments->status($booking);
+        foreach ($this->payments->provenance($booking) as $field => $value) {
+            $booking->$field = $value;
+        }
         $booking->can_review = $booking->status === 'confirmed' && $booking->has_checked_in && $booking->review_guid === null
             && ($booking->legacy_checked_in_at !== null || $booking->payment_status === 'paid');
         $booking->review = $booking->review_guid === null ? null : (object) [
