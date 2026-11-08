@@ -2,6 +2,8 @@
 
 namespace App\Services;
 
+use App\Services\Doku\DokuClient;
+
 class PaymentGateway
 {
     public function demoEnabled(): bool
@@ -20,13 +22,15 @@ class PaymentGateway
             ];
         }
 
-        // Credentials alone cannot enable a gateway before its adapter and merchant channels are verified.
+        $reason = app(DokuClient::class)->readinessReason();
+
         return [
-            'provider' => 'doku', 'environment' => 'sandbox', 'integration_status' => 'not_configured',
-            'reason' => 'doku_not_configured', 'can_pay' => false,
+            'provider' => 'doku', 'environment' => config('doku.environment', 'sandbox'), 'test_only' => config('doku.environment') !== 'production',
+            'integration_status' => $reason ? 'not_configured' : 'ready',
+            'reason' => $reason, 'can_pay' => $reason === null,
             'methods' => [
                 ['code' => 'qris', 'available' => false, 'presentation_type' => 'qr_payload', 'reason' => 'doku_not_configured'],
-                ['code' => 'virtual_account', 'available' => false, 'presentation_type' => 'virtual_account', 'reason' => 'doku_not_configured'],
+                ['code' => 'virtual_account', 'channel' => 'bni', 'available' => $reason === null, 'presentation_type' => 'virtual_account', 'reason' => $reason],
                 ['code' => 'ewallet', 'available' => false, 'presentation_type' => 'ewallet_redirect', 'reason' => 'doku_not_configured'],
             ],
         ];

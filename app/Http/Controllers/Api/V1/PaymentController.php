@@ -4,15 +4,23 @@ namespace App\Http\Controllers\Api\V1;
 
 use App\Http\Controllers\Controller;
 use App\Http\Requests\DemoPaymentRequest;
+use App\Http\Requests\DokuPaymentRequest;
 use App\Http\Requests\PaymentMethodsRequest;
 use App\Http\Resources\OperationalResource;
 use App\Services\DemoPaymentService;
+use App\Services\DokuPaymentService;
 use App\Services\PaymentService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 
 class PaymentController extends Controller
 {
+    public function initiateDoku(DokuPaymentRequest $request, string $booking, DokuPaymentService $service): JsonResponse
+    {
+        return (new OperationalResource($service->initiate($request->user(), $booking, $request->validated())))
+            ->response()->header('Cache-Control', 'private, no-store');
+    }
+
     public function initiateDemo(DemoPaymentRequest $request, string $booking, DemoPaymentService $service): JsonResponse
     {
         return (new OperationalResource($service->initiate($request->user(), $booking, $request->validated())))
@@ -34,6 +42,12 @@ class PaymentController extends Controller
     public function show(Request $request, string $booking, PaymentService $service): JsonResponse
     {
         return (new OperationalResource($service->show($request->user(), $booking)))
+            ->response()->header('Cache-Control', 'private, no-store');
+    }
+
+    public function adminShow(Request $request, string $booking, PaymentService $service): JsonResponse
+    {
+        return (new OperationalResource($service->adminShow($request->user(), $booking)))
             ->response()->header('Cache-Control', 'private, no-store');
     }
 }

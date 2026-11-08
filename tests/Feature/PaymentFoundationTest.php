@@ -16,6 +16,7 @@ uses(RefreshDatabase::class);
 
 beforeEach(function () {
     $this->freezeTime();
+    config(['operations.demo_payments_enabled' => false, 'doku.enabled' => false]);
 });
 
 function foundationBooking(int $price = 15000): array
@@ -140,7 +141,7 @@ it('does not treat a free confirmed booking as paid or provide a payment instruc
     expect(DB::table('booking_tickets')->whereNotNull('qr_token_hash')->count())->toBe(0);
 });
 
-it('does not expose payment writes before a verified provider adapter exists', function () {
+it('rejects untrusted payment writes and unsupported attempt input', function () {
     [$owner, $guid] = foundationBooking();
     app(BookingService::class)->decide(makeUser(2), $guid, true);
     $headers = bearer($owner) + ['Idempotency-Key' => 'forged-payment'];
@@ -148,7 +149,7 @@ it('does not expose payment writes before a verified provider adapter exists', f
     Http::fake();
 
     $this->postJson('/api/v1/bookings/'.$guid.'/payment-intent', ['amount' => 1, 'currency' => 'IDR', 'status' => 'paid'], $headers)->assertMethodNotAllowed();
-    $this->postJson('/api/v1/bookings/'.$guid.'/payment-attempts', ['method' => 'qris'], $headers)->assertNotFound();
+    $this->postJson('/api/v1/bookings/'.$guid.'/payment-attempts', ['method' => 'qris'], $headers)->assertUnprocessable();
 
     $this->assertDatabaseHas('bookings', ['guid' => $guid, 'status' => 'awaiting_payment']);
     $this->assertDatabaseCount('payment_intents', 0);

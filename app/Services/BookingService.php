@@ -354,7 +354,8 @@ class BookingService
                 'ticket_summary.ticket_rows', 'ticket_summary.ticket_checked_in_count', 'ticket_summary.first_checked_in_at',
                 'reviews.guid as review_guid', 'reviews.rating as review_rating',
                 'reviews.comment as review_comment', 'reviews.created_at as review_created_at')
-            ->selectRaw("EXISTS (SELECT 1 FROM payment_intents demo_payment WHERE demo_payment.booking_guid=bookings.guid AND demo_payment.provider='demo' AND demo_payment.environment='demo') AS has_demo_payment");
+            ->selectRaw("EXISTS (SELECT 1 FROM payment_intents demo_payment WHERE demo_payment.booking_guid=bookings.guid AND demo_payment.provider='demo' AND demo_payment.environment='demo') AS has_demo_payment")
+            ->selectRaw('EXISTS (SELECT 1 FROM payment_intents payment WHERE payment.booking_guid=bookings.guid) AS has_payment');
     }
 
     private function find(string $guid): object

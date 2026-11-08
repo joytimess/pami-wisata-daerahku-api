@@ -28,27 +28,61 @@ class PaymentService
     {
         $booking = $this->ownerBooking($owner, $guid);
 
-        return $this->bookingContract($booking) + $this->gateway->capabilities();
+        $contract = $this->bookingContract($booking);
+        $capabilities = $this->gateway->capabilities();
+        if (! $contract['can_pay']) {
+            $capabilities['methods'] = array_map(fn (array $method): array => array_replace($method, ['available' => false, 'reason' => $contract['reason']]), $capabilities['methods']);
+        }
+
+        return $contract + $capabilities;
+    }
+
+    public function adminShow(User $actor, string $guid): array
+    {
+        $scope = app(AdminDestinationScopeService::class);
+        $actor = $scope->actor($actor);
+        $booking = DB::table('bookings as b')->join('destination_quotas as q', 'q.guid', '=', 'b.destination_quota_guid')
+            ->where('b.guid', $guid)->first(['b.guid', 'b.status', 'q.destination_guid']);
+        abort_unless($booking, 404);
+        $scope->authorize($actor, $booking->destination_guid);
+        $intent = DB::table('payment_intents')->where('booking_guid', $guid)->first();
+        $attempts = $intent ? DB::table('payment_attempts')->where('payment_intent_guid', $intent->guid)->orderByDesc('attempt_number')->limit(20)
+            ->get(['guid', 'attempt_number', 'provider', 'environment', 'method', 'channel', 'status', 'amount', 'currency',
+                'started_at', 'finished_at', 'verified_paid_at', 'reversed_at', 'last_reconciled_at', 'next_reconcile_at', 'reconcile_count', 'last_error_code'])->all() : [];
+        $events = $intent ? DB::table('payment_events')->where('payment_intent_guid', $intent->guid)->orderByDesc('received_at')->orderByDesc('guid')->limit(20)
+            ->get(['guid', 'payment_attempt_guid', 'provider', 'environment', 'verification', 'event_type', 'disposition', 'amount', 'currency', 'provider_occurred_at', 'received_at'])->all() : [];
+
+        return ['booking_guid' => $guid, 'booking_status' => $booking->status, 'intent_guid' => $intent?->guid,
+            'status' => $intent?->status ?? 'not_created', 'provider' => $intent?->provider, 'environment' => $intent?->environment,
+            'test_only' => $intent && $intent->environment !== 'production', 'attempts' => $attempts, 'events' => $events];
     }
 
     public function show(User $owner, string $guid): array
     {
         $booking = $this->ownerBooking($owner, $guid);
         $intent = DB::table('payment_intents')->where('booking_guid', $guid)
-            ->where(function ($query): void {
-                $query->where(fn ($demo) => $demo->where('provider', 'demo')->where('environment', 'demo'))
-                    ->orWhere(fn ($doku) => $doku->where('provider', 'doku')->where('environment', 'sandbox'));
-            })->first();
+            ->first();
         $attempt = $intent ? DB::table('payment_attempts')->where('payment_intent_guid', $intent->guid)
             ->where('provider', $intent->provider)->where('environment', $intent->environment)
-            ->orderByDesc('attempt_number')->first(['guid', 'status', 'method', 'channel', 'started_at', 'finished_at', 'instruction_expires_at']) : null;
+            ->orderByDesc('attempt_number')->first() : null;
 
         $capabilities = $this->gateway->capabilities();
         if ($intent?->provider === 'demo') {
             $capabilities = array_replace($capabilities, ['provider' => 'demo', 'environment' => 'demo', 'test_only' => true, 'label' => 'DEMO']);
         }
+        if ($intent?->provider === 'doku') {
+            $capabilities = array_replace($capabilities, ['provider' => 'doku', 'environment' => $intent->environment, 'test_only' => $intent->environment !== 'production']);
+        }
+        $instruction = ['presentation_type' => $intent?->provider === 'demo' && $this->gateway->demoEnabled() ? 'demo_simulator' : 'unavailable'];
+        if ($intent?->provider === 'doku' && $attempt) {
+            $instruction = app(DokuPaymentService::class)->response($booking, $intent, $attempt)['instruction'];
+        }
+        $contract = $this->bookingContract($booking);
+        if (! $contract['can_pay']) {
+            $capabilities['methods'] = array_map(fn (array $method): array => array_replace($method, ['available' => false, 'reason' => $contract['reason']]), $capabilities['methods']);
+        }
 
-        return $this->bookingContract($booking) + $capabilities + [
+        return $contract + $capabilities + [
             'intent_guid' => $intent?->guid,
             'status' => $intent?->status ?? 'not_created',
             'last_attempt' => $attempt ? [
@@ -58,7 +92,7 @@ class PaymentService
                 'finished_at' => $this->timestamp($attempt->finished_at),
                 'expires_at' => $this->timestamp($attempt->instruction_expires_at),
             ] : null,
-            'instruction' => ['presentation_type' => $intent?->provider === 'demo' && $this->gateway->demoEnabled() ? 'demo_simulator' : 'unavailable'],
+            'instruction' => $instruction,
         ];
     }
 
@@ -72,12 +106,15 @@ class PaymentService
             now()->gte(BookingRules::visitStart($booking->visit_date, $booking->destination_timezone_snapshot ?? $booking->destination_timezone)) => 'visit_window_closed',
             $this->gateway->demoEnabled() && DB::table('payment_intents')->where('booking_guid', $booking->guid)
                 ->where(fn ($intent) => $intent->where('provider', '!=', 'demo')->orWhere('environment', '!=', 'demo'))->exists() => 'payment_provider_conflict',
-            default => $this->gateway->demoEnabled() ? null : 'doku_not_configured',
+            ! $this->gateway->demoEnabled() && DB::table('payment_intents')->where('booking_guid', $booking->guid)
+                ->where(fn ($intent) => $intent->where('provider', '!=', 'doku')->orWhere('environment', '!=', config('doku.environment', 'sandbox')))->exists() => 'payment_provider_conflict',
+            DB::table('payment_intents')->where('booking_guid', $booking->guid)->where('status', 'needs_review')->exists() => 'payment_needs_review',
+            default => $this->gateway->capabilities()['reason'],
         };
 
         return [
             'booking_guid' => $booking->guid, 'booking_status' => $booking->status,
-            'availability' => $reason === null ? 'demo' : 'unavailable', 'reason' => $reason,
+            'availability' => $reason === null ? ($this->gateway->demoEnabled() ? 'demo' : 'available') : 'unavailable', 'reason' => $reason,
             'can_pay' => $reason === null,
             'amount' => (int) $booking->total_amount, 'currency' => $booking->currency,
             'payment_status' => $this->eligibility->status($booking),

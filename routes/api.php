@@ -9,6 +9,7 @@ use App\Http\Controllers\Api\V1\BookingController;
 use App\Http\Controllers\Api\V1\BookingDocumentController;
 use App\Http\Controllers\Api\V1\CategoryController;
 use App\Http\Controllers\Api\V1\DestinationController;
+use App\Http\Controllers\Api\V1\DokuWebhookController;
 use App\Http\Controllers\Api\V1\FacilityController;
 use App\Http\Controllers\Api\V1\FavoriteController;
 use App\Http\Controllers\Api\V1\FinancialDashboardController;
@@ -35,9 +36,12 @@ use Illuminate\Support\Facades\Route;
 | See docs/API-ROUTES.md for the endpoint inventory and conventions.
 */
 Route::prefix('v1')->group(function () {
+    Route::post('webhooks/doku/va', DokuWebhookController::class)->middleware('throttle:300,1')->name('payments.doku.webhook');
     Route::middleware(AuthenticateApiToken::class)->group(function () {
+        Route::post('bookings/{booking}/payment-attempts', [PaymentController::class, 'initiateDoku'])->middleware('throttle:30,1')->name('payments.doku.initiate');
         Route::get('payments/methods', [PaymentController::class, 'methods'])->middleware('throttle:60,1');
         Route::get('bookings/{booking}/payment-intent', [PaymentController::class, 'show'])->middleware('throttle:60,1');
+        Route::get('admin/bookings/{booking}/payment-intent', [PaymentController::class, 'adminShow'])->middleware('throttle:60,1');
         Route::post('bookings/{booking}/demo-payment', [PaymentController::class, 'initiateDemo'])->middleware('throttle:30,1')->name('payments.demo.initiate');
         Route::post('bookings/{booking}/demo-payment/simulate', [PaymentController::class, 'simulateDemo'])->middleware('throttle:30,1')->name('payments.demo.simulate');
         Route::get('bookings/{booking}/payment-preview', PaymentPreviewController::class);
