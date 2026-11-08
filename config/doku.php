@@ -19,6 +19,15 @@ return [
         'mandiri' => ['partner_service_id' => env('DOKU_MANDIRI_PARTNER_SERVICE_ID', ''), 'customer_prefix' => env('DOKU_MANDIRI_CUSTOMER_PREFIX', ''),
             'notification_channel_id' => env('DOKU_MANDIRI_NOTIFICATION_CHANNEL_ID', '')],
     ],
+    // QRIS merchant values are specific to the merchant account; the documentation samples must never be used.
+    'qris' => ['merchant_id' => env('DOKU_QRIS_MERCHANT_ID', ''), 'terminal_id' => env('DOKU_QRIS_TERMINAL_ID', ''),
+        'postal_code' => env('DOKU_QRIS_POSTAL_CODE', '')],
+    // E-wallet one-time payments. return_url is the HTTPS page the wallet sends the customer back to (never proof of payment).
+    // redirect_hosts is an operator-confirmed allowlist for the webRedirectUrl DOKU returns; empty means unavailable.
+    // shopeepay_payment_path must be set explicitly because the official page lists both v1 and v2.
+    'ewallet' => ['return_url' => env('DOKU_EWALLET_RETURN_URL', ''),
+        'redirect_hosts' => array_values(array_filter(array_map('trim', explode(',', (string) env('DOKU_EWALLET_REDIRECT_HOSTS', ''))))),
+        'shopeepay_payment_path' => env('DOKU_SHOPEEPAY_PAYMENT_PATH', '')],
     'webhook_url' => env('DOKU_WEBHOOK_URL', ''),
     'channels' => array_values(array_filter(array_map('trim', explode(',', (string) env('DOKU_CHANNELS', ''))))),
     // Channels the operator has confirmed against the real merchant account. Required for every channel except the

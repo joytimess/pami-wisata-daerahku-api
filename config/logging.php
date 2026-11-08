@@ -65,6 +65,15 @@ return [
             'replace_placeholders' => true,
         ],
 
+        // Sanitized request/response snapshots of failed DOKU create calls. Credentials are redacted before they get here.
+        'doku_diagnostics' => [
+            'driver' => 'daily',
+            'path' => storage_path(env('DOKU_DIAGNOSTICS_LOG_FILE', 'logs/doku-diagnostics.log')),
+            'level' => 'warning',
+            'days' => (int) env('DOKU_DIAGNOSTICS_LOG_DAYS', 30),
+            'replace_placeholders' => false,
+        ],
+
         'daily' => [
             'driver' => 'daily',
             'path' => storage_path('logs/laravel.log'),

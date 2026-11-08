@@ -2,6 +2,7 @@
 
 namespace App\Services\Doku;
 
+use App\Exceptions\DokuRequestException;
 use Carbon\CarbonImmutable;
 use Illuminate\Contracts\Encryption\DecryptException;
 use Illuminate\Http\Client\ConnectionException;
@@ -9,16 +10,22 @@ use Illuminate\Http\Client\PendingRequest;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Crypt;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Str;
 use JsonException;
 use OpenSSLAsymmetricKey;
 use RuntimeException;
-use UnexpectedValueException;
 
 class DokuClient
 {
     private const CREATE_PATH = '/virtual-accounts/bi-snap-va/v1.1/transfer-va/create-va';
 
     private const STATUS_PATH = '/orders/v1.0/transfer-va/status';
+
+    /** @var array{request: array<string, mixed>, response: ?array<string, mixed>}|null */
+    private ?array $lastExchange = null;
+
+    private ?int $lastHttpStatus = null;
 
     public function environment(): string
     {
@@ -62,6 +69,14 @@ class DokuClient
     /** Channel-specific merchant parameters; never inferred from the Client ID or documentation samples. */
     public function merchantConfigured(string $channelCode): bool
     {
+        if ($channelCode === 'qris') {
+            return preg_match('/^[A-Za-z0-9_-]{1,64}$/D', (string) config('doku.qris.merchant_id')) === 1
+                && preg_match('/^[A-Za-z0-9]{3,16}$/D', (string) config('doku.qris.terminal_id')) === 1
+                && preg_match('/^\d{1,5}$/D', (string) config('doku.qris.postal_code')) === 1;
+        }
+        if (in_array($channelCode, ['ewallet_dana', 'ewallet_shopeepay'], true)) {
+            return app(DokuDirectDebitAdapter::class)->merchantConfigured(substr($channelCode, 8));
+        }
         $profile = str_starts_with($channelCode, 'va_') ? $this->vaBank(substr($channelCode, 3)) : null;
 
         return $profile !== null
@@ -100,6 +115,12 @@ class DokuClient
         if ($attempt->environment !== $this->environment() || $attempt->provider !== 'doku') {
             return ['status' => 'unknown', 'reason' => 'payment_environment_mismatch'];
         }
+        if (($attempt->method ?? 'virtual_account') === 'qris') {
+            return app(DokuQrisAdapter::class)->create($this, $attempt, $booking);
+        }
+        if (($attempt->method ?? 'virtual_account') === 'ewallet') {
+            return app(DokuDirectDebitAdapter::class)->create($this, $attempt, $booking);
+        }
         $bank = $this->vaBank((string) $attempt->channel);
         if (($attempt->method ?? 'virtual_account') !== 'virtual_account' || $bank === null) {
             return ['status' => 'unknown', 'reason' => 'channel_not_implemented'];
@@ -119,16 +140,18 @@ class DokuClient
             'additionalInfo' => ['channel' => $bank['doku_channel'], 'virtualAccountConfig' => ['reusableStatus' => false]],
         ];
         try {
-            $response = $this->request(self::CREATE_PATH, $body, $attempt->provider_request_id);
+            $response = $this->request(self::CREATE_PATH, $body, $attempt->provider_request_id, 'H2H', $this->diagnosticContext($attempt));
             if (($response['responseCode'] ?? '') !== '2002700') {
+                $this->recordCreateSnapshot($this->diagnosticContext($attempt), 'doku_payment_not_accepted');
+
                 return ['status' => 'unknown', 'reason' => 'provider_create_unresolved'];
             }
             $data = $response['virtualAccountData'] ?? [];
             if (! is_array($data)) {
                 return ['status' => 'unknown', 'reason' => 'provider_response_mismatch'];
             }
-            $amount = $this->amount($data['totalAmount'] ?? []);
-            $providerExpiry = $this->instant($data['expiredDate'] ?? null);
+            $amount = $this->parseAmount($data['totalAmount'] ?? []);
+            $providerExpiry = $this->parseInstant($data['expiredDate'] ?? null);
             if (($data['trxId'] ?? '') !== $attempt->merchant_reference || $amount !== (int) $attempt->amount
                 || ($data['virtualAccountTrxType'] ?? '') !== 'C'
                 || ($data['additionalInfo']['channel'] ?? '') !== $bank['doku_channel']
@@ -160,6 +183,12 @@ class DokuClient
         if (! $this->configured()) {
             return ['status' => 'unknown', 'reason' => 'doku_not_configured'];
         }
+        if (($attempt->method ?? 'virtual_account') === 'qris') {
+            return ['status' => 'unknown', 'reason' => 'provider_terminal_contract_unverified'];
+        }
+        if (($attempt->method ?? 'virtual_account') === 'ewallet') {
+            return app(DokuDirectDebitAdapter::class)->status($this, $attempt);
+        }
         $bank = $this->vaBank((string) $attempt->channel);
         if ($bank === null) {
             return ['status' => 'unknown', 'reason' => 'channel_not_implemented'];
@@ -171,7 +200,7 @@ class DokuClient
             return ['status' => 'unknown', 'reason' => 'provider_reference_unavailable'];
         }
         try {
-            $response = $this->request(self::STATUS_PATH, $provider + ['additionalInfo' => (object) []], (string) random_int(100000000000000000, 999999999999999999));
+            $response = $this->request(self::STATUS_PATH, $provider + ['additionalInfo' => (object) []], (string) random_int(100000000000000000, 999999999999999999), 'H2H', $this->diagnosticContext($attempt));
             if (($response['responseCode'] ?? '') !== '2002600') {
                 return ['status' => 'unknown', 'reason' => 'provider_status_unresolved'];
             }
@@ -206,7 +235,7 @@ class DokuClient
         $raw = $request->getContent();
         abort_unless(strlen($raw) <= 65536 && $request->isJson() && $request->method() === 'POST', 400, 'Invalid payment notification.');
         $timestamp = $request->header('X-TIMESTAMP', '');
-        $instant = $this->instant($timestamp);
+        $instant = $this->parseInstant($timestamp);
         $token = $request->bearerToken();
         abort_unless($instant && abs($instant->getTimestamp() - now()->getTimestamp()) <= 300
             && $request->header('X-PARTNER-ID') === config('doku.client_id')
@@ -224,8 +253,8 @@ class DokuClient
         $minified = preg_replace('/("(?:[^"\\\\]|\\\\.)*")|\s+/s', '$1', $raw);
         $expected = $this->signature($path, $token, $minified, $timestamp);
         abort_unless(hash_equals($expected, $request->header('X-SIGNATURE', '')), 401, 'Invalid payment signature.');
-        $amount = $this->amount($data['paidAmount'] ?? []);
-        $occurred = $this->instant($data['trxDateTime'] ?? null);
+        $amount = $this->parseAmount($data['paidAmount'] ?? []);
+        $occurred = $this->parseInstant($data['trxDateTime'] ?? null);
         abort_unless($amount !== null && $occurred && $occurred->lte(now()->addMinutes(5))
             && is_string($data['trxId'] ?? null) && preg_match('/^[A-Za-z0-9_-]{1,64}$/D', $data['trxId'])
             && is_string($data['paymentRequestId'] ?? null) && preg_match('/^[A-Za-z0-9_-]{1,30}$/D', $data['paymentRequestId'])
@@ -296,33 +325,200 @@ class DokuClient
             ->withOptions(['allow_redirects' => false, 'verify' => true]);
     }
 
-    /** @param array<string, mixed> $body
+    /**
+     * @param  array<string, mixed>  $body
+     * @param  array{attempt_guid?: ?string, channel?: ?string}  $context  Safe correlation for diagnostics only.
+     * @param  array{timezone?: string, headers?: array<string, string>}  $options  Diagnostic overrides: the zone of the request X-TIMESTAMP and extra headers.
      * @return array<string, mixed>
      */
-    private function request(string $path, array $body, string $requestId): array
+    private function request(string $path, array $body, string $requestId, ?string $channelId = 'H2H', array $context = [], array $options = []): array
     {
-        $timestamp = CarbonImmutable::now('UTC')->toIso8601String();
-        if (! openssl_sign(config('doku.client_id').'|'.$timestamp, $signed, $this->privateKey(), OPENSSL_ALGO_SHA256)) {
-            throw new RuntimeException('Payment authentication unavailable.');
+        $this->lastHttpStatus = null;
+        $tokenTimestamp = CarbonImmutable::now('UTC')->toIso8601String();
+        $token = $this->accessToken($tokenTimestamp, $context);
+        // The signature is computed from the exact string sent in X-TIMESTAMP.
+        $timestamp = isset($options['timezone']) ? CarbonImmutable::now($options['timezone'])->format('Y-m-d\TH:i:sP') : $tokenTimestamp;
+        $phase = str_starts_with($path, '/orders/') ? 'status_inquiry' : 'payment_create';
+        $started = hrtime(true);
+        try {
+            $encoded = json_encode($body, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        } catch (JsonException $e) {
+            $this->recordFailure($context, $phase, 'doku_internal_exception', ['exception_class' => $e::class, 'request_sent' => false, 'outcome_certainty' => 'not_issued']);
+            throw $e;
         }
-        $tokenResponse = $this->transport()->withHeaders(['X-CLIENT-KEY' => config('doku.client_id'),
-            'X-TIMESTAMP' => $timestamp, 'X-SIGNATURE' => base64_encode($signed)])
-            ->post('/authorization/v1/access-token/b2b', ['grantType' => 'client_credentials']);
-        $token = $tokenResponse->json('accessToken');
-        if (! $tokenResponse->successful() || $tokenResponse->json('responseCode') !== '2007300'
-            || $tokenResponse->json('tokenType') !== 'Bearer' || ! is_string($token) || $token === '') {
-            throw new RuntimeException('Payment authentication unavailable.');
+        $signature = $this->signature($path, $token, $encoded, $timestamp);
+        $headers = ['X-PARTNER-ID' => (string) config('doku.client_id'), 'X-EXTERNAL-ID' => $requestId,
+            'X-TIMESTAMP' => $timestamp, 'X-SIGNATURE' => $signature, 'Authorization' => 'Bearer '.$token,
+            'Content-Type' => 'application/json', 'Accept' => 'application/json']
+            + ($channelId === null ? [] : ['CHANNEL-ID' => $channelId]) + ($options['headers'] ?? []);
+        $this->lastExchange = null;
+        if ($phase === 'payment_create') {
+            $this->lastExchange = ['request' => app(DokuExchangeSanitizer::class)->request('POST', $path, $headers, $body, $this->secrets($token, $signature)), 'response' => null];
         }
-        $encoded = json_encode($body, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
-        $response = $this->transport()->withToken($token)->withHeaders([
-            'X-PARTNER-ID' => config('doku.client_id'), 'X-EXTERNAL-ID' => $requestId, 'CHANNEL-ID' => 'H2H',
-            'X-TIMESTAMP' => $timestamp, 'X-SIGNATURE' => $this->signature($path, $token, $encoded, $timestamp),
-        ])->withBody($encoded, 'application/json')->post($path);
-        if (! $response->successful() || ! is_array($response->json())) {
-            throw new UnexpectedValueException('Payment provider unavailable.');
+        try {
+            $response = $this->transport()->withToken($token)->withHeaders(array_diff_key($headers, ['Authorization' => 1, 'Content-Type' => 1, 'Accept' => 1]))
+                ->withBody($encoded, 'application/json')->post($path);
+        } catch (ConnectionException $e) {
+            $this->recordFailure($context, $phase, 'doku_payment_transport_timeout', ['exception_class' => $e::class, 'request_sent' => 'unknown', 'duration_ms' => $this->elapsedMs($started)]);
+            $this->recordCreateSnapshot($context, 'doku_payment_transport_timeout');
+            throw $e;
+        }
+        $this->lastHttpStatus = $response->status();
+        if ($this->lastExchange !== null) {
+            $this->lastExchange['response'] = app(DokuExchangeSanitizer::class)->response($response->status(), $response->json(), $response->body(), $this->secrets($token, $signature));
+        }
+        if (! $response->successful()) {
+            $failure = $this->failure($context, $phase, 'doku_payment_http_error', $started, $response->status(), $response->json('responseCode'));
+            $this->recordCreateSnapshot($context, 'doku_payment_http_error');
+
+            throw $failure;
+        }
+        if (! is_array($response->json())) {
+            $failure = $this->failure($context, $phase, 'doku_payment_response_invalid', $started, $response->status());
+            $this->recordCreateSnapshot($context, 'doku_payment_response_invalid');
+
+            throw $failure;
         }
 
         return $response->json();
+    }
+
+    /** @return list<string> Credential values scrubbed from every diagnostic snapshot. */
+    private function secrets(string $token, string $signature): array
+    {
+        return array_values(array_filter([$token, $signature, (string) config('doku.secret_key')], fn (string $value) => $value !== ''));
+    }
+
+    /**
+     * Persists the sanitized snapshot of the last payment-create exchange to the dedicated diagnostics channel. Adapters call
+     * this when DOKU answered but the create still did not succeed; request() calls it for its own failures.
+     *
+     * @param  array{attempt_guid?: ?string, channel?: ?string}  $context
+     */
+    public function recordCreateSnapshot(array $context, string $diagnosticCode): void
+    {
+        $exchange = $this->lastExchange;
+        $this->lastExchange = null;
+        if ($exchange === null) {
+            return;
+        }
+        $guid = $context['attempt_guid'] ?? null;
+        try {
+            Log::channel('doku_diagnostics')->warning('DOKU create failure snapshot.', [
+                'event' => 'doku.create_failure_snapshot',
+                'attempt_guid' => is_string($guid) && Str::isUuid($guid) ? $guid : null,
+                'environment' => $this->environment(),
+                'channel' => $context['channel'] ?? null,
+                'diagnostic_code' => $diagnosticCode,
+                'request' => $exchange['request'],
+                'response' => $exchange['response'],
+            ]);
+        } catch (\Throwable) {
+            // Diagnostics must never change the payment outcome.
+        }
+    }
+
+    /**
+     * B2B access token. A failure here means the payment request was never dispatched.
+     *
+     * @param  array{attempt_guid?: ?string, channel?: ?string}  $context
+     */
+    private function accessToken(string $timestamp, array $context): string
+    {
+        $started = hrtime(true);
+        if (! openssl_sign(config('doku.client_id').'|'.$timestamp, $signed, $this->privateKey(), OPENSSL_ALGO_SHA256)) {
+            throw $this->failure($context, 'b2b_token', 'doku_internal_exception', $started, requestSent: false);
+        }
+        try {
+            $response = $this->transport()->withHeaders(['X-CLIENT-KEY' => config('doku.client_id'),
+                'X-TIMESTAMP' => $timestamp, 'X-SIGNATURE' => base64_encode($signed)])
+                ->post('/authorization/v1/access-token/b2b', ['grantType' => 'client_credentials']);
+        } catch (ConnectionException $e) {
+            $this->recordFailure($context, 'b2b_token', 'doku_token_transport_error', ['exception_class' => $e::class, 'request_sent' => 'unknown', 'duration_ms' => $this->elapsedMs($started)]);
+            throw $e;
+        }
+        if (! $response->successful()) {
+            throw $this->failure($context, 'b2b_token', 'doku_token_http_error', $started, $response->status(), $response->json('responseCode'));
+        }
+        $token = $response->json('accessToken');
+        if ($response->json('responseCode') !== '2007300' || $response->json('tokenType') !== 'Bearer' || ! is_string($token) || $token === '') {
+            throw $this->failure($context, 'b2b_token', 'doku_token_response_invalid', $started, $response->status(), $response->json('responseCode'));
+        }
+
+        return $token;
+    }
+
+    /**
+     * Signed SNAP call for channel adapters. Pass a null CHANNEL-ID for products whose pages do not list that header.
+     *
+     * @param  array<string, mixed>  $body
+     * @param  array{attempt_guid?: ?string, channel?: ?string}  $context
+     * @param  array{timezone?: string, headers?: array<string, string>}  $options
+     * @return array<string, mixed>
+     */
+    public function signedRequest(string $path, array $body, string $requestId, ?string $channelId = 'H2H', array $context = [], array $options = []): array
+    {
+        return $this->request($path, $body, $requestId, $channelId, $context, $options);
+    }
+
+    /** HTTP status of the last signed request that got an answer; null before it or after a transport failure. */
+    public function lastHttpStatus(): ?int
+    {
+        return $this->lastHttpStatus;
+    }
+
+    /** @return array{attempt_guid: ?string, channel: ?string} */
+    public function diagnosticContext(object $attempt): array
+    {
+        return ['attempt_guid' => $attempt->guid ?? null, 'channel' => $attempt->channel ?? null];
+    }
+
+    /** Provider response codes are surfaced only when they look like a code; HTML, prose and secrets are dropped. */
+    public function safeProviderCode(mixed $code): ?string
+    {
+        return (is_string($code) || is_int($code)) && preg_match('/^[A-Za-z0-9_-]{1,32}$/D', (string) $code) === 1 ? (string) $code : null;
+    }
+
+    /**
+     * Writes one bounded diagnostic record. Only allow-listed scalar fields are logged: never bodies, headers, tokens,
+     * signatures, URLs, provider messages or exception messages.
+     *
+     * @param  array{attempt_guid?: ?string, channel?: ?string}  $context
+     * @param  array{http_status?: ?int, provider_response_code?: mixed, exception_class?: ?string, duration_ms?: ?int, request_sent?: bool|string, outcome_certainty?: string}  $details
+     */
+    public function recordFailure(array $context, string $phase, string $diagnosticCode, array $details = []): void
+    {
+        $guid = $context['attempt_guid'] ?? null;
+        $channel = $context['channel'] ?? null;
+        Log::warning('DOKU provider request failed.', [
+            'event' => 'doku.provider_request_failed',
+            'attempt_guid' => is_string($guid) && Str::isUuid($guid) ? $guid : null,
+            'provider' => 'doku',
+            'environment' => $this->environment(),
+            'channel' => is_string($channel) && preg_match('/^[a-z0-9_]{1,32}$/D', $channel) === 1 ? $channel : null,
+            'phase' => $phase,
+            'http_status' => isset($details['http_status']) ? (int) $details['http_status'] : null,
+            'provider_response_code' => $this->safeProviderCode($details['provider_response_code'] ?? null),
+            'diagnostic_code' => $diagnosticCode,
+            'exception_class' => $details['exception_class'] ?? null,
+            'duration_ms' => $details['duration_ms'] ?? null,
+            'request_sent' => $details['request_sent'] ?? true,
+            'outcome_certainty' => $details['outcome_certainty'] ?? ($phase === 'b2b_token' ? 'not_issued' : 'unknown'),
+        ]);
+    }
+
+    /** @param array{attempt_guid?: ?string, channel?: ?string} $context */
+    private function failure(array $context, string $phase, string $code, int $startedAt, ?int $httpStatus = null, mixed $providerCode = null, bool $requestSent = true): DokuRequestException
+    {
+        $this->recordFailure($context, $phase, $code, ['http_status' => $httpStatus, 'provider_response_code' => $providerCode,
+            'duration_ms' => $this->elapsedMs($startedAt), 'request_sent' => $requestSent]);
+
+        return new DokuRequestException($phase, $code, $httpStatus, $this->safeProviderCode($providerCode));
+    }
+
+    private function elapsedMs(int|float $startedAt): int
+    {
+        return (int) ((hrtime(true) - $startedAt) / 1000000);
     }
 
     private function signature(string $path, string $token, string $body, string $timestamp): string
@@ -353,13 +549,13 @@ class DokuClient
             && $data['virtualAccountNo'] === trim($data['partnerServiceId']).$data['customerNo'];
     }
 
-    private function amount(mixed $amount): ?int
+    public function parseAmount(mixed $amount): ?int
     {
         return is_array($amount) && ($amount['currency'] ?? '') === 'IDR' && is_string($amount['value'] ?? null)
             && preg_match('/^[1-9]\d{0,13}\.00$/D', $amount['value']) ? (int) substr($amount['value'], 0, -3) : null;
     }
 
-    private function instant(mixed $value): ?CarbonImmutable
+    public function parseInstant(mixed $value): ?CarbonImmutable
     {
         if (! is_string($value) || ! preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$/D', $value)) {
             return null;

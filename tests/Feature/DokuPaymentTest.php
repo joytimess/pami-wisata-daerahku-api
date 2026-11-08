@@ -120,6 +120,42 @@ it('keeps an uncertain create unresolved on retry', function () {
     $this->assertDatabaseCount('payment_attempts', 1);
 });
 
+it('retains create instructions when a concurrent refresh resolves before creation returns', function (string $inquiryStatus) {
+    [$owner, $booking] = dokuBooking();
+    $client = dokuClientFake();
+    $client->shouldReceive('status')->once()->andReturn(['status' => $inquiryStatus]);
+    $client->shouldReceive('create')->once()->andReturnUsing(function ($attempt, $booking) use ($owner) {
+        app(DokuPaymentService::class)->refresh($owner, $booking->guid, $attempt->guid);
+
+        return dokuCreateResult($attempt, $booking);
+    });
+
+    $result = dokuStart($owner, $booking);
+
+    expect($result['status'])->toBe('pending');
+    expect($result['instruction']['va_number'] ?? null)->toBe('988123456789');
+    $this->assertDatabaseHas('payment_attempts', ['guid' => $result['attempt_guid'], 'status' => 'pending', 'provider_reference' => '988123456789']);
+    expect(dokuStart($owner, $booking, 'retry')['attempt_guid'])->toBe($result['attempt_guid']);
+    $this->assertDatabaseCount('payment_attempts', 1);
+    $this->assertDatabaseHas('bookings', ['guid' => $booking->guid, 'status' => 'awaiting_payment']);
+})->with(['unknown', 'pending']);
+
+it('keeps a verified capture when the create response arrives afterward', function () {
+    [$owner, $booking] = dokuBooking();
+    dokuClientFake()->shouldReceive('create')->once()->andReturnUsing(function ($attempt, $booking) {
+        app(DokuPaymentService::class)->receive(dokuOutcome($attempt->guid, ['provider_reference' => '988123456789']));
+
+        return dokuCreateResult($attempt, $booking);
+    });
+
+    $result = dokuStart($owner, $booking);
+
+    expect($result)->toMatchArray(['status' => 'paid', 'booking_status' => 'confirmed', 'payment_status' => 'paid',
+        'instruction' => ['presentation_type' => 'unavailable']]);
+    $this->assertDatabaseHas('payment_attempts', ['guid' => $result['attempt_guid'], 'status' => 'paid', 'provider_reference' => '988123456789', 'instruction_ciphertext' => null]);
+    $this->assertDatabaseCount('payment_events', 1);
+});
+
 it('durably records events before queueing and applies duplicate captures once', function () {
     [$owner, $booking] = dokuBooking();
     dokuClientFake()->shouldReceive('create')->once()->andReturnUsing('dokuCreateResult');

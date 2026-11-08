@@ -21,6 +21,14 @@ class PaymentController extends Controller
             ->response()->header('Cache-Control', 'private, no-store');
     }
 
+    public function refreshDoku(Request $request, string $booking, string $attempt, DokuPaymentService $doku, PaymentService $payments): JsonResponse
+    {
+        $doku->refresh($request->user(), $booking, $attempt);
+
+        return (new OperationalResource($payments->show($request->user(), $booking)))
+            ->response()->header('Cache-Control', 'private, no-store');
+    }
+
     public function initiateDemo(DemoPaymentRequest $request, string $booking, DemoPaymentService $service): JsonResponse
     {
         return (new OperationalResource($service->initiate($request->user(), $booking, $request->validated())))

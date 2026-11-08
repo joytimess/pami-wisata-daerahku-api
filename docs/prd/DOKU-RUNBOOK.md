@@ -15,7 +15,7 @@ Kode menyediakan VA BNI SNAP v1.1 DGPC, penerimaan capture bertanda tangan, peny
 | M4 | Verifikasi raw JSON sesuai SNAP, event durable sebelum ACK, job replay, capture dan ticket eligibility diuji melalui HTTP lokal. Callback simulator DOKU: NOT RUN. |
 | M5 | PARTIAL. Polling pending, lease, backoff/jitter dan replay event tersedia. Mapping inquiry terminal belum diaktifkan karena bentuk status akhir/waktu pembayaran belum terverifikasi. Reversal/refund ditangani pada domain dan diuji dengan fixture; parser notifikasi provider untuk adjustment belum tersedia. |
 | M6 | Kontrak backend native VA tersedia; endpoint DEMO tetap ada. Source Flutter tidak diubah, pengujian emulator/device belum dijalankan. |
-| M7 | PARTIAL (v2.0). Registry channel dan VA BCA/BRI/Mandiri tersedia di kode, diuji dengan fixture; belum ada transaksi Sandbox. QRIS dan e-wallet belum diimplementasikan karena kontrak notifikasi resmi belum lengkap (lihat `DOKU-CHANNEL-MATRIX.md`); capability tetap unavailable. |
+| M7 | PARTIAL (v2.0). Registry channel, VA BCA/BRI/Mandiri, DANA, ShopeePay dan adapter generate QRIS ada di kode dan diuji dengan fixture; belum ada transaksi Sandbox. OVO belum diimplementasikan (kontrak tidak terbaca). QRIS tidak dapat settle sehingga tetap unavailable (lihat `DOKU-CHANNEL-MATRIX.md`). |
 | M8 | BLOCKED untuk go-live: menunggu bukti Sandbox, kontrak terminal/adjustment, merchant/channel live, HTTPS tetap, worker/scheduler, monitoring dan release smoke test. |
 
 PRD penuh belum memenuhi Definition of Done. Jangan mengaktifkan Production dengan mengandalkan hasil fixture.
@@ -92,6 +92,7 @@ Semua endpoint owner memakai JWT aplikasi dan header respons `Cache-Control: pri
 | `GET /api/v1/payments/methods?booking_guid={guid}` | Capability berdasarkan konfigurasi dan booking. Hanya BNI VA yang dapat diaktifkan. |
 | `POST /api/v1/bookings/{guid}/payment-attempts` | Header `Idempotency-Key`; body `{"method_code":"virtual_account","channel":"bni"}`. Amount/currency/provider/environment/status dari client ditolak. |
 | `GET /api/v1/bookings/{guid}/payment-intent` | Status persisted, `last_attempt` dan instruksi VA yang aman dipulihkan tanpa memanggil provider. |
+| `POST /api/v1/bookings/{guid}/payment-attempts/{attempt}/refresh` | Owner-only. Memicu status inquiry DOKU terautentikasi untuk attempt yang masih `initiating/pending/unknown`, menerapkan event verified, lalu mengembalikan payload yang sama dengan `GET payment-intent`. Minimum 10 detik antar-inquiry per attempt (panggilan cepat berulang tidak memanggil DOKU lagi), throttle 20/menit, attempt terminal tidak memanggil DOKU. |
 | `POST /api/v1/webhooks/doku/va` | Verifikasi HMAC raw-body minification SNAP, timestamp, merchant, channel dan reference. ACK `2002500` sesudah event durable. |
 | `GET /api/v1/admin/bookings/{guid}/payment-intent` | Investigasi read-only bagi role 2 atau role 1 yang ditugaskan ke destinasi; maksimal 20 attempts/events terbaru, tanpa nomor VA atau raw payload. |
 
@@ -117,6 +118,29 @@ Instruksi disembunyikan setelah deadline, status terminal, booking selesai/dibat
 
 Nominal biaya gateway, settlement, net revenue dan kelengkapan refund tetap unavailable bila tidak ada bukti provider. Data Sandbox memiliki `test_only=true` dan tidak menjadi revenue Production.
 
+## Diagnosis `unknown` / `provider_unavailable` (PRD-FIX-DOKU-DANA-001, Gate A)
+
+`last_error_code=provider_unavailable` hanya menyatakan bahwa create gagal sebelum respons yang dapat dipakai diterima. Penyebab tepatnya ada di log `DOKU provider request failed.` (`event=doku.provider_request_failed`, level warning), dikorelasikan lewat `attempt_guid`. Field yang dicatat: `phase`, `diagnostic_code`, `http_status`, `provider_response_code` (hanya bila cocok `^[A-Za-z0-9_-]{1,32}$`), `exception_class`, `duration_ms`, `request_sent`, `outcome_certainty`. Body, header, token, signature, URL redirect, `responseMessage` dan pesan exception tidak pernah dicatat. Attempt lama sebelum patch ini tidak punya record tersebut; penyebabnya tidak dapat direkonstruksi dan harus dianggap belum terkonfirmasi.
+
+| `diagnostic_code` | `phase` | Arti | Pembayaran mungkin terbit? |
+| --- | --- | --- | --- |
+| `doku_token_http_error` | `b2b_token` | Endpoint token membalas non-2xx (credential/key salah, outage). | Tidak (`not_issued`) |
+| `doku_token_response_invalid` | `b2b_token` | Token HTTP 2xx tetapi `responseCode`/`tokenType`/`accessToken` tidak valid. | Tidak |
+| `doku_token_transport_error` | `b2b_token` | Timeout/koneksi saat meminta token. | Tidak |
+| `doku_payment_http_error` | `payment_create` | Endpoint pembayaran membalas non-2xx; lihat `http_status` dan `provider_response_code`. | Mungkin (`unknown`) |
+| `doku_payment_response_invalid` | `payment_create` | HTTP 2xx tetapi body bukan JSON object atau `partnerReferenceNo` tidak cocok. | Mungkin |
+| `doku_payment_not_accepted` | `payment_create` | HTTP 2xx dengan `responseCode` bukan sukses (bukan `200xx00`). | Mungkin |
+| `doku_payment_transport_timeout` | `payment_create` | Timeout/koneksi setelah request pembayaran mungkin terkirim. | Mungkin |
+| `doku_redirect_host_rejected` | `payment_create` | `webRedirectUrl` bukan HTTPS atau host di luar `DOKU_EWALLET_REDIRECT_HOSTS`. | Mungkin; jangan arahkan pelanggan |
+| `doku_internal_exception` | `internal`, `b2b_token`, `payment_create` | Kesalahan internal Laravel (kelas exception saja). | Tergantung fase; anggap mungkin |
+
+Keputusan operator:
+
+1. Klasifikasi tidak mengizinkan attempt baru. Status tetap `unknown`; frontend tetap menampilkan "jangan membayar ulang".
+2. Kode `4xx` pada create tidak membuktikan pembayaran tidak terbit. Hanya `phase=b2b_token` yang membuktikan create tidak pernah dikirim.
+3. Untuk DANA/ShopeePay, `payments:reconcile-doku` memakai inquiry `/orders/v1.0/debit/status` dengan `merchant_reference`; hasilnya satu-satunya jalan keluar dari `unknown` secara otomatis. Jangan memaksa `paid` atau menghapus attempt.
+4. Bila inquiry tidak menemukan transaksi (`07`) atau tidak terselesaikan, eskalasi `attempt_guid`, `merchant_reference`, waktu dan `provider_response_code` ke DOKU. Percobaan Sandbox baru memerlukan persetujuan terpisah (Gate C) setelah ketidakpastian attempt lama diselesaikan dengan bukti otoritatif.
+
 ## Monitoring dan rollback
 
 Log mencatat GUID attempt/event, provider/environment/channel, status, latency, duplicate delivery dan alasan review tanpa key/token/nomor VA/raw notification. Endpoint investigasi menunjukkan jadwal/count/error inquiry. Pantau event `recorded` menua, pending/unknown menua, `needs_review`, antrean gagal, HTTP 401 webhook dan worker/scheduler mati. Alarm/collector produksi belum dipasang dalam pekerjaan ini; gunakan access log gateway untuk tingkat penolakan signature.
@@ -133,13 +157,44 @@ Sumber kontrak per channel dan sel yang masih `BLOCKED_EXTERIOR` ada di `docs/pr
 | --- | --- | --- | --- |
 | `va_bni` | Ada, tidak berubah | Ya, bila config BNI valid (grandfathered, tanpa `DOKU_VERIFIED_CHANNELS`) | Ya |
 | `va_bca`, `va_bri`, `va_mandiri` | Ada (profil bank pada `DokuClient::vaBank`) | Ya, bila ada di `DOKU_CHANNELS`, `DOKU_VERIFIED_CHANNELS`, dan BIN/prefix bank valid | Hanya bila `DOKU_<BANK>_NOTIFICATION_CHANNEL_ID` diisi dari notifikasi Sandbox asli |
-| `qris`, `ewallet_dana`, `ewallet_shopeepay`, `ewallet_ovo` | Belum ada adapter | Tidak (`channel_not_implemented`) | Tidak |
+| `ewallet_dana` | Ada (`DokuDirectDebitAdapter`) | Ya, bila return URL, `DOKU_EWALLET_REDIRECT_HOSTS`, `DOKU_CHANNELS` dan `DOKU_VERIFIED_CHANNELS` terisi | Ya, hanya dari status query terautentikasi (`00`); polling maksimum 3 menit |
+| `ewallet_shopeepay` | Ada | Sama, ditambah `DOKU_SHOPEEPAY_PAYMENT_PATH` eksplisit (v1 atau v2, belum dikonfirmasi DOKU) | Sama dengan DANA |
+| `qris` | Adapter generate ada (`DokuQrisAdapter`) | Tidak: `channel_contract_unverified` | Tidak: notifikasi dan status QRIS tidak terdokumentasi |
+| `ewallet_ovo` | Belum ada adapter | Tidak (`channel_not_implemented`) | Tidak |
 
 Gate fail-closed (`DokuChannelRegistry`): adapter ada, kontrak notifikasi terverifikasi, ada di `DOKU_CHANNELS`, ada di `DOKU_VERIFIED_CHANNELS` (kecuali BNI), parameter merchant valid, DOKU aktif. Parameter BNI yang hilang hanya menonaktifkan BNI. `GET payments/methods` tetap berisi tiga family (`qris`, `virtual_account`, `ewallet`) dan menambah daftar `channels` per family; key `channel` lama pada `virtual_account` dipertahankan.
 
-Variabel baru (semuanya kosong secara default): `DOKU_VERIFIED_CHANNELS`, `DOKU_{BCA,BRI,MANDIRI}_PARTNER_SERVICE_ID`, `DOKU_{BCA,BRI,MANDIRI}_CUSTOMER_PREFIX`, `DOKU_{BCA,BRI,MANDIRI}_NOTIFICATION_CHANNEL_ID`. Jangan memakai nilai BNI atau contoh dokumentasi untuk bank lain.
+Variabel baru (semuanya kosong secara default): `DOKU_VERIFIED_CHANNELS`, `DOKU_QRIS_{MERCHANT_ID,TERMINAL_ID,POSTAL_CODE}`, `DOKU_EWALLET_RETURN_URL`, `DOKU_EWALLET_REDIRECT_HOSTS`, `DOKU_SHOPEEPAY_PAYMENT_PATH`, `DOKU_{BCA,BRI,MANDIRI}_PARTNER_SERVICE_ID`, `DOKU_{BCA,BRI,MANDIRI}_CUSTOMER_PREFIX`, `DOKU_{BCA,BRI,MANDIRI}_NOTIFICATION_CHANNEL_ID`. Jangan memakai nilai BNI atau contoh dokumentasi untuk bank lain.
 
 Catatan lingkungan lokal: nilai `.env` yang berisi path Windows dalam tanda kutip ganda (misalnya `DOKU_MERCHANT_PRIVATE_KEY_PATH="C:\laragon\..."`) membuat dotenv gagal diparse sehingga artisan tidak dapat boot. Gunakan tanda kutip tunggal atau garis miring depan.
+
+## Return flow e-wallet (DANA, ShopeePay)
+
+Alur: app `POST payment-attempts` → membuka `redirect_url` DOKU di browser/aplikasi e-wallet → e-wallet mengarahkan pelanggan ke `DOKU_EWALLET_RETURN_URL` → app dibuka kembali → app memanggil `POST .../payment-attempts/{attempt}/refresh` dan menampilkan hasil dari server.
+
+**Nilai yang benar:**
+
+```
+DOKU_EWALLET_RETURN_URL=https://<domain-publik-API>/payment/return
+```
+
+- Harus HTTPS (adapter menolak selain itu), domain publik yang sama dengan host App Link app (`APP_LINK_HOST`), path persis `/payment/return` (route `payment.return`, `GET`). Tanpa `/api`, tanpa `/v1`, tanpa query, tanpa trailing slash, tanpa fragment, maksimum 255 karakter.
+- Contoh: bila API di `https://api.wisatadaerahku.id`, isi `https://api.wisatadaerahku.id/payment/return`. Jangan memakai custom scheme (`wisatadaerahku://`) atau `http://`: DOKU `isDeepLink` dikirim `N` dan adapter hanya menerima HTTPS.
+- Sandbox lokal: DOKU harus dapat menjangkau URL ini dari browser pelanggan, jadi gunakan domain HTTPS publik/tunnel, bukan `http://*.test`.
+- Verifikasi route: `php artisan route:list --path=payment/return` harus menampilkan `GET|HEAD payment/return › payment.return`; `curl -i <URL>` harus `200` dengan `Cache-Control: no-store`, tanpa `Set-Cookie`. Tes `PaymentReturnFlowTest` mengunci bahwa path dari config sama dengan route.
+
+**Prinsip keamanan:** halaman return statis, tanpa sesi/cookie, tanpa baca/tulis database dan tanpa memanggil DOKU. Parameter `result` (`success|cancel|error`) hanya petunjuk teks yang di-whitelist; parameter lain diabaikan, tidak pernah dipantulkan, dan DOKU tidak terdokumentasi menambahkannya. Redirect, deep link atau `result=success` tidak pernah mengonfirmasi booking; hanya status inquiry terautentikasi (via `refresh`, `payments:reconcile-doku`) yang dapat menghasilkan `paid`.
+
+**Android App Links** (supaya return membuka app langsung):
+
+1. Isi `MOBILE_ANDROID_SHA256_FINGERPRINTS` (comma list, uppercase, `AA:BB:..`) dengan sertifikat penandatangan app: `keytool -list -v -keystore <keystore> -alias <alias>` untuk upload key/debug, dan sertifikat *App signing key* dari Play Console (Setup → App signing) untuk build store. `MOBILE_ANDROID_PACKAGE` default `id.wisatadaerahku.app`.
+2. `GET /.well-known/assetlinks.json` harus `200 application/json` pada domain yang sama, tanpa redirect. Bila fingerprint kosong/tidak valid endpoint menjawab `404` (tidak ada klaim palsu).
+3. Build app dengan host yang sama lewat properti gradle `APP_LINK_HOST`. `flutter build` tidak menerima `-P` langsung, jadi gunakan environment variable (sudah diuji menghasilkan intent-filter yang benar pada manifest hasil merge): `ORG_GRADLE_PROJECT_APP_LINK_HOST=<domain-publik-API> flutter build apk --dart-define=APP_ENV=... --dart-define=API_BASE_URL=...` (PowerShell: `$env:ORG_GRADLE_PROJECT_APP_LINK_HOST='<domain>'`), atau tulis `APP_LINK_HOST=<domain>` di `android/gradle.properties`. Default `wisatadaerahku.invalid` tidak pernah cocok sehingga build tanpa nilai ini tidak membuka app dari return URL. Cek di perangkat: `adb shell pm get-app-links id.wisatadaerahku.app` harus `verified`.
+4. Cadangan bila verifikasi belum selesai: tombol "Buka aplikasi" di halaman return memakai intent eksplisit `intent://<host>/payment/return#Intent;scheme=https;package=id.wisatadaerahku.app;end`, yang tetap membuka app yang benar.
+
+**Perilaku saat pelanggan membatalkan atau error di e-wallet:** DOKU tidak mendokumentasikan pembatalan sebagai event terpisah. Attempt tetap `pending` sampai status query menjawab `05/06` (gagal) atau `validUpTo` lewat, lalu intent kembali `requires_payment`. App tidak membuat attempt baru selama attempt lama belum terminal (idempotensi); selama masih valid pelanggan dapat membuka ulang `redirect_url` yang sama.
+
+**Belum dibuktikan (perlu UAT Sandbox/perangkat):** apakah DANA/ShopeePay benar-benar mengarahkan ke return URL dan apakah ada parameter tambahan; perilaku App Links di Chrome Custom Tab/WebView e-wallet pada perangkat nyata. Fixture dan tes widget tidak membuktikan keduanya.
 
 ## Sumber protokol
 

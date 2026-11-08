@@ -26,9 +26,9 @@ class DokuChannelRegistry
             ['va_bca', 'virtual_account', 'bca', 'virtual_account', true, null, false],
             ['va_bri', 'virtual_account', 'bri', 'virtual_account', true, null, false],
             ['va_mandiri', 'virtual_account', 'mandiri', 'virtual_account', true, null, false],
-            ['qris', 'qris', 'qris', 'qr_payload', false, false, false],
-            ['ewallet_dana', 'ewallet', 'dana', 'ewallet_redirect', false, false, false],
-            ['ewallet_shopeepay', 'ewallet', 'shopeepay', 'ewallet_redirect', false, false, false],
+            ['qris', 'qris', 'qris', 'qr_payload', true, false, false],
+            ['ewallet_dana', 'ewallet', 'dana', 'ewallet_redirect', true, true, false],
+            ['ewallet_shopeepay', 'ewallet', 'shopeepay', 'ewallet_redirect', true, true, false],
             ['ewallet_ovo', 'ewallet', 'ovo', 'ewallet_redirect', false, false, false],
         ];
 
