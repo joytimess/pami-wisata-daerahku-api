@@ -49,7 +49,8 @@ it('disables only BNI when its merchant parameters are missing', function (strin
     $reasons = app(DokuChannelRegistry::class)->reasons();
 
     expect($reasons['va_bni'])->toBe('doku_not_configured')
-        ->and(app(DokuChannelRegistry::class)->staticReason('va_bca'))->toBe('channel_not_implemented');
+        ->and(app(DokuChannelRegistry::class)->staticReason('va_bca'))->toBe('channel_contract_unverified')
+        ->and(app(DokuChannelRegistry::class)->staticReason('qris'))->toBe('channel_not_implemented');
 })->with(['doku.partner_service_id', 'doku.customer_prefix']);
 
 it('never enables a channel only because it is allowlisted or marked verified', function () {
@@ -94,20 +95,20 @@ it('reports every family and channel on the methods endpoint without changing th
     $channels = collect($response->json('data.methods.1.channels'))->keyBy('channel');
     expect($channels->keys()->all())->toBe(['bni', 'bca', 'bri', 'mandiri'])
         ->and($channels['bni']['available'])->toBeTrue()
-        ->and($channels['bca'])->toMatchArray(['available' => false, 'reason' => 'channel_not_implemented']);
+        ->and($channels['bca'])->toMatchArray(['available' => false, 'reason' => 'channel_contract_unverified']);
     expect(collect($response->json('data.methods.2.channels'))->pluck('channel')->all())->toBe(['dana', 'shopeepay', 'ovo']);
 });
 
-it('rejects unimplemented channels before any attempt or provider request', function (string $method, string $channel) {
+it('rejects unavailable channels before any attempt or provider request', function (string $method, string $channel, string $reason) {
     [$owner, $booking] = registryBooking();
     config(['doku.channels' => ['va_bni', 'qris', 'ewallet_dana', 'va_bca'], 'doku.verified_channels' => ['qris', 'ewallet_dana', 'va_bca']]);
 
     $this->postJson('/api/v1/bookings/'.$booking->guid.'/payment-attempts', ['method_code' => $method, 'channel' => $channel],
-        bearer($owner) + ['Idempotency-Key' => 'unavailable-'.$channel])->assertStatus(409)->assertJsonPath('code', 'channel_not_implemented');
+        bearer($owner) + ['Idempotency-Key' => 'unavailable-'.$channel])->assertStatus(409)->assertJsonPath('code', $reason);
     $this->assertDatabaseCount('payment_attempts', 0);
     $this->assertDatabaseCount('payment_intents', 0);
     Http::assertNothingSent();
-})->with([['qris', 'qris'], ['ewallet', 'dana'], ['virtual_account', 'bca']]);
+})->with([['qris', 'qris', 'channel_not_implemented'], ['ewallet', 'dana', 'channel_not_implemented'], ['virtual_account', 'bca', 'channel_contract_unverified']]);
 
 it('rejects mismatched or unknown method and channel pairs as validation errors', function (string $method, string $channel) {
     [$owner, $booking] = registryBooking();

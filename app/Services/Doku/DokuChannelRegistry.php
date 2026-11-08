@@ -13,7 +13,8 @@ class DokuChannelRegistry
 {
     /**
      * `implemented`: transport, normalizer and tests exist in this codebase.
-     * `settles`: a verified provider notification/inquiry contract exists, so a paid outcome may be applied.
+     * `settles`: a verified provider notification/inquiry contract exists, so a paid outcome may be applied. `null` means the
+     *   contract is documented but the operator must confirm the bank's notification CHANNEL-ID in configuration first.
      * `grandfathered`: enabled before DOKU_VERIFIED_CHANNELS existed; stays compatible with current deployments.
      *
      * @return array<string, array{code: string, method: string, channel: string, presentation_type: string, implemented: bool, settles: bool, grandfathered: bool}>
@@ -22,9 +23,9 @@ class DokuChannelRegistry
     {
         $definitions = [
             ['va_bni', 'virtual_account', 'bni', 'virtual_account', true, true, true],
-            ['va_bca', 'virtual_account', 'bca', 'virtual_account', false, false, false],
-            ['va_bri', 'virtual_account', 'bri', 'virtual_account', false, false, false],
-            ['va_mandiri', 'virtual_account', 'mandiri', 'virtual_account', false, false, false],
+            ['va_bca', 'virtual_account', 'bca', 'virtual_account', true, null, false],
+            ['va_bri', 'virtual_account', 'bri', 'virtual_account', true, null, false],
+            ['va_mandiri', 'virtual_account', 'mandiri', 'virtual_account', true, null, false],
             ['qris', 'qris', 'qris', 'qr_payload', false, false, false],
             ['ewallet_dana', 'ewallet', 'dana', 'ewallet_redirect', false, false, false],
             ['ewallet_shopeepay', 'ewallet', 'shopeepay', 'ewallet_redirect', false, false, false],
@@ -34,10 +35,15 @@ class DokuChannelRegistry
         $channels = [];
         foreach ($definitions as [$code, $method, $channel, $presentation, $implemented, $settles, $grandfathered]) {
             $channels[$code] = ['code' => $code, 'method' => $method, 'channel' => $channel, 'presentation_type' => $presentation,
-                'implemented' => $implemented, 'settles' => $settles, 'grandfathered' => $grandfathered];
+                'implemented' => $implemented, 'settles' => $settles ?? $this->notificationConfigured($channel), 'grandfathered' => $grandfathered];
         }
 
         return $channels;
+    }
+
+    private function notificationConfigured(string $bank): bool
+    {
+        return preg_match('/^[A-Za-z0-9]{2,16}$/D', (string) config('doku.va_banks.'.$bank.'.notification_channel_id')) === 1;
     }
 
     /** @return array<string, string> method code => family presentation type, in public order */

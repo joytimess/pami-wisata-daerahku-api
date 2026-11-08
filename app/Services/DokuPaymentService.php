@@ -213,10 +213,13 @@ class DokuPaymentService
         if (! $attempt) {
             throw new BookingException('Unknown payment reference or environment.', 'payment_environment_mismatch');
         }
+        if ((isset($outcome['channel']) && $outcome['channel'] !== $attempt->channel) || (isset($outcome['method']) && $outcome['method'] !== $attempt->method)) {
+            throw new BookingException('Provider event belongs to another channel.', 'payment_needs_review');
+        }
         $type = match ($outcome['status']) {
             'paid' => 'capture', 'reversed' => 'reversal', 'refunded' => 'refund', default => 'status'
         };
-        $snapshot = array_intersect_key($outcome, array_flip(['status', 'merchant_reference', 'provider_reference', 'amount', 'currency', 'occurred_at']));
+        $snapshot = array_intersect_key($outcome, array_flip(['status', 'merchant_reference', 'provider_reference', 'amount', 'currency', 'occurred_at', 'method', 'channel']));
         if (isset($snapshot['occurred_at'])) {
             $snapshot['occurred_at'] = CarbonImmutable::parse($snapshot['occurred_at'])->utc()->toIso8601String();
         }

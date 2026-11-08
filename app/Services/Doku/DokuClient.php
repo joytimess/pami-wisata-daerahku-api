@@ -39,14 +39,35 @@ class DokuClient
         };
     }
 
+    /**
+     * Bank-specific VA profile: DOKU channel name, merchant BIN/prefix and the notification CHANNEL-ID.
+     * Values come only from server configuration; nothing is inferred from another bank or the Client ID.
+     *
+     * @return array{bank: string, doku_channel: string, partner_service_id: string, customer_prefix: string, notification_channel_id: string, acquirer: ?string}|null
+     */
+    public function vaBank(string $bank): ?array
+    {
+        $profiles = ['bni' => ['VIRTUAL_ACCOUNT_BNI', 'BNI'], 'bca' => ['VIRTUAL_ACCOUNT_BCA', null],
+            'bri' => ['VIRTUAL_ACCOUNT_BRI', 'BRI'], 'mandiri' => ['VIRTUAL_ACCOUNT_BANK_MANDIRI', 'MANDIRI']];
+        if (! isset($profiles[$bank])) {
+            return null;
+        }
+
+        return ['bank' => $bank, 'doku_channel' => $profiles[$bank][0], 'acquirer' => $profiles[$bank][1],
+            'partner_service_id' => (string) ($bank === 'bni' ? config('doku.partner_service_id') : config('doku.va_banks.'.$bank.'.partner_service_id')),
+            'customer_prefix' => (string) ($bank === 'bni' ? config('doku.customer_prefix') : config('doku.va_banks.'.$bank.'.customer_prefix')),
+            'notification_channel_id' => $bank === 'bni' ? 'VA004' : (string) config('doku.va_banks.'.$bank.'.notification_channel_id')];
+    }
+
     /** Channel-specific merchant parameters; never inferred from the Client ID or documentation samples. */
     public function merchantConfigured(string $channelCode): bool
     {
-        return match ($channelCode) {
-            'va_bni' => preg_match('/^\d{1,8}$/D', (string) config('doku.partner_service_id')) === 1
-                && preg_match('/^\d{1,20}$/D', (string) config('doku.customer_prefix')) === 1,
-            default => false,
-        };
+        $profile = str_starts_with($channelCode, 'va_') ? $this->vaBank(substr($channelCode, 3)) : null;
+
+        return $profile !== null
+            && preg_match('/^\d{1,8}$/D', $profile['partner_service_id']) === 1
+            && preg_match('/^\d{1,20}$/D', $profile['customer_prefix']) === 1
+            && strlen($profile['partner_service_id'].$profile['customer_prefix']) <= 28;
     }
 
     public function configured(): bool
@@ -79,22 +100,23 @@ class DokuClient
         if ($attempt->environment !== $this->environment() || $attempt->provider !== 'doku') {
             return ['status' => 'unknown', 'reason' => 'payment_environment_mismatch'];
         }
-        if (($attempt->method ?? 'virtual_account') !== 'virtual_account' || $attempt->channel !== 'bni') {
+        $bank = $this->vaBank((string) $attempt->channel);
+        if (($attempt->method ?? 'virtual_account') !== 'virtual_account' || $bank === null) {
             return ['status' => 'unknown', 'reason' => 'channel_not_implemented'];
         }
-        if ($reason = $this->readinessReason('va_bni')) {
+        if ($reason = $this->readinessReason('va_'.$bank['bank'])) {
             return ['status' => 'unknown', 'reason' => $reason];
         }
         $expiry = CarbonImmutable::parse($attempt->instruction_expires_at ?? $booking->payment_expires_at, 'UTC');
         $body = [
-            'partnerServiceId' => str_pad((string) config('doku.partner_service_id'), 8, ' ', STR_PAD_LEFT),
-            'customerNo' => (string) config('doku.customer_prefix'),
-            'virtualAccountNo' => (string) config('doku.partner_service_id').config('doku.customer_prefix'),
+            'partnerServiceId' => str_pad($bank['partner_service_id'], 8, ' ', STR_PAD_LEFT),
+            'customerNo' => $bank['customer_prefix'],
+            'virtualAccountNo' => $bank['partner_service_id'].$bank['customer_prefix'],
             'virtualAccountName' => mb_substr($booking->visitor_name, 0, 255),
             'trxId' => $attempt->merchant_reference,
             'totalAmount' => ['value' => $attempt->amount.'.00', 'currency' => $attempt->currency],
             'virtualAccountTrxType' => 'C', 'expiredDate' => $expiry->toIso8601String(),
-            'additionalInfo' => ['channel' => 'VIRTUAL_ACCOUNT_BNI', 'virtualAccountConfig' => ['reusableStatus' => false]],
+            'additionalInfo' => ['channel' => $bank['doku_channel'], 'virtualAccountConfig' => ['reusableStatus' => false]],
         ];
         try {
             $response = $this->request(self::CREATE_PATH, $body, $attempt->provider_request_id);
@@ -109,16 +131,16 @@ class DokuClient
             $providerExpiry = $this->instant($data['expiredDate'] ?? null);
             if (($data['trxId'] ?? '') !== $attempt->merchant_reference || $amount !== (int) $attempt->amount
                 || ($data['virtualAccountTrxType'] ?? '') !== 'C'
-                || ($data['additionalInfo']['channel'] ?? '') !== 'VIRTUAL_ACCOUNT_BNI'
-                || ! is_string($data['partnerServiceId'] ?? null) || trim($data['partnerServiceId']) !== (string) config('doku.partner_service_id')
-                || ! $this->validVa($data) || ! str_starts_with($data['customerNo'], (string) config('doku.customer_prefix'))
+                || ($data['additionalInfo']['channel'] ?? '') !== $bank['doku_channel']
+                || ! is_string($data['partnerServiceId'] ?? null) || trim($data['partnerServiceId']) !== $bank['partner_service_id']
+                || ! $this->validVa($data) || ! str_starts_with($data['customerNo'], $bank['customer_prefix'])
                 || ! $providerExpiry || $providerExpiry->gt($expiry) || $providerExpiry->lte(now())) {
                 return ['status' => 'unknown', 'reason' => 'provider_response_mismatch'];
             }
 
             return ['status' => 'pending', 'provider_reference' => $data['virtualAccountNo'],
                 'expires_at' => $providerExpiry->utc()->toDateTimeString(),
-                'instruction' => ['presentation_type' => 'virtual_account', 'bank_code' => 'bni',
+                'instruction' => ['presentation_type' => 'virtual_account', 'bank_code' => $bank['bank'],
                     'va_number' => $data['virtualAccountNo'], 'copyable' => true,
                     '_provider' => ['partnerServiceId' => $data['partnerServiceId'], 'customerNo' => $data['customerNo'],
                         'virtualAccountNo' => $data['virtualAccountNo']]]];
@@ -138,6 +160,10 @@ class DokuClient
         if (! $this->configured()) {
             return ['status' => 'unknown', 'reason' => 'doku_not_configured'];
         }
+        $bank = $this->vaBank((string) $attempt->channel);
+        if ($bank === null) {
+            return ['status' => 'unknown', 'reason' => 'channel_not_implemented'];
+        }
         $instruction = $this->storedInstruction($attempt);
         $provider = $instruction['_provider'] ?? null;
         if (! is_array($provider) || ! $this->validVa($provider)) {
@@ -154,7 +180,7 @@ class DokuClient
                 return ['status' => 'unknown', 'reason' => 'provider_response_mismatch'];
             }
             if (($response['additionalInfo']['trxId'] ?? '') !== $attempt->merchant_reference
-                || ($response['additionalInfo']['acquirer']['id'] ?? '') !== 'BNI'
+                || ($bank['acquirer'] !== null && ($response['additionalInfo']['acquirer']['id'] ?? '') !== $bank['acquirer'])
                 || ($data['virtualAccountNo'] ?? '') !== $provider['virtualAccountNo']
                 || ($data['partnerServiceId'] ?? '') !== $provider['partnerServiceId']
                 || ($data['customerNo'] ?? '') !== $provider['customerNo']) {
@@ -184,7 +210,6 @@ class DokuClient
         $token = $request->bearerToken();
         abort_unless($instant && abs($instant->getTimestamp() - now()->getTimestamp()) <= 300
             && $request->header('X-PARTNER-ID') === config('doku.client_id')
-            && $request->header('CHANNEL-ID') === 'VA004'
             && preg_match('/^\d{1,36}$/D', $request->header('X-EXTERNAL-ID', ''))
             && is_string($token) && $token !== '' && strlen($token) <= 4096, 401, 'Invalid payment signature.');
         try {
@@ -193,6 +218,7 @@ class DokuClient
             abort(400, 'Invalid payment notification.');
         }
         abort_unless(is_array($data) && ! array_is_list($data), 400, 'Invalid payment notification.');
+        $bank = $this->notificationBank($data, (string) $request->header('CHANNEL-ID', ''));
         $path = $request->getRequestUri();
         abort_unless($path === parse_url((string) config('doku.webhook_url'), PHP_URL_PATH), 401, 'Invalid payment signature.');
         $minified = preg_replace('/("(?:[^"\\\\]|\\\\.)*")|\s+/s', '$1', $raw);
@@ -203,17 +229,41 @@ class DokuClient
         abort_unless($amount !== null && $occurred && $occurred->lte(now()->addMinutes(5))
             && is_string($data['trxId'] ?? null) && preg_match('/^[A-Za-z0-9_-]{1,64}$/D', $data['trxId'])
             && is_string($data['paymentRequestId'] ?? null) && preg_match('/^[A-Za-z0-9_-]{1,30}$/D', $data['paymentRequestId'])
-            && is_string($data['partnerServiceId'] ?? null) && trim($data['partnerServiceId']) === (string) config('doku.partner_service_id') && $this->validVa($data)
+            && is_string($data['partnerServiceId'] ?? null) && trim($data['partnerServiceId']) === $bank['partner_service_id'] && $this->validVa($data)
             && ($data['virtualAccountTrxType'] ?? '') === 'C'
-            && ($data['additionalInfo']['channel'] ?? '') === 'VIRTUAL_ACCOUNT_BNI', 422, 'Invalid payment evidence.');
+            && ($data['additionalInfo']['channel'] ?? '') === $bank['doku_channel']
+            && str_starts_with($data['customerNo'], $bank['customer_prefix']), 422, 'Invalid payment evidence.');
         $acknowledgement = ['responseCode' => '2002500', 'responseMessage' => 'Successful',
             'virtualAccountData' => array_intersect_key($data, array_flip(['partnerServiceId', 'customerNo', 'virtualAccountNo',
                 'virtualAccountName', 'trxId', 'paymentRequestId', 'paidAmount', 'virtualAccountTrxType', 'additionalInfo']))];
 
-        return ['status' => 'paid', 'environment' => $this->environment(), 'amount' => $amount, 'currency' => 'IDR',
+        return ['status' => 'paid', 'environment' => $this->environment(), 'method' => 'virtual_account', 'channel' => $bank['bank'], 'amount' => $amount, 'currency' => 'IDR',
             'merchant_reference' => $data['trxId'], 'provider_reference' => $data['virtualAccountNo'],
             'occurred_at' => $occurred->utc()->toDateTimeString(), 'event_key' => 'va:'.hash('sha256', $data['trxId'].':'.$data['paymentRequestId']),
             'payload_hash' => hash('sha256', $raw), 'acknowledgement' => $acknowledgement];
+    }
+
+    /**
+     * The route is trusted, the bank is not: the signed body names a channel, but it only counts when that bank is
+     * configured to settle and DOKU's CHANNEL-ID header equals the value confirmed for that bank.
+     *
+     * @param  array<string, mixed>  $data
+     * @return array{bank: string, doku_channel: string, partner_service_id: string, customer_prefix: string, notification_channel_id: string, acquirer: ?string}
+     */
+    private function notificationBank(array $data, string $channelId): array
+    {
+        $declared = $data['additionalInfo']['channel'] ?? null;
+        foreach (['bni', 'bca', 'bri', 'mandiri'] as $bank) {
+            $profile = $this->vaBank($bank);
+            if (is_string($declared) && $profile['doku_channel'] === $declared) {
+                $registry = app(DokuChannelRegistry::class);
+                abort_unless($registry->staticReason('va_'.$bank) === null && $this->merchantConfigured('va_'.$bank)
+                    && $profile['notification_channel_id'] !== '' && hash_equals($profile['notification_channel_id'], $channelId), 401, 'Invalid payment signature.');
+
+                return $profile;
+            }
+        }
+        abort(422, 'Invalid payment evidence.');
     }
 
     /** @return array<string, mixed> */
