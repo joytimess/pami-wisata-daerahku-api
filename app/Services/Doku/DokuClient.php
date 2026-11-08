@@ -25,13 +25,27 @@ class DokuClient
         return (string) config('doku.environment');
     }
 
-    public function readinessReason(): ?string
+    /**
+     * Global and merchant readiness for one channel. Missing parameters of one channel never disable another.
+     */
+    public function readinessReason(string $channelCode = 'va_bni'): ?string
     {
         return match (true) {
             ! $this->configured() => 'doku_not_configured',
             config('doku.enabled') !== true => 'doku_disabled',
-            ! in_array('va_bni', config('doku.channels', []), true) => 'channel_unavailable',
+            ! in_array($channelCode, config('doku.channels', []), true) => 'channel_unavailable',
+            ! $this->merchantConfigured($channelCode) => 'doku_not_configured',
             default => null,
+        };
+    }
+
+    /** Channel-specific merchant parameters; never inferred from the Client ID or documentation samples. */
+    public function merchantConfigured(string $channelCode): bool
+    {
+        return match ($channelCode) {
+            'va_bni' => preg_match('/^\d{1,8}$/D', (string) config('doku.partner_service_id')) === 1
+                && preg_match('/^\d{1,20}$/D', (string) config('doku.customer_prefix')) === 1,
+            default => false,
         };
     }
 
@@ -42,8 +56,6 @@ class DokuClient
         if (! in_array($this->environment(), ['sandbox', 'production'], true)
             || ! is_string(config('doku.client_id')) || config('doku.client_id') === ''
             || ! is_string(config('doku.secret_key')) || config('doku.secret_key') === ''
-            || ! preg_match('/^\d{1,8}$/D', (string) config('doku.partner_service_id'))
-            || ! preg_match('/^\d{1,20}$/D', (string) config('doku.customer_prefix'))
             || ($url['scheme'] ?? '') !== 'https' || $host === '' || isset($url['user']) || isset($url['pass'])
             || isset($url['query']) || isset($url['fragment']) || empty($url['path'])
             || ! $this->privateKey()) {
@@ -67,7 +79,10 @@ class DokuClient
         if ($attempt->environment !== $this->environment() || $attempt->provider !== 'doku') {
             return ['status' => 'unknown', 'reason' => 'payment_environment_mismatch'];
         }
-        if ($reason = $this->readinessReason()) {
+        if (($attempt->method ?? 'virtual_account') !== 'virtual_account' || $attempt->channel !== 'bni') {
+            return ['status' => 'unknown', 'reason' => 'channel_not_implemented'];
+        }
+        if ($reason = $this->readinessReason('va_bni')) {
             return ['status' => 'unknown', 'reason' => $reason];
         }
         $expiry = CarbonImmutable::parse($attempt->instruction_expires_at ?? $booking->payment_expires_at, 'UTC');

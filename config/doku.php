@@ -11,6 +11,9 @@ return [
     'customer_prefix' => env('DOKU_BNI_CUSTOMER_PREFIX', ''),
     'webhook_url' => env('DOKU_WEBHOOK_URL', ''),
     'channels' => array_values(array_filter(array_map('trim', explode(',', (string) env('DOKU_CHANNELS', ''))))),
+    // Channels the operator has confirmed against the real merchant account. Required for every channel except the
+    // grandfathered BNI VA. Never a substitute for provider activation evidence.
+    'verified_channels' => array_values(array_filter(array_map('trim', explode(',', (string) env('DOKU_VERIFIED_CHANNELS', ''))))),
     'production_approved' => (bool) env('DOKU_PRODUCTION_APPROVED', false),
     'http_timeout_seconds' => (int) env('DOKU_HTTP_TIMEOUT_SECONDS', 15),
     'reconciliation_enabled' => (bool) env('DOKU_RECONCILIATION_ENABLED', true),

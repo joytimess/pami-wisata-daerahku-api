@@ -2,6 +2,7 @@
 
 namespace App\Services;
 
+use App\Services\Doku\DokuChannelRegistry;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Facades\DB;
 
@@ -18,7 +19,12 @@ class PaymentEligibility
             ->where('b.guid', $booking->guid)->where('b.status', 'confirmed')->where('b.total_amount', '>', 0)
             ->where(function (Builder $provider): void {
                 $provider->where(fn (Builder $doku) => $doku->where('i.provider', 'doku')->where('i.environment', config('doku.environment', 'sandbox'))
-                    ->whereIn('i.environment', ['sandbox', 'production'])->where('a.method', 'virtual_account')->where('a.channel', 'bni')->whereNotNull('a.provider_reference'));
+                    ->whereIn('i.environment', ['sandbox', 'production'])->whereNotNull('a.provider_reference')
+                    ->where(function (Builder $channel): void {
+                        foreach (app(DokuChannelRegistry::class)->settlingPairs() as [$method, $name]) {
+                            $channel->orWhere(fn (Builder $pair) => $pair->where('a.method', $method)->where('a.channel', $name));
+                        }
+                    }));
                 if (app(PaymentGateway::class)->demoEnabled()) {
                     $provider->orWhere(fn (Builder $demo) => $demo->where('i.provider', 'demo')->where('i.environment', 'demo'));
                 }

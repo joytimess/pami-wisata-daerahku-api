@@ -5,6 +5,7 @@ namespace App\Services;
 use App\Exceptions\BookingException;
 use App\Jobs\ProcessDokuPaymentEvent;
 use App\Models\User;
+use App\Services\Doku\DokuChannelRegistry;
 use App\Services\Doku\DokuClient;
 use App\Support\BookingRules;
 use App\Support\PaymentStates;
@@ -61,7 +62,8 @@ class DokuPaymentService
                 }
             }
             $this->assertPayable($booking);
-            if ($reason = $this->client->readinessReason()) {
+            $definition = app(DokuChannelRegistry::class)->find($input['method_code'], $input['channel']);
+            if ($reason = $definition ? app(DokuChannelRegistry::class)->reason($definition['code']) : 'channel_unavailable') {
                 throw new BookingException('Payment channel is unavailable.', $reason);
             }
             if (! $intent) {
@@ -275,7 +277,7 @@ class DokuPaymentService
             $matches = $intent->provider === 'doku' && $attempt->provider === 'doku' && $event->provider === 'doku'
                 && $intent->environment === $this->client->environment() && $attempt->environment === $intent->environment && $event->environment === $intent->environment
                 && $attempt->payment_intent_guid === $intent->guid && $event->payment_intent_guid === $intent->guid
-                && $attempt->method === 'virtual_account' && $attempt->channel === 'bni' && ! empty($outcome['provider_reference'])
+                && in_array([$attempt->method, $attempt->channel], app(DokuChannelRegistry::class)->settlingPairs(), true) && ! empty($outcome['provider_reference'])
                 && $attempt->merchant_reference === $outcome['merchant_reference']
                 && ($attempt->provider_reference === null || $attempt->provider_reference === ($outcome['provider_reference'] ?? null))
                 && (int) $attempt->amount === (int) $intent->amount && (int) $intent->amount === (int) $booking->total_amount
