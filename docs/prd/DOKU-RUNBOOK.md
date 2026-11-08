@@ -15,7 +15,7 @@ Kode menyediakan VA BNI SNAP v1.1 DGPC, penerimaan capture bertanda tangan, peny
 | M4 | Verifikasi raw JSON sesuai SNAP, event durable sebelum ACK, job replay, capture dan ticket eligibility diuji melalui HTTP lokal. Callback simulator DOKU: NOT RUN. |
 | M5 | PARTIAL. Polling pending, lease, backoff/jitter dan replay event tersedia. Mapping inquiry terminal belum diaktifkan karena bentuk status akhir/waktu pembayaran belum terverifikasi. Reversal/refund ditangani pada domain dan diuji dengan fixture; parser notifikasi provider untuk adjustment belum tersedia. |
 | M6 | Kontrak backend native VA tersedia; endpoint DEMO tetap ada. Source Flutter tidak diubah, pengujian emulator/device belum dijalankan. |
-| M7 | Bank lain, QRIS dan e-wallet belum diimplementasikan; capability tetap unavailable. |
+| M7 | PARTIAL (v2.0). Registry channel dan VA BCA/BRI/Mandiri tersedia di kode, diuji dengan fixture; belum ada transaksi Sandbox. QRIS dan e-wallet belum diimplementasikan karena kontrak notifikasi resmi belum lengkap (lihat `DOKU-CHANNEL-MATRIX.md`); capability tetap unavailable. |
 | M8 | BLOCKED untuk go-live: menunggu bukti Sandbox, kontrak terminal/adjustment, merchant/channel live, HTTPS tetap, worker/scheduler, monitoring dan release smoke test. |
 
 PRD penuh belum memenuhi Definition of Done. Jangan mengaktifkan Production dengan mengandalkan hasil fixture.
@@ -124,6 +124,22 @@ Log mencatat GUID attempt/event, provider/environment/channel, status, latency, 
 Untuk menghentikan transaksi baru, set `DOKU_ENABLED=false`, refresh config dan restart worker. Pertahankan environment, secret, webhook dan worker lama untuk menyelesaikan transaksi issued. Jangan mengganti Sandbox menjadi Production pada deployment/database yang masih mempunyai transaksi unresolved.
 
 Rotasi secret/key harus dikoordinasikan dengan DOKU dan transaksi in-flight. Simpan `APP_KEY`/previous keys dengan aman agar instruksi serta snapshot idempotensi lama tetap dapat didekripsi. Jangan menjalankan migration rollback yang menghapus kolom recovery setelah transaksi nyata tersimpan; utamakan forward fix. Rollback kode tidak boleh menghapus callback handler yang dibutuhkan transaksi pending.
+
+## Multi-channel v2.0 (status kode)
+
+Sumber kontrak per channel dan sel yang masih `BLOCKED_EXTERIOR` ada di `docs/prd/DOKU-CHANNEL-MATRIX.md`.
+
+| Channel | Kode | Dapat membuat pembayaran | Dapat settle (paid) |
+| --- | --- | --- | --- |
+| `va_bni` | Ada, tidak berubah | Ya, bila config BNI valid (grandfathered, tanpa `DOKU_VERIFIED_CHANNELS`) | Ya |
+| `va_bca`, `va_bri`, `va_mandiri` | Ada (profil bank pada `DokuClient::vaBank`) | Ya, bila ada di `DOKU_CHANNELS`, `DOKU_VERIFIED_CHANNELS`, dan BIN/prefix bank valid | Hanya bila `DOKU_<BANK>_NOTIFICATION_CHANNEL_ID` diisi dari notifikasi Sandbox asli |
+| `qris`, `ewallet_dana`, `ewallet_shopeepay`, `ewallet_ovo` | Belum ada adapter | Tidak (`channel_not_implemented`) | Tidak |
+
+Gate fail-closed (`DokuChannelRegistry`): adapter ada, kontrak notifikasi terverifikasi, ada di `DOKU_CHANNELS`, ada di `DOKU_VERIFIED_CHANNELS` (kecuali BNI), parameter merchant valid, DOKU aktif. Parameter BNI yang hilang hanya menonaktifkan BNI. `GET payments/methods` tetap berisi tiga family (`qris`, `virtual_account`, `ewallet`) dan menambah daftar `channels` per family; key `channel` lama pada `virtual_account` dipertahankan.
+
+Variabel baru (semuanya kosong secara default): `DOKU_VERIFIED_CHANNELS`, `DOKU_{BCA,BRI,MANDIRI}_PARTNER_SERVICE_ID`, `DOKU_{BCA,BRI,MANDIRI}_CUSTOMER_PREFIX`, `DOKU_{BCA,BRI,MANDIRI}_NOTIFICATION_CHANNEL_ID`. Jangan memakai nilai BNI atau contoh dokumentasi untuk bank lain.
+
+Catatan lingkungan lokal: nilai `.env` yang berisi path Windows dalam tanda kutip ganda (misalnya `DOKU_MERCHANT_PRIVATE_KEY_PATH="C:\laragon\..."`) membuat dotenv gagal diparse sehingga artisan tidak dapat boot. Gunakan tanda kutip tunggal atau garis miring depan.
 
 ## Sumber protokol
 
