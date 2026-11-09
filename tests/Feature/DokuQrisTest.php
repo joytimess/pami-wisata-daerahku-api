@@ -50,6 +50,9 @@ function qrisBooking(): object
 
 function qrisFake(array|Closure $generate): void
 {
+    $client = Mockery::mock(DokuClient::class)->makePartial();
+    $client->shouldReceive('expiryWindowReason')->andReturn(null);
+    app()->instance(DokuClient::class, $client);
     Http::fake([
         'https://api-sandbox.doku.com/authorization/v1/access-token/b2b' => Http::response(['responseCode' => '2007300', 'accessToken' => 'test-token', 'tokenType' => 'Bearer', 'expiresIn' => 900]),
         'https://api-sandbox.doku.com/snap-adapter/b2b/v1.0/qr/qr-mpm-generate' => is_array($generate) ? Http::response($generate) : $generate,
@@ -75,6 +78,14 @@ it('generates a QR with the documented request and normalizes the payload', func
         && $request['additionalInfo'] === ['postalCode' => '12345', 'feeType' => '1']
         && preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+07:00$/', $request['validityPeriod']) === 1
         && $request->header('CHANNEL-ID')[0] === 'H2H' && $request->header('X-EXTERNAL-ID')[0] === '20261108000000000002'));
+});
+
+it('does not send a QRIS generate while the merchant expiry window contract is unverified', function () {
+    Http::fake();
+
+    expect((new DokuClient)->create(qrisAttempt(), qrisBooking()))
+        ->toBe(['status' => 'unknown', 'reason' => 'provider_expiry_window_unverified']);
+    Http::assertNothingSent();
 });
 
 it('keeps a timed-out generate unresolved', function () {

@@ -37,6 +37,8 @@ class DokuPaymentRequest extends FormRequest
             }],
             'amount' => ['prohibited'], 'currency' => ['prohibited'], 'provider' => ['prohibited'],
             'environment' => ['prohibited'], 'status' => ['prohibited'], 'paid_at' => ['prohibited'],
+            'merchant_id' => ['prohibited'], 'expiry' => ['prohibited'], 'fee' => ['prohibited'],
+            'total_amount' => ['prohibited'], 'invoice_id' => ['prohibited'], 'booking_guid' => ['prohibited'], 'paid' => ['prohibited'],
         ];
     }
 

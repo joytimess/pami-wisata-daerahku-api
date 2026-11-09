@@ -3,6 +3,8 @@
 namespace App\Services;
 
 use App\Services\Doku\DokuChannelRegistry;
+use App\Services\Doku\DokuClient;
+use Carbon\CarbonImmutable;
 
 class PaymentGateway
 {
@@ -12,7 +14,7 @@ class PaymentGateway
     }
 
     /** @return array<string, mixed> */
-    public function capabilities(): array
+    public function capabilities(?CarbonImmutable $expiresAt = null): array
     {
         if ($this->demoEnabled()) {
             return [
@@ -29,6 +31,7 @@ class PaymentGateway
             $channels = [];
             foreach ($registry->all() as $definition) {
                 if ($definition['method'] === $method) {
+                    $reasons[$definition['code']] ??= app(DokuClient::class)->expiryWindowReason($definition['code'], $expiresAt ?? CarbonImmutable::now()->addMinutes(30));
                     $channels[] = ['channel' => $definition['channel'], 'available' => $reasons[$definition['code']] === null,
                         'presentation_type' => $definition['presentation_type'], 'reason' => $reasons[$definition['code']]];
                 }

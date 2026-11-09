@@ -7,6 +7,7 @@ use App\Http\Controllers\Api\V1\AuthController;
 use App\Http\Controllers\Api\V1\AvatarController;
 use App\Http\Controllers\Api\V1\BookingController;
 use App\Http\Controllers\Api\V1\BookingDocumentController;
+use App\Http\Controllers\Api\V1\BookingRefundController;
 use App\Http\Controllers\Api\V1\CategoryController;
 use App\Http\Controllers\Api\V1\DestinationController;
 use App\Http\Controllers\Api\V1\DokuWebhookController;
@@ -41,6 +42,8 @@ Route::prefix('v1')->group(function () {
         Route::post('bookings/{booking}/payment-attempts', [PaymentController::class, 'initiateDoku'])->middleware('throttle:30,1')->name('payments.doku.initiate');
         Route::post('bookings/{booking}/payment-attempts/{attempt}/refresh', [PaymentController::class, 'refreshDoku'])->whereUuid('attempt')
             ->middleware('throttle:20,1')->name('payments.doku.refresh');
+        Route::get('bookings/{booking}/payment-attempts/{attempt}/qr', [PaymentController::class, 'qrisImage'])->whereUuid('attempt')
+            ->middleware('throttle:60,1')->name('payments.doku.qr');
         Route::get('payments/methods', [PaymentController::class, 'methods'])->middleware('throttle:60,1');
         Route::get('bookings/{booking}/payment-intent', [PaymentController::class, 'show'])->middleware('throttle:60,1');
         Route::get('admin/bookings/{booking}/payment-intent', [PaymentController::class, 'adminShow'])->middleware('throttle:60,1');
@@ -215,11 +218,16 @@ Route::prefix('v1')->group(function () {
             Route::post('{booking}/cancel', 'cancel');
         });
 
+        Route::controller(BookingRefundController::class)->prefix('{booking}/refund-requests')->group(function () {
+            Route::get('/', 'index')->name('refunds.index');
+            Route::post('/', 'store')->middleware('throttle:10,1')->name('refunds.store');
+        });
+
         Route::prefix('{booking}/documents')
             ->controller(BookingDocumentController::class)
             ->group(function () {
                 Route::get('/', 'show');
-                Route::get('{type}', 'download')->whereIn('type', ['invoice', 'ticket']);
+                Route::get('{type}', 'download')->whereIn('type', ['invoice', 'ticket', 'receipt']);
             });
 
         // Private per-unit tickets; legacy check-in remains explicitly disabled.
@@ -309,6 +317,12 @@ Route::prefix('v1')->group(function () {
             Route::get('{booking}', 'adminShow')->name('admin.bookings.show');
             Route::post('{booking}/approve', 'approve');
             Route::post('{booking}/reject', 'reject');
+        });
+
+        Route::controller(BookingRefundController::class)->prefix('bookings/{booking}/refund-requests')->group(function () {
+            Route::get('/', 'index')->name('admin.refunds.index');
+            Route::post('{refund}/decision', 'decide')->whereUuid('refund')->middleware('throttle:30,1')->name('admin.refunds.decision');
+            Route::post('{refund}/manual-settlement', 'settleManually')->whereUuid('refund')->middleware('throttle:30,1')->name('admin.refunds.settlement');
         });
     });
 

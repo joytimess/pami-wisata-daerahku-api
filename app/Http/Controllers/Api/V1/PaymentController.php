@@ -12,6 +12,7 @@ use App\Services\DokuPaymentService;
 use App\Services\PaymentService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Http\Response;
 
 class PaymentController extends Controller
 {
@@ -27,6 +28,12 @@ class PaymentController extends Controller
 
         return (new OperationalResource($payments->show($request->user(), $booking)))
             ->response()->header('Cache-Control', 'private, no-store');
+    }
+
+    public function qrisImage(Request $request, string $booking, string $attempt, DokuPaymentService $service): Response
+    {
+        return response($service->qrisSvg($request->user(), $booking, $attempt), 200, ['Content-Type' => 'image/svg+xml',
+            'Cache-Control' => 'private, no-store', 'X-Content-Type-Options' => 'nosniff']);
     }
 
     public function initiateDemo(DemoPaymentRequest $request, string $booking, DemoPaymentService $service): JsonResponse

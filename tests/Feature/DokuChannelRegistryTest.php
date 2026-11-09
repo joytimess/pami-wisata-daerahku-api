@@ -2,6 +2,7 @@
 
 use App\Services\BookingService;
 use App\Services\Doku\DokuChannelRegistry;
+use App\Services\Doku\DokuClient;
 use App\Services\TicketService;
 use Carbon\CarbonImmutable;
 use Illuminate\Foundation\Testing\RefreshDatabase;
@@ -19,7 +20,7 @@ beforeEach(function () {
     config(['operations.demo_payments_enabled' => false, 'app.debug' => false, 'doku.enabled' => true, 'doku.environment' => 'sandbox',
         'doku.client_id' => 'MCH-TEST', 'doku.secret_key' => 'test-only-secret', 'doku.merchant_private_key_path' => $this->registryKey,
         'doku.merchant_private_key_passphrase' => '', 'doku.partner_service_id' => '98829172', 'doku.customer_prefix' => '3',
-        'doku.channels' => ['va_bni'], 'doku.verified_channels' => [], 'doku.webhook_url' => 'https://sandbox.example.com/api/v1/webhooks/doku/va']);
+        'doku.channels' => ['va_bni'], 'doku.verified_channels' => ['va_bni'], 'doku.webhook_url' => 'https://sandbox.example.com/api/v1/webhooks/doku/va']);
     Http::preventStrayRequests();
 });
 
@@ -85,6 +86,9 @@ it('keeps BNI grandfathered while any new channel needs explicit verification', 
 
 it('reports every family and channel on the methods endpoint without changing the existing family shape', function () {
     [$owner, $booking] = registryBooking();
+    $client = Mockery::mock(DokuClient::class)->makePartial();
+    $client->shouldReceive('expiryWindowReason')->andReturn(null);
+    app()->instance(DokuClient::class, $client);
 
     $response = $this->getJson('/api/v1/payments/methods?booking_guid='.$booking->guid, bearer($owner))->assertOk()
         ->assertJsonPath('data.can_pay', true)->assertJsonPath('data.integration_status', 'ready')
@@ -100,6 +104,17 @@ it('reports every family and channel on the methods endpoint without changing th
     expect(collect($response->json('data.methods.2.channels'))->pluck('channel')->all())->toBe(['dana', 'shopeepay', 'ovo']);
 });
 
+it('reports the unverified BNI expiry contract as unavailable without changing grandfathered settlement', function () {
+    [$owner, $booking] = registryBooking();
+
+    $this->getJson('/api/v1/payments/methods?booking_guid='.$booking->guid, bearer($owner))->assertOk()
+        ->assertJsonPath('data.can_create', false)->assertJsonPath('data.can_pay', false)
+        ->assertJsonPath('data.methods.1.channels.0.available', false)
+        ->assertJsonPath('data.methods.1.channels.0.reason', 'provider_expiry_window_unverified');
+    expect(app(DokuChannelRegistry::class)->staticReason('va_bni'))->toBeNull();
+    Http::assertNothingSent();
+});
+
 it('rejects unavailable channels before any attempt or provider request', function (string $method, string $channel, string $reason) {
     [$owner, $booking] = registryBooking();
     config(['doku.channels' => ['va_bni', 'qris', 'ewallet_dana', 'ewallet_ovo', 'va_bca'], 'doku.verified_channels' => ['qris', 'ewallet_dana', 'ewallet_ovo', 'va_bca']]);
@@ -109,7 +124,7 @@ it('rejects unavailable channels before any attempt or provider request', functi
     $this->assertDatabaseCount('payment_attempts', 0);
     $this->assertDatabaseCount('payment_intents', 0);
     Http::assertNothingSent();
-})->with([['qris', 'qris', 'channel_contract_unverified'], ['ewallet', 'dana', 'doku_not_configured'], ['ewallet', 'ovo', 'channel_not_implemented'], ['virtual_account', 'bca', 'channel_contract_unverified']]);
+})->with([['qris', 'qris', 'channel_contract_unverified'], ['ewallet', 'dana', 'channel_outside_release_scope'], ['ewallet', 'ovo', 'channel_not_implemented'], ['virtual_account', 'bca', 'channel_contract_unverified']]);
 
 it('rejects mismatched or unknown method and channel pairs as validation errors', function (string $method, string $channel) {
     [$owner, $booking] = registryBooking();
@@ -118,3 +133,30 @@ it('rejects mismatched or unknown method and channel pairs as validation errors'
         bearer($owner) + ['Idempotency-Key' => 'mismatch'])->assertUnprocessable()->assertJsonValidationErrors('channel');
     $this->assertDatabaseCount('payment_attempts', 0);
 })->with([['virtual_account', 'dana'], ['ewallet', 'bni'], ['qris', 'bni'], ['virtual_account', 'permata']]);
+
+it('requires the explicit verified-channel gate for BNI issuance without closing existing notifications', function () {
+    config(['doku.verified_channels' => []]);
+    $registry = app(DokuChannelRegistry::class);
+
+    expect($registry->reason('va_bni'))->toBe('channel_not_verified')
+        ->and($registry->staticReason('va_bni'))->toBeNull();
+
+    config(['doku.verified_channels' => ['va_bni']]);
+    expect($registry->reason('va_bni'))->toBeNull();
+});
+
+it('restricts new issuance to BNI VA and QRIS even when legacy bank and wallet flags are set', function () {
+    config(['doku.channels' => array_keys(app(DokuChannelRegistry::class)->all()), 'doku.verified_channels' => array_keys(app(DokuChannelRegistry::class)->all()),
+        'doku.va_banks.bca' => ['partner_service_id' => '12345678', 'customer_prefix' => '4', 'notification_channel_id' => 'VA001']]);
+    $registry = app(DokuChannelRegistry::class);
+
+    foreach (['va_bca', 'va_bri', 'va_mandiri', 'ewallet_dana', 'ewallet_shopeepay', 'ewallet_ovo'] as $code) {
+        expect($registry->reason($code))->not->toBeNull();
+    }
+    expect($registry->reason('va_bca'))->toBe('channel_outside_release_scope')
+        ->and($registry->reason('ewallet_dana'))->toBe('channel_outside_release_scope')
+        ->and($registry->reason('qris'))->toBe('channel_contract_unverified');
+    // Legacy bank notifications and wallet recovery remain governed by their own settlement gates.
+    expect($registry->staticReason('va_bca'))->toBeNull()
+        ->and($registry->settlingPairs())->toContain(['virtual_account', 'bca'], ['ewallet', 'dana']);
+});

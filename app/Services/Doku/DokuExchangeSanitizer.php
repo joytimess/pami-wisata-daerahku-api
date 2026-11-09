@@ -6,7 +6,7 @@ namespace App\Services\Doku;
  * Builds the sanitized request/response snapshot kept for failed DOKU create calls.
  *
  * Everything the operator needs to reproduce a rejection is kept (method, path, X-EXTERNAL-ID, X-TIMESTAMP, full body,
- * non-secret headers, status and full response body). Credentials never are: the signature and bearer token are replaced
+ * non-secret headers, status and a bounded response summary). Credentials, VA/customer numbers, e-mail and QR content never are: the signature and bearer token are replaced
  * by a marker, secret-looking keys are masked, and the literal secret key, access token and signature are scrubbed out of
  * every string, so a provider that echoes them back cannot leak them either.
  */
@@ -22,7 +22,8 @@ class DokuExchangeSanitizer
     private const CREDENTIAL_HEADERS = ['Authorization', 'X-SIGNATURE'];
 
     /** Personal data that is not needed to debug a rejection. */
-    private const PERSONAL_KEYS = ['virtualaccountname'];
+    private const PERSONAL_KEYS = ['virtualaccountname', 'virtualaccountno', 'customerno', 'virtualaccountemail', 'virtualaccountphone',
+        'email', 'phone', 'msisdn', 'qrcontent', 'qrisqrcontent'];
 
     /**
      * @param  array<string, mixed>  $body
@@ -51,11 +52,16 @@ class DokuExchangeSanitizer
      */
     public function response(int $status, mixed $json, string $raw, array $secrets): array
     {
-        if (is_array($json)) {
-            return ['status' => $status, 'body' => $this->clean($json, $secrets, true)];
+        if (is_array($json) && ! array_is_list($json) && strlen($raw) <= self::MAX_RAW_BODY_BYTES) {
+            // Allowlist only: a provider response code and the names of the top-level keys. Provider prose, nested data
+            // (VA numbers, e-mail, QR content, URLs) and echoed credentials never reach the log.
+            $code = $json['responseCode'] ?? null;
+
+            return ['status' => $status, 'body' => ['responseCode' => (is_string($code) || is_int($code)) && preg_match('/^[A-Za-z0-9_-]{1,32}$/D', (string) $code) === 1 ? (string) $code : null,
+                'keys' => array_slice(array_values(array_filter(array_keys($json), fn ($key) => is_string($key) && preg_match('/^[A-Za-z0-9_]{1,40}$/D', $key) === 1)), 0, 20)]];
         }
 
-        return ['status' => $status, 'body' => $this->scrub(mb_strcut($raw, 0, self::MAX_RAW_BODY_BYTES), $secrets)];
+        return ['status' => $status, 'body' => ['non_json_or_oversized' => true, 'bytes' => strlen($raw), 'sha256_prefix' => substr(hash('sha256', $raw), 0, 12)]];
     }
 
     /**

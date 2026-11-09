@@ -22,6 +22,14 @@ const VA_BANK_FIXTURES = [
 ];
 
 beforeEach(function () {
+    // Legacy adapters stay shipped for recovery; this suite lifts only the new-issuance release scope to exercise them.
+    app()->instance(DokuChannelRegistry::class, new class extends DokuChannelRegistry
+    {
+        protected function issuanceScope(): array
+        {
+            return array_keys($this->all());
+        }
+    });
     $this->travelTo(CarbonImmutable::parse('2026-11-08 08:00:00', 'UTC'));
     $key = openssl_pkey_new(['private_key_bits' => 2048, 'private_key_type' => OPENSSL_KEYTYPE_RSA]);
     openssl_pkey_export($key, $pem);
@@ -34,7 +42,7 @@ beforeEach(function () {
     config(['operations.demo_payments_enabled' => false, 'app.debug' => false, 'doku.enabled' => true, 'doku.environment' => 'sandbox',
         'doku.client_id' => 'MCH-TEST', 'doku.secret_key' => 'test-only-secret', 'doku.merchant_private_key_path' => $this->vaKey,
         'doku.merchant_private_key_passphrase' => '', 'doku.partner_service_id' => '98829172', 'doku.customer_prefix' => '3',
-        'doku.channels' => ['va_bni', 'va_bca', 'va_bri', 'va_mandiri'], 'doku.verified_channels' => ['va_bca', 'va_bri', 'va_mandiri'],
+        'doku.channels' => ['va_bni', 'va_bca', 'va_bri', 'va_mandiri'], 'doku.verified_channels' => ['va_bni', 'va_bca', 'va_bri', 'va_mandiri'],
         'doku.va_banks' => $banks, 'doku.webhook_url' => 'https://sandbox.example.com/api/v1/webhooks/doku/va']);
     Http::preventStrayRequests();
 });

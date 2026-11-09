@@ -2,6 +2,7 @@
 
 use App\Exceptions\BookingException;
 use App\Services\BookingService;
+use App\Services\Doku\DokuClient;
 use App\Services\PaymentEligibility;
 use App\Services\PaymentService;
 use App\Support\PaymentStates;
@@ -97,6 +98,20 @@ it('keeps methods and status read only using server amounts even when client val
     $this->assertDatabaseCount('payment_events', 0);
     expect(DB::table('booking_tickets')->whereNotNull('qr_token_hash')->count())->toBe(0);
     Http::assertNothingSent();
+});
+
+it('disables nested channels with their parent booking and exposes only persisted invoice data', function () {
+    [$owner, $guid] = foundationBooking();
+    $client = Mockery::mock(DokuClient::class)->makePartial();
+    $client->shouldReceive('readinessReason')->andReturn(null);
+    app()->instance(DokuClient::class, $client);
+
+    $this->getJson('/api/v1/payments/methods?booking_guid='.$guid, bearer($owner))->assertOk()
+        ->assertJsonPath('data.methods.1.available', false)->assertJsonPath('data.methods.1.channels.0.available', false)
+        ->assertJsonPath('data.can_create', false)->assertJsonPath('data.can_switch', false)
+        ->assertJsonPath('data.invoice_number', null)->assertJsonPath('data.subtotal', 30000)
+        ->assertJsonPath('data.service_fee', 0)->assertJsonPath('data.receipt_available', false);
+    $this->assertDatabaseCount('invoices', 0);
 });
 
 it('preserves the one hour cutoff grace and held quota across payment status reads', function () {

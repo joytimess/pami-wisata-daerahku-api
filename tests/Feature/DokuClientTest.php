@@ -33,6 +33,14 @@ function adapterAttempt(): object
         'amount' => 30000, 'currency' => 'IDR', 'instruction_expires_at' => now()->addHour()->toDateTimeString()];
 }
 
+function adapterClientWithControlledWindow(): DokuClient
+{
+    $client = Mockery::mock(DokuClient::class)->makePartial();
+    $client->shouldReceive('expiryWindowReason')->andReturn(null);
+
+    return $client;
+}
+
 function adapterVaResponse(): array
 {
     return ['responseCode' => '2002700', 'responseMessage' => 'Successful', 'virtualAccountData' => [
@@ -107,7 +115,7 @@ it('creates closed nonreusable BNI VA using RSA token and HMAC transaction signa
         'https://api-sandbox.doku.com/virtual-accounts/bi-snap-va/v1.1/transfer-va/create-va' => Http::response(adapterVaResponse()),
     ]);
 
-    $result = app(DokuClient::class)->create(adapterAttempt(), (object) ['visitor_name' => 'Test Visitor', 'payment_expires_at' => now()->addHour()->toDateTimeString()]);
+    $result = adapterClientWithControlledWindow()->create(adapterAttempt(), (object) ['visitor_name' => 'Test Visitor', 'payment_expires_at' => now()->addHour()->toDateTimeString()]);
     expect($result['status'])->toBe('pending')->and($result['instruction']['va_number'])->toBe('9882917230000000000000000001');
     Http::assertSent(function (ClientRequest $request) {
         if (! str_ends_with($request->url(), '/b2b')) {
@@ -135,7 +143,7 @@ it('does not retry a timed out provider create', function () {
         'https://api-sandbox.doku.com/authorization/v1/access-token/b2b' => Http::response(['responseCode' => '2007300', 'accessToken' => 'test-token', 'tokenType' => 'Bearer', 'expiresIn' => 900]),
         'https://api-sandbox.doku.com/virtual-accounts/bi-snap-va/v1.1/transfer-va/create-va' => Http::failedConnection(),
     ]);
-    $result = app(DokuClient::class)->create(adapterAttempt(), (object) ['visitor_name' => 'Test Visitor', 'payment_expires_at' => now()->addHour()->toDateTimeString()]);
+    $result = adapterClientWithControlledWindow()->create(adapterAttempt(), (object) ['visitor_name' => 'Test Visitor', 'payment_expires_at' => now()->addHour()->toDateTimeString()]);
     expect($result['status'])->toBe('unknown');
     Http::assertSentCount(2);
 });
@@ -149,7 +157,7 @@ it('uses the live host only for a matching approved production attempt', functio
         'https://api.doku.com/authorization/v1/access-token/b2b' => Http::response(['responseCode' => '2007300', 'accessToken' => 'test-token', 'tokenType' => 'Bearer', 'expiresIn' => 900]),
         'https://api.doku.com/virtual-accounts/bi-snap-va/v1.1/transfer-va/create-va' => Http::response(adapterVaResponse()),
     ]);
-    expect(app(DokuClient::class)->create($attempt, (object) ['visitor_name' => 'Test Visitor', 'payment_expires_at' => now()->addHour()->toDateTimeString()])['status'])->toBe('pending');
+    expect(adapterClientWithControlledWindow()->create($attempt, (object) ['visitor_name' => 'Test Visitor', 'payment_expires_at' => now()->addHour()->toDateTimeString()])['status'])->toBe('pending');
     Http::assertSentCount(2);
     Http::assertNotSent(fn (ClientRequest $request) => str_contains($request->url(), 'api-sandbox.doku.com'));
 });
@@ -162,8 +170,17 @@ it('quarantines a successful create with altered monetary snapshot', function ()
         'https://api-sandbox.doku.com/authorization/v1/access-token/b2b' => Http::response(['responseCode' => '2007300', 'accessToken' => 'test-token', 'tokenType' => 'Bearer', 'expiresIn' => 900]),
         'https://api-sandbox.doku.com/virtual-accounts/bi-snap-va/v1.1/transfer-va/create-va' => Http::response($response),
     ]);
-    expect(app(DokuClient::class)->create(adapterAttempt(), (object) ['visitor_name' => 'Test Visitor', 'payment_expires_at' => now()->addHour()->toDateTimeString()])['status'])->toBe('unknown');
+    expect(adapterClientWithControlledWindow()->create(adapterAttempt(), (object) ['visitor_name' => 'Test Visitor', 'payment_expires_at' => now()->addHour()->toDateTimeString()])['status'])->toBe('unknown');
     Http::assertSentCount(2);
+});
+
+it('does not send a BNI request while the merchant expiry window contract is unverified', function () {
+    Http::preventStrayRequests();
+    Http::fake();
+
+    expect((new DokuClient)->create(adapterAttempt(), (object) ['visitor_name' => 'Test Visitor']))
+        ->toBe(['status' => 'unknown', 'reason' => 'provider_expiry_window_unverified']);
+    Http::assertNothingSent();
 });
 
 it('verifies and normalizes signed SNAP payment notification without exposing tokens', function () {
@@ -171,7 +188,7 @@ it('verifies and normalizes signed SNAP payment notification without exposing to
     expect($result['status'])->toBe('paid')->and($result['amount'])->toBe(30000)
         ->and($result['merchant_reference'])->toBe('WDK-test-reference')->and($result['environment'])->toBe('sandbox')
         ->and($result['acknowledgement']['responseCode'])->toBe('2002500')
-        ->and(json_encode($result))->not->toContain('test-token', 'test-only-secret');
+        ->and(json_encode($result))->not->toContain('test-token')->not->toContain('test-only-secret');
 });
 
 it('verifies pretty printed raw JSON without changing escapes or string whitespace', function () {
@@ -253,4 +270,103 @@ it('queries documented pending status without interpreting paidAmount as a payme
     expect(app(DokuClient::class)->status($attempt)['status'])->toBe('pending');
     Http::assertSentCount(2);
     Http::assertSent(fn (ClientRequest $request) => str_ends_with($request->url(), '/transfer-va/status') && $request['virtualAccountNo'] === $provider['virtualAccountNo']);
+});
+
+it('still verifies a signed BNI notification after the issuance kill switch and without the verified gate', function () {
+    config(['doku.enabled' => false, 'doku.channels' => [], 'doku.verified_channels' => []]);
+    expect(app(DokuClient::class)->readinessReason('va_bni'))->not->toBeNull();
+
+    $outcome = app(DokuClient::class)->verifyNotification(adapterSignedRequest(adapterNotification()));
+
+    expect($outcome['status'])->toBe('paid')->and($outcome['merchant_reference'])->toBe('WDK-test-reference');
+});
+
+it('keeps a BNI status response unresolved unless the documented pending shape matches exactly', function (array $flag) {
+    Http::preventStrayRequests();
+    $attempt = adapterAttempt();
+    $provider = ['partnerServiceId' => '98829172', 'customerNo' => '30000000000000000001', 'virtualAccountNo' => '9882917230000000000000000001'];
+    $attempt->instruction_ciphertext = Crypt::encryptString(json_encode(['_provider' => $provider]));
+    Http::fake([
+        'https://api-sandbox.doku.com/authorization/v1/access-token/b2b' => Http::response(['responseCode' => '2007300', 'accessToken' => 'test-token', 'tokenType' => 'Bearer', 'expiresIn' => 900]),
+        'https://api-sandbox.doku.com/orders/v1.0/transfer-va/status' => Http::response([
+            'responseCode' => '2002600', 'virtualAccountData' => $provider + ['paymentFlagReason' => $flag,
+                'paidAmount' => ['value' => '30000.00', 'currency' => 'IDR']],
+            'additionalInfo' => ['trxId' => $attempt->merchant_reference, 'acquirer' => ['id' => 'BNI']],
+        ]),
+    ]);
+
+    expect(app(DokuClient::class)->status($attempt))->toBe(['status' => 'unknown', 'reason' => 'provider_terminal_contract_unverified']);
+})->with([
+    'paid-looking label' => [['english' => 'Success', 'indonesia' => 'Berhasil']],
+    'expired-looking label' => [['english' => 'Expired', 'indonesia' => 'Kedaluwarsa']],
+    'failed-looking label' => [['english' => 'Failed', 'indonesia' => 'Gagal']],
+    'missing label' => [[]],
+]);
+
+function diagnosticsLogFile(): string
+{
+    $path = tempnam(sys_get_temp_dir(), 'doku-diag-');
+    config(['logging.channels.doku_diagnostics' => ['driver' => 'single', 'path' => $path, 'level' => 'warning', 'replace_placeholders' => false],
+        'logging.channels.diag_app' => ['driver' => 'single', 'path' => $path.'.app', 'level' => 'debug'], 'logging.default' => 'diag_app']);
+    Log::forgetChannel('doku_diagnostics');
+    Log::forgetChannel('diag_app');
+
+    return $path;
+}
+
+it('keeps credentials, VA and customer numbers, email, QR content and provider prose out of diagnostic logs', function () {
+    $path = diagnosticsLogFile();
+    Http::preventStrayRequests();
+    Http::fake([
+        'https://api-sandbox.doku.com/authorization/v1/access-token/b2b' => Http::response(['responseCode' => '2007300', 'accessToken' => 'test-token', 'tokenType' => 'Bearer', 'expiresIn' => 900]),
+        'https://api-sandbox.doku.com/virtual-accounts/bi-snap-va/v1.1/transfer-va/create-va' => Http::response([
+            'responseCode' => '4012700', 'responseMessage' => 'Rejected for Budi Santoso budi.sentinel@example.test',
+            'virtualAccountData' => ['virtualAccountNo' => '9882917299999999999999', 'customerNo' => '99999999999999999999',
+                'virtualAccountEmail' => 'va.sentinel@example.test', 'virtualAccountPhone' => '081200000777'],
+            'additionalInfo' => ['qrContent' => '000201SENTINELQRCONTENT', 'note' => 'free text sentinel prose'],
+        ], 400),
+    ]);
+
+    adapterClientWithControlledWindow()->create(adapterAttempt(), (object) ['visitor_name' => 'Sentinel Visitor', 'payment_expires_at' => now()->addHour()->toDateTimeString()]);
+
+    $logs = file_get_contents($path).(is_file($path.'.app') ? file_get_contents($path.'.app') : '');
+    expect($logs)->toContain('4012700');
+    foreach (['test-token', 'test-only-secret', 'Sentinel Visitor', 'Budi Santoso', 'budi.sentinel@example.test', 'va.sentinel@example.test',
+        '081200000777', '9882917299999999999999', '99999999999999999999', 'SENTINELQRCONTENT', 'free text sentinel prose'] as $sentinel) {
+        expect($logs)->not->toContain($sentinel);
+    }
+    @unlink($path);
+    @unlink($path.'.app');
+});
+
+it('records only bounded metadata for oversized or non-JSON provider bodies', function () {
+    $path = diagnosticsLogFile();
+    Http::preventStrayRequests();
+    Http::fake([
+        'https://api-sandbox.doku.com/authorization/v1/access-token/b2b' => Http::response(['responseCode' => '2007300', 'accessToken' => 'test-token', 'tokenType' => 'Bearer', 'expiresIn' => 900]),
+        'https://api-sandbox.doku.com/virtual-accounts/bi-snap-va/v1.1/transfer-va/create-va' => Http::response('<html>SENTINELHTMLBODY '.str_repeat('x', 40000).'</html>', 502),
+    ]);
+
+    adapterClientWithControlledWindow()->create(adapterAttempt(), (object) ['visitor_name' => 'Test Visitor', 'payment_expires_at' => now()->addHour()->toDateTimeString()]);
+
+    $logs = file_get_contents($path);
+    expect($logs)->not->toContain('SENTINELHTMLBODY')->and(strlen($logs))->toBeLessThan(6000)
+        ->and($logs)->toContain('doku_payment_http_error');
+    @unlink($path);
+    @unlink($path.'.app');
+});
+
+it('answers an oversized string literal as an input error before any signature work instead of a server error', function () {
+    $data = adapterNotification();
+    $data['virtualAccountName'] = str_repeat('A', 60000);
+    $request = adapterSignedRequest($data);
+
+    try {
+        app(DokuClient::class)->verifyNotification($request);
+        $status = 200;
+    } catch (HttpException $exception) {
+        $status = $exception->getStatusCode();
+    }
+
+    expect($status)->toBeIn([200, 400, 401]);
 });

@@ -46,6 +46,12 @@ class DokuClient
         };
     }
 
+    public function expiryWindowReason(string $channelCode, CarbonImmutable $expiresAt): ?string
+    {
+        // Merchant minimum/maximum windows need verified provider evidence before these channels can issue.
+        return in_array($channelCode, ['va_bni', 'qris'], true) ? 'provider_expiry_window_unverified' : null;
+    }
+
     /**
      * Bank-specific VA profile: DOKU channel name, merchant BIN/prefix and the notification CHANNEL-ID.
      * Values come only from server configuration; nothing is inferred from another bank or the Client ID.
@@ -129,6 +135,9 @@ class DokuClient
             return ['status' => 'unknown', 'reason' => $reason];
         }
         $expiry = CarbonImmutable::parse($attempt->instruction_expires_at ?? $booking->payment_expires_at, 'UTC');
+        if ($reason = $this->expiryWindowReason('va_'.$bank['bank'], $expiry)) {
+            return ['status' => 'unknown', 'reason' => $reason];
+        }
         $body = [
             'partnerServiceId' => str_pad($bank['partner_service_id'], 8, ' ', STR_PAD_LEFT),
             'customerNo' => $bank['customer_prefix'],
@@ -251,6 +260,7 @@ class DokuClient
         $path = $request->getRequestUri();
         abort_unless($path === parse_url((string) config('doku.webhook_url'), PHP_URL_PATH), 401, 'Invalid payment signature.');
         $minified = preg_replace('/("(?:[^"\\\\]|\\\\.)*")|\s+/s', '$1', $raw);
+        abort_if($minified === null, 400, 'Invalid payment notification.');
         $expected = $this->signature($path, $token, $minified, $timestamp);
         abort_unless(hash_equals($expected, $request->header('X-SIGNATURE', '')), 401, 'Invalid payment signature.');
         $amount = $this->parseAmount($data['paidAmount'] ?? []);

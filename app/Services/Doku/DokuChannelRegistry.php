@@ -11,11 +11,24 @@ namespace App\Services\Doku;
  */
 class DokuChannelRegistry
 {
+    /** Channels that may issue NEW payments in the current release. Legacy channels keep notification and recovery handling only. */
+    private const ISSUANCE_SCOPE = ['va_bni', 'qris'];
+
+    /**
+     * Overridable only so legacy-adapter test suites can still create attempts to exercise recovery paths; production uses the constant.
+     *
+     * @return list<string>
+     */
+    protected function issuanceScope(): array
+    {
+        return self::ISSUANCE_SCOPE;
+    }
+
     /**
      * `implemented`: transport, normalizer and tests exist in this codebase.
      * `settles`: a verified provider notification/inquiry contract exists, so a paid outcome may be applied. `null` means the
      *   contract is documented but the operator must confirm the bank's notification CHANNEL-ID in configuration first.
-     * `grandfathered`: enabled before DOKU_VERIFIED_CHANNELS existed; stays compatible with current deployments.
+     * `grandfathered`: enabled before DOKU_VERIFIED_CHANNELS existed; only relaxes the notification/settlement gate for existing BNI attempts, never new issuance.
      *
      * @return array<string, array{code: string, method: string, channel: string, presentation_type: string, implemented: bool, settles: bool, grandfathered: bool}>
      */
@@ -92,10 +105,17 @@ class DokuChannelRegistry
         };
     }
 
-    /** Full fail-closed decision for one channel: static gates, then global/merchant readiness. */
+    /**
+     * Full fail-closed decision for issuing a NEW payment on one channel: the settlement gates above, the release scope,
+     * global/merchant readiness (so an unconfigured deployment reports the actionable reason) and finally the explicit
+     * verified-channel onboarding, which BNI needs too. Never used to accept notifications or recover existing attempts.
+     */
     public function reason(string $code): ?string
     {
-        return $this->staticReason($code) ?? app(DokuClient::class)->readinessReason($code);
+        return $this->staticReason($code)
+            ?? (in_array($code, $this->issuanceScope(), true) ? null : 'channel_outside_release_scope')
+            ?? app(DokuClient::class)->readinessReason($code)
+            ?? (in_array($code, (array) config('doku.verified_channels', []), true) ? null : 'channel_not_verified');
     }
 
     /** @return array<string, string|null> channel code => disabled reason (null when payable) */

@@ -23,6 +23,14 @@ const WALLET_PAYMENT_PATH = '/direct-debit/core/v2/debit/payment-host-to-host';
 const WALLET_REDIRECT = 'https://pay.wallet-fixture.example.com/checkout?token=abc';
 
 beforeEach(function () {
+    // Legacy adapters stay shipped for recovery; this suite lifts only the new-issuance release scope to exercise them.
+    app()->instance(DokuChannelRegistry::class, new class extends DokuChannelRegistry
+    {
+        protected function issuanceScope(): array
+        {
+            return array_keys($this->all());
+        }
+    });
     walletSetStatus(null);
     $this->travelTo(CarbonImmutable::parse('2026-11-08 08:00:00', 'UTC'));
     $key = openssl_pkey_new(['private_key_bits' => 2048, 'private_key_type' => OPENSSL_KEYTYPE_RSA]);
@@ -517,7 +525,7 @@ function walletSnapshots(): ArrayObject
     return $records;
 }
 
-it('stores a sanitized snapshot of a failed create with the full body and no credentials', function () {
+it('stores a sanitized snapshot of a failed create with the full request and a bounded response summary and no credentials', function () {
     [$owner, $booking] = walletBooking();
     walletFake('/direct-debit/core/v1/debit/payment-host-to-host', fn (ClientRequest $request) => Http::response([
         'responseCode' => '5005400', 'responseMessage' => 'General Error', 'echo' => ['auth' => 'Bearer test-token', 'sig' => $request->header('X-SIGNATURE')[0],
@@ -542,7 +550,8 @@ it('stores a sanitized snapshot of a failed create with the full body and no cre
         ->and($snapshot['request']['body']['amount'])->toBe(['value' => '20000.00', 'currency' => 'IDR'])
         ->and($snapshot['response']['status'])->toBe(500)
         ->and($snapshot['response']['body']['responseCode'])->toBe('5005400')
-        ->and($snapshot['response']['body']['responseMessage'])->toBe('General Error');
+        ->and($snapshot['response']['body'])->not->toHaveKey('responseMessage')->not->toHaveKey('echo')
+        ->and($snapshot['response']['body']['keys'])->toBe(['responseCode', 'responseMessage', 'echo']);
     $signature = Http::recorded(fn (ClientRequest $request) => str_contains($request->url(), 'payment-host-to-host'))->first()[0]->header('X-SIGNATURE')[0];
     expect(json_encode($snapshot))->not->toContain('test-token')->not->toContain('test-only-secret')->not->toContain($signature)
         ->not->toContain('other-token-value')->not->toContain('leaked-query');

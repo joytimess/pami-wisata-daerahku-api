@@ -28,6 +28,9 @@ class DokuQrisAdapter
             return ['status' => 'unknown', 'reason' => $reason];
         }
         $expiry = CarbonImmutable::parse($attempt->instruction_expires_at ?? $booking->payment_expires_at, 'UTC');
+        if ($reason = $client->expiryWindowReason('qris', $expiry)) {
+            return ['status' => 'unknown', 'reason' => $reason];
+        }
         $body = [
             'partnerReferenceNo' => $attempt->merchant_reference,
             'amount' => ['value' => $attempt->amount.'.00', 'currency' => $attempt->currency],
