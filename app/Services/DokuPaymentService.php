@@ -3,12 +3,18 @@
 namespace App\Services;
 
 use App\Exceptions\BookingException;
+use App\Jobs\IssueBookingTicketQr;
 use App\Jobs\ProcessDokuPaymentEvent;
 use App\Models\User;
 use App\Services\Doku\DokuChannelRegistry;
 use App\Services\Doku\DokuClient;
 use App\Support\BookingRules;
 use App\Support\PaymentStates;
+use BaconQrCode\Common\ErrorCorrectionLevel;
+use BaconQrCode\Renderer\Image\SvgImageBackEnd;
+use BaconQrCode\Renderer\ImageRenderer;
+use BaconQrCode\Renderer\RendererStyle\RendererStyle;
+use BaconQrCode\Writer;
 use Carbon\CarbonImmutable;
 use Illuminate\Support\Facades\Crypt;
 use Illuminate\Support\Facades\DB;
@@ -48,7 +54,16 @@ class DokuPaymentService
             if (now()->gte($record->expires_at)) {
                 throw new BookingException('Check the current payment before retrying.', 'idempotency_key_expired');
             }
+            if ($booking->status === 'awaiting_payment') {
+                app(BookingDocumentService::class)->ensureInvoice($booking);
+            }
             if ($record->status === 'completed') {
+                // Replays are rebuilt from live state so an expired instruction (VA/QR/redirect) is never shown again.
+                $replayAttempt = $record->response_reference ? DB::table('payment_attempts')->where('guid', $record->response_reference)->first() : null;
+                $replayIntent = $replayAttempt ? DB::table('payment_intents')->where('guid', $replayAttempt->payment_intent_guid)->first() : null;
+                if ($replayAttempt && $replayIntent) {
+                    return ['response' => $this->response($booking, $replayIntent, $replayAttempt)];
+                }
                 $stored = json_decode($record->response_body, true, 512, JSON_THROW_ON_ERROR);
 
                 return ['response' => json_decode(Crypt::decryptString($stored['ciphertext']), true, 512, JSON_THROW_ON_ERROR)];
@@ -56,7 +71,9 @@ class DokuPaymentService
             $intent = DB::table('payment_intents')->where('booking_guid', $guid)->lockForUpdate()->first();
             if ($intent) {
                 $this->assertSnapshot($booking, $intent);
-                $attempt = DB::table('payment_attempts')->where('payment_intent_guid', $intent->guid)->orderByDesc('attempt_number')->lockForUpdate()->first();
+                $attempt = DB::table('payment_attempts')->where('payment_intent_guid', $intent->guid)
+                    ->whereIn('status', self::OPEN_ATTEMPT_STATUSES)->orderByDesc('attempt_number')->lockForUpdate()->first()
+                    ?? DB::table('payment_attempts')->where('payment_intent_guid', $intent->guid)->orderByDesc('attempt_number')->lockForUpdate()->first();
                 if ($intent->status === 'needs_review') {
                     throw new BookingException('Payment requires investigation.', 'payment_needs_review');
                 }
@@ -67,9 +84,14 @@ class DokuPaymentService
                 }
             }
             $this->assertPayable($booking);
+            $startedAt = CarbonImmutable::now()->startOfSecond();
+            $expiresAt = app(PaymentService::class)->instructionExpiresAt($booking, $startedAt);
             $definition = app(DokuChannelRegistry::class)->find($input['method_code'], $input['channel']);
             if ($reason = $definition ? app(DokuChannelRegistry::class)->reason($definition['code']) : 'channel_unavailable') {
                 throw new BookingException('Payment channel is unavailable.', $reason);
+            }
+            if ($reason = $this->client->expiryWindowReason($definition['code'], $expiresAt)) {
+                throw new BookingException('Payment instruction window is unavailable.', $reason);
             }
             if (! $intent) {
                 $intent = (object) [
@@ -89,8 +111,8 @@ class DokuPaymentService
                 'attempt_number' => $number + 1, 'method' => $input['method_code'], 'channel' => $input['channel'],
                 'merchant_reference' => (string) Str::uuid(), 'provider_request_id' => (string) random_int(100000000000000000, 999999999999999999),
                 'request_hash' => $hash, 'amount' => $intent->amount, 'currency' => $intent->currency,
-                'status' => 'initiating', 'presentation_type' => 'unavailable', 'instruction_expires_at' => $intent->expires_at,
-                'started_at' => now(), 'next_reconcile_at' => now()->addMinutes(2), 'created_at' => now(), 'updated_at' => now(),
+                'status' => 'initiating', 'presentation_type' => 'unavailable', 'instruction_expires_at' => $expiresAt,
+                'started_at' => $startedAt, 'next_reconcile_at' => now()->addMinutes(2), 'created_at' => now(), 'updated_at' => now(),
             ];
             DB::table('payment_attempts')->insert((array) $attempt);
             DB::table('payment_intents')->where('guid', $intent->guid)->update(['status' => 'processing', 'updated_at' => now()]);
@@ -123,29 +145,33 @@ class DokuPaymentService
             $booking = $this->lockedBooking($booking->guid, $booking->destination_quota_guid);
             $intent = DB::table('payment_intents')->where('guid', $attempt->payment_intent_guid)->lockForUpdate()->first();
             $attempt = DB::table('payment_attempts')->where('guid', $attempt->guid)->lockForUpdate()->first();
+            try {
+                $expiry = isset($result['expires_at']) ? CarbonImmutable::parse($result['expires_at'])->utc() : null;
+            } catch (\Exception) {
+                $expiry = null;
+            }
+            $presentation = $result['presentation_type'] ?? 'virtual_account';
+            $instruction = $result['instruction'] ?? [];
+            $complete = match ($presentation) {
+                'virtual_account' => ! empty($instruction['va_number']) && ! empty($result['provider_reference']),
+                'qr_payload' => ! empty($instruction['qr_content']) && ! empty($result['provider_reference']),
+                'ewallet_redirect' => ! empty($instruction['redirect_url']),
+                default => false,
+            };
             // A refresh may finish before create; keep its valid instructions without replacing a final outcome.
             $recoverInstructions = in_array($attempt->status, ['pending', 'unknown'], true) && $attempt->instruction_ciphertext === null
                 && ($result['status'] ?? null) === 'pending'
                 && ($attempt->provider_reference === null || ! isset($result['provider_reference']) || $attempt->provider_reference === $result['provider_reference']);
             if ($attempt->status === 'initiating' || $recoverInstructions) {
                 $status = in_array($result['status'] ?? null, ['pending', 'failed'], true) ? $result['status'] : 'unknown';
-                $expiry = isset($result['expires_at']) ? CarbonImmutable::parse($result['expires_at'])->utc() : null;
-                $presentation = $result['presentation_type'] ?? 'virtual_account';
-                $instruction = $result['instruction'] ?? [];
-                $complete = match ($presentation) {
-                    'virtual_account' => ! empty($instruction['va_number']) && ! empty($result['provider_reference']),
-                    'qr_payload' => ! empty($instruction['qr_content']) && ! empty($result['provider_reference']),
-                    'ewallet_redirect' => ! empty($instruction['redirect_url']),
-                    default => false,
-                };
-                if ($status === 'pending' && (! $expiry || $expiry->gt($booking->payment_expires_at) || $expiry->lte(now()) || ! $complete)) {
+                if ($status === 'pending' && (! $expiry || $expiry->gt($attempt->instruction_expires_at) || $expiry->lte(now()) || ! $complete)) {
                     $status = 'unknown';
                 }
                 DB::table('payment_attempts')->where('guid', $attempt->guid)->update([
                     'status' => $status, 'provider_reference' => $result['provider_reference'] ?? $attempt->provider_reference,
                     'instruction_ciphertext' => isset($result['instruction']) ? Crypt::encryptString(json_encode($result['instruction'], JSON_THROW_ON_ERROR)) : null,
                     'presentation_type' => $status === 'pending' ? $presentation : 'unavailable',
-                    'instruction_expires_at' => $expiry && $expiry->lt($booking->payment_expires_at) ? $expiry : $booking->payment_expires_at,
+                    'instruction_expires_at' => $expiry && $expiry->lt($attempt->instruction_expires_at) ? $expiry : $attempt->instruction_expires_at,
                     'last_error_code' => $status === 'unknown' ? ($result['reason'] ?? 'provider_response_invalid') : ($status === 'failed' ? ($result['reason'] ?? 'provider_create_failed') : null),
                     'finished_at' => $status === 'failed' ? now() : null,
                     'next_reconcile_at' => $status === 'failed' ? null : $attempt->next_reconcile_at, 'updated_at' => now(),
@@ -153,6 +179,10 @@ class DokuPaymentService
                 if ($status === 'failed') {
                     DB::table('payment_intents')->where('guid', $intent->guid)->update(['status' => 'requires_payment', 'updated_at' => now()]);
                 }
+            } elseif ($attempt->status === 'paid' && ($result['status'] ?? null) === 'pending' && $complete
+                && ! empty($result['provider_reference']) && $attempt->provider_reference === $result['provider_reference']
+                && $expiry && $expiry->gt(now()) && $expiry->lt($attempt->instruction_expires_at)) {
+                DB::table('payment_attempts')->where('guid', $attempt->guid)->update(['instruction_expires_at' => $expiry, 'updated_at' => now()]);
             }
             $response = $this->response($booking, DB::table('payment_intents')->where('guid', $intent->guid)->first(), DB::table('payment_attempts')->where('guid', $attempt->guid)->first());
             DB::table('idempotency_records')->where('operation', 'doku_payment.initiate')->where('response_reference', $attempt->guid)
@@ -213,7 +243,7 @@ class DokuPaymentService
             $instruction = $this->client->instruction($attempt);
         }
 
-        return [
+        return app(PaymentService::class)->invoiceContract($booking, $intent) + [
             'booking_guid' => $booking->guid, 'intent_guid' => $intent->guid, 'attempt_guid' => $attempt->guid,
             'provider' => 'doku', 'environment' => $intent->environment, 'test_only' => $intent->environment !== 'production',
             'status' => $attempt->status, 'booking_status' => $booking->status, 'payment_status' => app(PaymentEligibility::class)->status($booking),
@@ -224,6 +254,8 @@ class DokuPaymentService
             },
             'amount' => (int) $intent->amount, 'currency' => $intent->currency, 'method_code' => $attempt->method, 'channel' => $attempt->channel,
             'expires_at' => CarbonImmutable::parse($attempt->instruction_expires_at, 'UTC')->toIso8601String(),
+            'verification_pending' => app(PaymentService::class)->verificationPending($attempt),
+            'escalated' => app(PaymentService::class)->verificationPending($attempt) && $attempt->escalated_at !== null,
             'instruction' => $instruction,
         ];
     }
@@ -326,6 +358,9 @@ class DokuPaymentService
                 }
                 DB::table('payment_attempts')->where('guid', $attempt->guid)->update(['status' => 'reversed', 'reversed_at' => $event->provider_occurred_at, 'next_reconcile_at' => null, 'updated_at' => now()]);
                 $this->review($booking, $intent, $event, 'provider_adjustment', 'applied');
+                if ($attempt->guid === $intent->applied_attempt_guid) {
+                    app(BookingRefundService::class)->recordVerifiedAdjustment($booking->guid, $attempt->guid, $event->guid, $event->event_type);
+                }
             } elseif (! in_array($attempt->status, ['paid', 'reversed'], true) && in_array($outcome['status'], ['pending', 'failed', 'expired', 'unknown'], true)) {
                 if ($attempt->status !== $outcome['status'] && ! in_array($outcome['status'], PaymentStates::ATTEMPT_TRANSITIONS[$attempt->status], true)) {
                     DB::table('payment_events')->where('guid', $event->guid)->update(['disposition' => 'ignored']);
@@ -376,18 +411,52 @@ class DokuPaymentService
         DB::table('booking_status_histories')->insert(['guid' => (string) Str::uuid(), 'booking_guid' => $booking->guid, 'actor_guid' => null,
             'old_status' => $booking->status, 'new_status' => 'confirmed', 'reason' => 'Verified DOKU '.$intent->environment.' payment.', 'created_at' => now()]);
         DB::table('payment_events')->where('guid', $event->guid)->update(['disposition' => 'applied']);
-        $this->notifications->record($booking->guid, $booking->user_guid, $intent->environment === 'sandbox' ? 'sandbox_paid' : 'doku_paid');
+        $this->notifications->recordPaymentReceipt($booking->guid, $booking->user_guid, $attempt->guid);
+        if (app(TicketService::class)->qrWindowOpen($booking)) {
+            $bookingGuid = $booking->guid;
+            // Queue publication runs after commit and inside its own guard: a broken queue must never turn an applied payment
+            // into an error. tickets:issue-qr is the recovery path.
+            DB::afterCommit(function () use ($bookingGuid): void {
+                try {
+                    IssueBookingTicketQr::dispatch($bookingGuid);
+                } catch (Throwable $exception) {
+                    Log::warning('Ticket QR job could not be queued.', ['booking_guid' => $bookingGuid, 'exception_type' => $exception::class]);
+                }
+            });
+        }
     }
 
     private function review(object $booking, object $intent, object $event, string $reason, string $disposition = 'quarantined'): void
     {
         DB::table('payment_intents')->where('guid', $intent->guid)->update(['status' => 'needs_review', 'updated_at' => now()]);
+        if ($disposition !== 'applied' && in_array($event->event_type, ['refund', 'reversal'], true)) {
+            app(BookingRefundService::class)->flagForReview($booking->guid, $reason);
+        }
         $metadata = json_decode($event->metadata, true, 512, JSON_THROW_ON_ERROR);
         DB::table('payment_events')->where('guid', $event->guid)->update(['disposition' => $disposition, 'metadata' => json_encode($metadata + ['reason' => $reason], JSON_THROW_ON_ERROR)]);
         DB::table('booking_tickets')->where('booking_guid', $booking->guid)->whereNull('checked_in_at')->whereNotNull('qr_token_hash')
             ->whereNull('qr_revoked_at')->update(['qr_revoked_at' => now(), 'updated_at' => now()]);
         $this->notifications->record($booking->guid, $booking->user_guid, 'payment_review');
         Log::warning('DOKU payment needs review.', ['intent_guid' => $intent->guid, 'event_guid' => $event->guid, 'reason' => $reason]);
+    }
+
+    /**
+     * Payment QR for the owner's active QRIS attempt, rendered from the persisted provider payload. It is not an entry credential
+     * and is served only while the same instruction would still be shown; everything else is a plain 404.
+     */
+    public function qrisSvg(User $owner, string $guid, string $attemptGuid): string
+    {
+        $booking = app(PaymentService::class)->ownerBooking($owner, $guid);
+        $intent = DB::table('payment_intents')->where('booking_guid', $guid)->first();
+        $attempt = $intent ? DB::table('payment_attempts')->where('guid', $attemptGuid)->where('payment_intent_guid', $intent->guid)->first() : null;
+        abort_unless($attempt && $attempt->provider === 'doku' && $attempt->method === 'qris' && $attempt->presentation_type === 'qr_payload'
+            && $attempt->status === 'pending' && $intent->status === 'processing' && $booking->status === 'awaiting_payment'
+            && $intent->environment === $this->client->environment() && $attempt->environment === $intent->environment
+            && now()->lt($attempt->instruction_expires_at) && now()->lt($booking->payment_expires_at), 404);
+        $payload = $this->client->instruction($attempt)['qr_content'] ?? null;
+        abort_unless(is_string($payload) && $payload !== '' && strlen($payload) <= 2048, 404);
+
+        return (new Writer(new ImageRenderer(new RendererStyle(360, 4), new SvgImageBackEnd)))->writeString($payload, 'UTF-8', ErrorCorrectionLevel::M());
     }
 
     /**
@@ -413,6 +482,34 @@ class DokuPaymentService
         foreach (DB::table('payment_events')->where('payment_attempt_guid', $attempt->guid)->where('disposition', 'recorded')->pluck('guid') as $eventGuid) {
             $this->apply($eventGuid);
         }
+    }
+
+    /**
+     * Operational escalation for attempts that are past their instruction window while the provider has not proven a terminal
+     * outcome. Escalation only marks the attempt and logs once: the attempt stays open (reconciliation keeps polling it), the
+     * booking keeps holding its quota, and no new attempt is ever created from here. Returns the number newly escalated.
+     */
+    public function escalateOverdue(int $limit = 100): int
+    {
+        $escalated = 0;
+        $overdue = DB::table('payment_attempts')->where('provider', 'doku')->where('environment', $this->client->environment())
+            ->whereIn('status', self::OPEN_ATTEMPT_STATUSES)->whereNull('escalated_at')->where('instruction_expires_at', '<=', now())
+            ->orderBy('instruction_expires_at')->orderBy('guid')->limit($limit)->get();
+        foreach ($overdue as $attempt) {
+            $marked = DB::table('payment_attempts')->where('guid', $attempt->guid)->whereIn('status', self::OPEN_ATTEMPT_STATUSES)->whereNull('escalated_at')
+                ->update(['escalated_at' => now(), 'escalation_reason' => substr($attempt->last_error_code ?: 'unresolved_after_expiry', 0, 64), 'updated_at' => now()]);
+            if ($marked !== 1) {
+                continue;
+            }
+            $escalated++;
+            Log::error('DOKU payment attempt unresolved after its instruction window; provider status not proven terminal.', [
+                'attempt_guid' => $attempt->guid, 'payment_intent_guid' => $attempt->payment_intent_guid, 'status' => $attempt->status,
+                'method' => $attempt->method, 'channel' => $attempt->channel, 'instruction_expires_at' => (string) $attempt->instruction_expires_at,
+                'reconcile_count' => (int) $attempt->reconcile_count, 'last_error_code' => $attempt->last_error_code,
+            ]);
+        }
+
+        return $escalated;
     }
 
     public function reconcile(string $guid): void

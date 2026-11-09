@@ -6,9 +6,11 @@ use App\Models\User;
 use App\Services\AdminDestinationScopeService;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Queue\Queueable;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Mail;
+use Illuminate\Support\Str;
 use Kreait\Firebase\Contract\Messaging;
 use Kreait\Firebase\Exception\Messaging\NotFound;
 use Kreait\Firebase\Factory;
@@ -18,6 +20,12 @@ use Throwable;
 class DeliverBookingNotification implements ShouldQueue
 {
     use Queueable;
+
+    /** Event types whose email must only ever reach a verified address. */
+    private const VERIFIED_RECIPIENT_TYPES = ['booking.payment_receipt', 'booking.ticket_issued'];
+
+    /** Upper bound on delivery tries (including abandoned claims); afterwards the delivery is marked failed for operators. */
+    private const MAX_ATTEMPTS = 10;
 
     public function __construct(public string $deliveryGuid) {}
 
@@ -35,8 +43,17 @@ class DeliverBookingNotification implements ShouldQueue
         $delivery = DB::table('notification_deliveries')->join('notifications', 'notifications.guid', '=', 'notification_deliveries.notification_guid')
             ->join('users', 'users.guid', '=', 'notifications.user_guid')
             ->where('notification_deliveries.guid', $this->deliveryGuid)
-            ->select('notification_deliveries.*', 'notifications.user_guid', 'notifications.booking_guid', 'notifications.title', 'notifications.body', 'notifications.type', 'users.email', 'users.status as user_status')->first();
+            ->select('notification_deliveries.*', 'notifications.user_guid', 'notifications.booking_guid', 'notifications.title', 'notifications.body', 'notifications.type', 'users.email', 'users.email_verified_at', 'users.status as user_status')->first();
         if (! $delivery) {
+            return;
+        }
+        [$attemptGuid, $attemptNumber] = $this->openAttempt($delivery->guid, $now);
+        if ($attemptNumber > self::MAX_ATTEMPTS) {
+            DB::table('notification_deliveries')->where('guid', $delivery->guid)->update([
+                'status' => 'failed', 'next_attempt_at' => null, 'last_error_code' => 'max_attempts_exceeded', 'updated_at' => now(),
+            ]);
+            $this->closeAttempt($attemptGuid, 'failed', 'max_attempts_exceeded');
+
             return;
         }
         try {
@@ -47,8 +64,10 @@ class DeliverBookingNotification implements ShouldQueue
                 $authorized = $user && $destination && $user->status === 'active' && in_array((int) $user->role, [1, 2], true)
                     && app(AdminDestinationScopeService::class)->allows($user, $destination);
             }
-            if ($delivery->user_status !== 'active' || ! $authorized) {
+            $unverifiedRecipient = $delivery->channel === 'email' && in_array($delivery->type, self::VERIFIED_RECIPIENT_TYPES, true) && $delivery->email_verified_at === null;
+            if ($delivery->user_status !== 'active' || ! $authorized || $unverifiedRecipient) {
                 $status = 'cancelled';
+                $errorCode = $unverifiedRecipient ? 'email_unverified' : null;
             } elseif ($delivery->channel === 'fcm') {
                 $device = DB::table('device_tokens')->where('guid', $delivery->target_key)->where('user_guid', $delivery->user_guid)->first();
                 if (! $device) {
@@ -81,6 +100,7 @@ class DeliverBookingNotification implements ShouldQueue
                 if (in_array(config("mail.mailers.$mailer.transport"), ['log', 'array', 'null'], true)) {
                     throw new \RuntimeException('mail_unconfigured');
                 }
+                DB::table('notification_delivery_attempts')->where('guid', $attemptGuid)->update(['submitted_at' => now(), 'updated_at' => now()]);
                 Mail::raw($delivery->body, fn ($message) => $message->to($delivery->email)->subject($delivery->title));
                 $status = 'sent';
             } else {
@@ -88,8 +108,14 @@ class DeliverBookingNotification implements ShouldQueue
             }
             DB::table('notification_deliveries')->where('guid', $delivery->guid)->update([
                 'status' => $status, 'attempts' => $delivery->attempts + 1, 'next_attempt_at' => null,
-                'last_error_code' => null, 'updated_at' => now(),
+                'last_error_code' => $errorCode ?? null, 'updated_at' => now(),
             ]);
+            try {
+                $this->closeAttempt($attemptGuid, $status, $errorCode ?? null);
+            } catch (Throwable) {
+                // Audit bookkeeping must never turn a delivered message back into a pending one.
+                Log::warning('Notification attempt audit could not be closed.', ['delivery_guid' => $delivery->guid]);
+            }
         } catch (Throwable $exception) {
             $attempts = $delivery->attempts + 1;
             DB::table('notification_deliveries')->where('guid', $delivery->guid)->update([
@@ -98,7 +124,37 @@ class DeliverBookingNotification implements ShouldQueue
                 'last_error_code' => in_array($exception->getMessage(), ['fcm_unconfigured', 'mail_unconfigured'], true) ? $exception->getMessage() : 'delivery_failed',
                 'updated_at' => now(),
             ]);
+            $this->closeAttempt($attemptGuid, 'failed', in_array($exception->getMessage(), ['fcm_unconfigured', 'mail_unconfigured'], true) ? $exception->getMessage() : 'delivery_failed');
             Log::warning('Notification delivery failed.', ['delivery_guid' => $delivery->guid]);
         }
+    }
+
+    /**
+     * Opens an append-only audit row. A previous row still in `submitting` means a worker died after claiming, so the
+     * transport may already have accepted that message: it is marked `ambiguous` as evidence, and the delivery is still
+     * retried, so a duplicate email is possible in that window. Retries are capped by MAX_ATTEMPTS.
+     *
+     * @return array{0: string, 1: int} attempt guid and number
+     */
+    private function openAttempt(string $deliveryGuid, Carbon $now): array
+    {
+        DB::table('notification_delivery_attempts')->where('delivery_guid', $deliveryGuid)->where('outcome', 'submitting')
+            ->update(['outcome' => 'ambiguous', 'error_code' => 'worker_lost', 'finished_at' => $now, 'updated_at' => $now]);
+        $guid = (string) Str::uuid();
+        $number = ((int) DB::table('notification_delivery_attempts')->where('delivery_guid', $deliveryGuid)->max('attempt_number')) + 1;
+        DB::table('notification_delivery_attempts')->insert([
+            'guid' => $guid, 'delivery_guid' => $deliveryGuid,
+            'attempt_number' => $number,
+            'outcome' => 'submitting', 'claimed_at' => $now, 'created_at' => $now, 'updated_at' => $now,
+        ]);
+
+        return [$guid, $number];
+    }
+
+    private function closeAttempt(string $attemptGuid, string $outcome, ?string $errorCode): void
+    {
+        DB::table('notification_delivery_attempts')->where('guid', $attemptGuid)->update([
+            'outcome' => $outcome, 'error_code' => $errorCode, 'finished_at' => now(), 'updated_at' => now(),
+        ]);
     }
 }
