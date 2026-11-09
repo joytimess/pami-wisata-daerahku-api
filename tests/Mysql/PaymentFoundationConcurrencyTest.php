@@ -1,5 +1,7 @@
 <?php
 
+require_once __DIR__.'/DisposableMysqlGuard.php';
+
 use App\Services\BookingService;
 use App\Services\FinancialAnalyticsService;
 use App\Support\BookingRules;
@@ -17,18 +19,25 @@ function withPaymentFoundationMysql(Closure $test): void
         test()->markTestSkipped('Requires dedicated MySQL test configuration.');
     }
     $original = config('database.connections.mysql');
+    if (! empty($original['url']) || isset($original['read']) || isset($original['write']) || app()->configurationIsCached()) {
+        throw new RuntimeException('Disposable MySQL tests reject URL, replica overrides and cached configuration.');
+    }
+    assertDisposableMysqlAccount($original);
     $database = 'pami_phase1b_'.strtolower(Str::random(12)).'_test';
     DB::statement('CREATE DATABASE `'.$database.'`');
     try {
         config(['database.connections.mysql.database' => $database]);
         DB::purge('mysql');
-        Artisan::call('migrate', ['--force' => true, '--no-interaction' => true]);
+        expect(DB::selectOne('SELECT DATABASE() AS db')->db)->toBe($database);
+        expect(DB::select('SHOW TABLES'))->toBeEmpty();
+        expect(Artisan::call('migrate', ['--force' => true, '--no-interaction' => true]))->toBe(0);
         $test($original, $database);
     } finally {
         config(['database.connections.mysql' => $original]);
         DB::purge('mysql');
         if (preg_match('/^pami_phase1b_[a-z0-9]{12}_test$/D', $database)) {
             DB::statement('DROP DATABASE `'.$database.'`');
+            expect((int) DB::selectOne('SELECT COUNT(*) AS total FROM information_schema.schemata WHERE schema_name = ?', [$database])->total)->toBe(0);
         }
     }
 }
@@ -98,22 +107,32 @@ function paymentFoundationIntent(object $booking): array
 }
 
 it('rolls the additive payment migration down and up without altering booking and approval records', function () {
-    withPaymentFoundationMysql(function (): void {
+    withPaymentFoundationMysql(function (array $connection, string $database): void {
         $booking = paymentFoundationBooking();
         $historyCount = DB::table('booking_status_histories')->count();
         $claimCount = DB::table('booking_approval_claims')->count();
-        $path = 'database/migrations/2026_11_05_040716_create_payment_tables.php';
+        // The reconciliation and refund migrations depend on payment tables, so all four roll back (dependents first) and re-apply together.
+        $paths = ['database/migrations/2026_11_09_030710_add_escalation_to_payment_attempts.php', 'database/migrations/2026_11_08_190053_create_booking_refund_requests_table.php', 'database/migrations/2026_11_08_034113_add_reconciliation_to_payment_attempts.php', 'database/migrations/2026_11_05_040716_create_payment_tables.php'];
+        $names = ['2026_11_09_030710_add_escalation_to_payment_attempts', '2026_11_08_190053_create_booking_refund_requests_table', '2026_11_08_034113_add_reconciliation_to_payment_attempts', '2026_11_05_040716_create_payment_tables'];
+        $reconcileColumns = ['next_reconcile_at', 'last_reconciled_at', 'reconcile_count', 'last_error_code', 'escalated_at', 'escalation_reason'];
+        expect(DB::table('migrations')->whereIn('migration', $names)->count())->toBe(4);
+        expect(Schema::hasColumns('payment_attempts', $reconcileColumns))->toBeTrue();
 
-        expect(Artisan::call('migrate:rollback', ['--step' => 1, '--path' => $path, '--force' => true, '--no-interaction' => true]))->toBe(0);
+        expect(DB::selectOne('SELECT DATABASE() AS db')->db)->toBe($database);
+        expect(Artisan::call('migrate:rollback', ['--path' => $paths, '--force' => true, '--no-interaction' => true]))->toBe(0);
+        expect(DB::table('migrations')->whereIn('migration', $names)->count())->toBe(0);
 
-        foreach (['payment_intents', 'payment_attempts', 'payment_events'] as $table) {
+        foreach (['booking_refund_request_events', 'booking_refund_requests', 'payment_intents', 'payment_attempts', 'payment_events'] as $table) {
             expect(Schema::hasTable($table))->toBeFalse();
         }
         $this->assertDatabaseHas('bookings', ['guid' => $booking->guid, 'status' => 'awaiting_payment']);
         $this->assertDatabaseCount('booking_status_histories', $historyCount);
         $this->assertDatabaseCount('booking_approval_claims', $claimCount);
 
-        expect(Artisan::call('migrate', ['--path' => $path, '--force' => true, '--no-interaction' => true]))->toBe(0);
+        expect(DB::selectOne('SELECT DATABASE() AS db')->db)->toBe($database);
+        expect(Artisan::call('migrate', ['--path' => $paths, '--force' => true, '--no-interaction' => true]))->toBe(0);
+        expect(DB::table('migrations')->whereIn('migration', $names)->count())->toBe(4);
+        expect(Schema::hasColumns('payment_attempts', $reconcileColumns))->toBeTrue();
 
         foreach (['payment_intents', 'payment_attempts', 'payment_events'] as $table) {
             $this->assertDatabaseCount($table, 0);

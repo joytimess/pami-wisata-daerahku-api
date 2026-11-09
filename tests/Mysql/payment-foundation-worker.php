@@ -13,7 +13,12 @@ $app = require __DIR__.'/../../bootstrap/app.php';
 $app->make(Kernel::class)->bootstrap();
 
 if (! env('MYSQL_CONCURRENCY_TESTS') || config('database.default') !== 'mysql'
+    || config('database.connections.mysql.url') || config('database.connections.mysql.read') || config('database.connections.mysql.write')
+    || app()->configurationIsCached()
     || ! preg_match('/^pami_phase1b_[a-z0-9]{12}_test$/D', (string) config('database.connections.mysql.database'))) {
+    exit(2);
+}
+if (DB::selectOne('SELECT DATABASE() AS db')->db !== config('database.connections.mysql.database')) {
     exit(2);
 }
 
