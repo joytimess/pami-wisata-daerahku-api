@@ -69,6 +69,32 @@ class PaymentEligibility
         return $reversed ? 'reversed' : 'unverified';
     }
 
+    /**
+     * Admission entitlement, the single question "may this booking hold entry QR units": a verified payment (`paid`), an explicit
+     * free entitlement (`free`), a settled refund (`refunded`) or the unchanged payment status. `free` is never derived from any
+     * payment record: it requires an approved, confirmed Rp0 booking that has no payment intent at all.
+     */
+    public function entitlement(object $booking): string
+    {
+        if (DB::table('booking_refund_requests')->where('booking_guid', $booking->guid)->whereIn('status', ['refunded', 'manual_refunded'])->exists()) {
+            return 'refunded';
+        }
+        $status = $this->status($booking);
+        if ($status === 'paid') {
+            return 'paid';
+        }
+
+        return $status === 'unverified' && $this->freeEntitlement($booking) ? 'free' : $status;
+    }
+
+    private function freeEntitlement(object $booking): bool
+    {
+        return $booking->status === 'confirmed' && (int) $booking->total_amount === 0 && $booking->currency === 'IDR' && (int) $booking->quantity > 0
+            && ! DB::table('payment_intents')->where('booking_guid', $booking->guid)->exists()
+            && DB::table('booking_status_histories')->where('booking_guid', $booking->guid)->where('old_status', 'pending_approval')
+                ->where('new_status', 'confirmed')->whereNotNull('actor_guid')->exists();
+    }
+
     /** @return array{payment_provider: ?string, payment_environment: ?string, payment_test_only: bool, payment_label: ?string} */
     public function provenance(object $booking): array
     {

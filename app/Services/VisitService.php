@@ -31,7 +31,7 @@ class VisitService
             $hasTickets = DB::table('booking_tickets')->where('booking_guid', $guid)->exists();
             $checked = DB::table('booking_tickets')->where('booking_guid', $guid)->whereNotNull('checked_in_at')->exists()
                 || (! $hasTickets && $legacy);
-            if ($booking->status !== 'confirmed' || ! $checked || (! $legacy && $this->payments->status($booking) !== 'paid')) {
+            if ($booking->status !== 'confirmed' || ! $checked || (! $legacy && ! in_array($this->payments->entitlement($booking), ['paid', 'free'], true))) {
                 throw new BookingException('A confirmed, checked-in visit is required before reviewing.', 'review_not_eligible');
             }
             $destination = DB::table('destination_quotas')->where('guid', $booking->destination_quota_guid)->value('destination_guid');

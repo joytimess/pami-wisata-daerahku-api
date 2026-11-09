@@ -78,6 +78,7 @@ class TicketService
                 $this->initialize($booking);
                 $state = $this->state($booking);
                 if ($state === 'available') {
+                    $issued = 0;
                     foreach (DB::table('booking_tickets')->where('booking_guid', $guid)->orderBy('sequence')->lockForUpdate()->get() as $ticket) {
                         if ($ticket->qr_token_hash === null && $ticket->qr_token_encrypted === null
                             && $ticket->checked_in_at === null && $ticket->qr_revoked_at === null) {
@@ -86,7 +87,12 @@ class TicketService
                                 'qr_token_hash' => hash('sha256', $payload), 'qr_token_encrypted' => Crypt::encryptString($payload),
                                 'qr_issued_at' => now(), 'updated_at' => now(),
                             ]);
+                            $issued++;
                         }
+                    }
+                    if ($issued > 0) {
+                        // Stable per-booking key: the business event is part of the issuance transaction and cannot repeat on retries.
+                        app(BookingNotificationService::class)->recordTicketIssued($guid, $booking->user_guid, (int) $booking->quantity);
                     }
                 } elseif ($state === 'revoked') {
                     DB::table('booking_tickets')->where('booking_guid', $guid)->whereNull('checked_in_at')
@@ -143,9 +149,14 @@ class TicketService
         }
     }
 
+    public function entitlement(object $booking): string
+    {
+        return $this->payments->entitlement($booking);
+    }
+
     public function state(object $booking): string
     {
-        $payment = $this->payments->status($booking);
+        $payment = $this->payments->entitlement($booking);
         if (in_array($booking->status, ['cancelled', 'rejected', 'expired', 'refunded'], true)
             || in_array($payment, ['refunded', 'reversed', 'chargeback'], true)) {
             return 'revoked';
@@ -154,17 +165,24 @@ class TicketService
         if ($today > $booking->visit_date) {
             return 'expired';
         }
-        if ($payment !== 'paid') {
+        if (! in_array($payment, ['paid', 'free'], true)) {
             return 'awaiting_payment';
         }
         if ($booking->status !== 'confirmed') {
             return 'awaiting_approval';
         }
-        if ($today < CarbonImmutable::parse($booking->visit_date, $booking->destination_timezone)->subDays(5)->toDateString()) {
+        if (! $this->qrWindowOpen($booking)) {
             return 'scheduled';
         }
 
         return 'available';
+    }
+
+    /** Entry QR opens at local midnight of H-5 in the destination timezone snapshot; paid-earlier bookings only hold entitlements. */
+    public function qrWindowOpen(object $booking): bool
+    {
+        return now($booking->destination_timezone)->toDateString()
+            >= CarbonImmutable::parse($booking->visit_date, $booking->destination_timezone)->subDays(5)->toDateString();
     }
 
     private function collection(object $booking): array
@@ -176,7 +194,7 @@ class TicketService
         return [
             'booking_guid' => $booking->guid, 'visit_date' => $booking->visit_date, 'timezone' => $booking->destination_timezone,
             'qr_available_from' => CarbonImmutable::parse($booking->visit_date, $booking->destination_timezone)->subDays(5)->toDateString(),
-            'quantity' => (int) $booking->quantity, 'checked_in_count' => $checked, 'payment_status' => $this->payments->status($booking),
+            'quantity' => (int) $booking->quantity, 'checked_in_count' => $checked, 'payment_status' => $this->payments->status($booking), 'entitlement' => $this->entitlement($booking),
             'ticket_state' => $checked === (int) $booking->quantity ? 'fully_checked_in' : ($checked > 0 && $state === 'available' ? 'partially_checked_in' : $state),
             'tickets' => $tickets->map(fn ($ticket) => [
                 'guid' => $ticket->guid, 'sequence' => (int) $ticket->sequence,

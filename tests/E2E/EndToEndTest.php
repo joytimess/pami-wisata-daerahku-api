@@ -144,8 +144,11 @@ it('Phase 6: profile, visit, review and documents use authoritative Laravel data
     expect(e2e($strangerToken)->get('profile/statistics')->json('data'))->toMatchArray(['bookings' => 0, 'visits' => 0, 'reviews' => 0]);
 
     app(BookingDocumentService::class)->generate($guid);
-    expect(e2e($ownerToken)->get("bookings/{$guid}/documents/ticket")->body())->toStartWith('%PDF');
+    expect(e2e($ownerToken)->get("bookings/{$guid}/documents/invoice")->body())->toStartWith('%PDF');
+    $confirmation = e2e($ownerToken)->get("bookings/{$guid}/documents/ticket");
+    expect($confirmation->status())->toBe(200)->and($confirmation->body())->toStartWith('%PDF')->and($confirmation->body())->not->toContain('WDR1');
     expect(e2e($strangerToken)->get("bookings/{$guid}/documents/ticket")->status())->toBe(404);
+    expect(e2e($strangerToken)->get("bookings/{$guid}/documents/invoice")->status())->toBe(404);
     expect(DB::table('bookings')->where('guid', $guid)->value('status'))->toBe('confirmed');
 });
 
@@ -200,11 +203,11 @@ it('Scenario A: user books, admin sees and decides, user sees the server status'
         expect($process->getExitCode())->toBe(0);
     }
     $documents = e2e($userToken)->get("bookings/{$third}/documents")->json('data');
-    expect($documents['invoice']['status'])->toBe('issued')->and($documents['ticket']['status'])->toBe('issued');
+    expect($documents['invoice']['status'])->toBe('issued')->and($documents['ticket'])->toMatchArray(['admission' => false, 'download_available' => true])->and($documents['entry_tickets']['quantity'])->toBeInt();
     $pdf = e2e($userToken)->get("bookings/{$third}/documents/invoice");
     expect($pdf->status())->toBe(200)->and($pdf->body())->toStartWith('%PDF');
     expect(e2e(e2eLogin(makeUser()))->get("bookings/{$third}/documents/invoice")->status())->toBe(404);
-    expect(e2e($adminToken)->get("bookings/{$third}/documents/ticket")->status())->toBe(200);
+    expect(e2e($adminToken)->get("bookings/{$third}/documents/invoice")->status())->toBe(200);
     expect(e2e()->get("bookings/{$third}/documents/ticket")->status())->toBe(401);
 });
 

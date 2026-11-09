@@ -268,6 +268,9 @@ class BookingService
                 $updates['notification_grace_expires_at'] = $now->copy()->addHour()->addMinutes(15);
             }
             DB::table('bookings')->where('guid', $guid)->update($updates);
+            if ($approve) {
+                app(BookingDocumentService::class)->ensureInvoice($booking);
+            }
             $this->history($guid, $actor->guid, 'pending_approval', $status, $reason);
             $this->claims->close($guid, $actor->guid, 'completed');
             $this->notifications->record($guid, $booking->user_guid, $approve ? 'approved' : 'rejected');

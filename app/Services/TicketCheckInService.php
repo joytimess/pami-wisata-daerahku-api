@@ -24,7 +24,7 @@ class TicketCheckInService
             'ticket_guid' => $ticket->guid, 'sequence' => (int) $ticket->sequence, 'quantity' => (int) $booking->quantity,
             'destination_name' => $booking->destination_name_snapshot, 'visit_date' => $booking->visit_date,
             'timezone' => $booking->destination_timezone, 'booker_name' => $booking->visitor_name,
-            'payment_status' => 'paid', 'booking_status' => 'confirmed', 'check_in_status' => 'not_checked_in', 'can_confirm' => true,
+            'payment_status' => 'paid', 'entitlement' => $this->payments->entitlement($booking), 'booking_status' => 'confirmed', 'check_in_status' => 'not_checked_in', 'can_confirm' => true,
         ] + $this->payments->provenance($booking);
     }
 
@@ -97,7 +97,7 @@ class TicketCheckInService
         if ($ticket->qr_revoked_at !== null || $this->tickets->state($booking) === 'revoked') {
             throw new TicketException('ticket_revoked', 'Tiket sudah dicabut atau booking dibatalkan.');
         }
-        if ($this->payments->status($booking) !== 'paid') {
+        if (! in_array($this->payments->entitlement($booking), ['paid', 'free'], true)) {
             throw new TicketException('payment_not_paid', 'Menunggu pembayaran terverifikasi.');
         }
         if ($booking->status !== 'confirmed') {

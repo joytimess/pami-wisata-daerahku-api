@@ -11,9 +11,9 @@ use Illuminate\Support\Str;
 
 uses(RefreshDatabase::class);
 
-function smartTicketFixture(int $quantity = 2): array
+function smartTicketFixture(int $quantity = 2, int $price = 0): array
 {
-    [$destination, $date] = seedDestination(days: 7, destination: ['timezone' => 'Asia/Jayapura']);
+    [$destination, $date] = seedDestination(price: $price, days: 7, destination: ['timezone' => 'Asia/Jayapura']);
     $owner = makeUser();
     $booking = app(BookingService::class)->create($owner, bookingPayload($destination, $date, $quantity) + ['idempotency_key' => 'smart-ticket']);
     app(BookingService::class)->decide(makeUser(2), $booking->guid, true);
@@ -39,8 +39,8 @@ function verifiedTicketPayments(): PaymentEligibility
 
 it('creates quantity units once and fails closed without authoritative payment', function () {
     $this->travelTo(CarbonImmutable::parse('2026-11-03 08:00:00', 'UTC'));
-    [$owner, $destination, $guid, $date] = smartTicketFixture();
-    app(BookingService::class)->create($owner, bookingPayload($destination, $date, 2) + ['idempotency_key' => 'smart-ticket']);
+    [$owner, $destination, $guid, $date] = smartTicketFixture(price: 12000);
+    DB::table('bookings')->where('guid', $guid)->update(['status' => 'confirmed']);
     $this->travelTo(CarbonImmutable::parse($date.' 10:00:00', 'Asia/Jayapura'));
     $headers = bearer($owner);
     $response = $this->getJson("/api/v1/bookings/{$guid}/tickets", $headers)->assertOk()
@@ -167,5 +167,61 @@ it('preserves legacy group visits and reviews through repeatable backfill withou
     $this->getJson('/api/v1/profile/statistics', $headers)->assertJsonPath('data.visits', 1);
     $this->getJson("/api/v1/bookings/{$guid}/tickets", $headers)->assertJsonPath('data.ticket_state', 'fully_checked_in');
     $this->postJson("/api/v1/bookings/{$guid}/review", ['rating' => 5, 'comment' => 'Legacy visit'], $headers)->assertOk();
+    $this->travelBack();
+});
+
+it('issues one distinct QR per visitor for an approved free booking from H-5 without any payment record', function () {
+    $this->travelTo(CarbonImmutable::parse('2026-11-03 08:00:00', 'UTC'));
+    [$owner, $destination, $guid, $date] = smartTicketFixture(price: 0);
+    $path = "/api/v1/bookings/{$guid}/tickets";
+    $visit = CarbonImmutable::parse($date.' 00:05:00', 'Asia/Jayapura');
+    $headers = bearer($owner);
+
+    $this->travelTo($visit->subDays(6));
+    $this->getJson($path, $headers)->assertOk()->assertJsonPath('data.ticket_state', 'scheduled')->assertJsonPath('data.entitlement', 'free');
+    expect(DB::table('booking_tickets')->whereNotNull('qr_token_hash')->count())->toBe(0);
+
+    $this->travelTo($visit->subDays(5));
+    $this->artisan('tickets:issue-qr')->assertSuccessful();
+    $response = $this->getJson($path, $headers)->assertOk()->assertJsonPath('data.ticket_state', 'available')
+        ->assertJsonPath('data.entitlement', 'free')->assertJsonPath('data.payment_status', 'unverified');
+    expect($response->getContent())->not->toContain('WDR1.')->not->toContain('qr_token');
+    $tickets = DB::table('booking_tickets')->where('booking_guid', $guid)->orderBy('sequence')->get();
+    expect($tickets)->toHaveCount(2)->and($tickets[0]->qr_token_hash)->not->toBe($tickets[1]->qr_token_hash);
+    expect(DB::table('payment_intents')->count())->toBe(0)->and(DB::table('payment_attempts')->count())->toBe(0)->and(DB::table('payment_events')->count())->toBe(0);
+
+    $payload = Crypt::decryptString($tickets[0]->qr_token_encrypted);
+    $staff = bearer(makeUser(2));
+    $this->travelTo($visit);
+    $this->postJson('/api/v1/admin/ticket-check-ins/preview', ['qr_payload' => $payload], $staff)->assertOk()->assertJsonPath('data.can_confirm', true);
+    $this->postJson('/api/v1/admin/ticket-check-ins/confirm', ['qr_payload' => $payload], $staff + ['Idempotency-Key' => (string) Str::uuid()])
+        ->assertOk()->assertJsonPath('data.checked_in_count', 1);
+    $this->travelBack();
+});
+
+it('never treats an unapproved, forged or paid-but-unverified booking as a free entitlement', function () {
+    $this->travelTo(CarbonImmutable::parse('2026-11-03 08:00:00', 'UTC'));
+    [$destination, $date] = seedDestination(price: 0, days: 7, destination: ['timezone' => 'Asia/Jayapura']);
+    $owner = makeUser();
+    $pending = app(BookingService::class)->create($owner, bookingPayload($destination, $date, 1) + ['idempotency_key' => 'free-pending']);
+    $this->travelTo(CarbonImmutable::parse($date.' 10:00:00', 'Asia/Jayapura'));
+    $tickets = app(TicketService::class);
+
+    expect($tickets->entitlement(DB::table('bookings')->where('guid', $pending->guid)->first()))->not->toBe('free');
+    $this->getJson("/api/v1/bookings/{$pending->guid}/tickets", bearer($owner))->assertJsonPath('data.ticket_state', 'awaiting_payment');
+
+    // Confirmed without a human approval record is not an entitlement.
+    DB::table('bookings')->where('guid', $pending->guid)->update(['status' => 'confirmed']);
+    expect($tickets->entitlement(DB::table('bookings')->where('guid', $pending->guid)->first()))->not->toBe('free');
+    $this->getJson("/api/v1/bookings/{$pending->guid}/tickets", bearer($owner))->assertJsonPath('data.ticket_state', 'awaiting_payment');
+    expect(DB::table('booking_tickets')->whereNotNull('qr_token_hash')->count())->toBe(0);
+
+    // A paid-price booking is never free, even when confirmed by an approver.
+    [$paidDestination, $paidDate] = seedDestination(price: 12000, days: 7);
+    $paid = app(BookingService::class)->create(makeUser(), bookingPayload($paidDestination, $paidDate, 1) + ['idempotency_key' => 'paid-confirmed']);
+    DB::table('bookings')->where('guid', $paid->guid)->update(['status' => 'confirmed']);
+    DB::table('booking_status_histories')->insert(['guid' => (string) Str::uuid(), 'booking_guid' => $paid->guid, 'actor_guid' => makeUser(2)->guid,
+        'old_status' => 'pending_approval', 'new_status' => 'confirmed', 'reason' => 'x', 'created_at' => now()]);
+    expect($tickets->entitlement(DB::table('bookings')->where('guid', $paid->guid)->first()))->not->toBe('free');
     $this->travelBack();
 });
