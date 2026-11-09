@@ -32,6 +32,13 @@ class ReconcileDokuPayments extends Command
                 Log::warning('DOKU event replay failed.', ['event_guid' => $guid]);
             }
         }
+        try {
+            $escalated = $payments->escalateOverdue($limit);
+        } catch (\Throwable) {
+            $escalated = 0;
+            $failures++;
+            Log::warning('DOKU overdue-attempt escalation failed.');
+        }
         if (config('doku.reconciliation_enabled') === true) {
             $attempts = DB::table('payment_attempts')->where('provider', 'doku')->where('environment', $client->environment())
                 ->whereIn('status', ['initiating', 'pending', 'unknown'])->where('next_reconcile_at', '<=', now())
@@ -45,7 +52,7 @@ class ReconcileDokuPayments extends Command
                 }
             }
         }
-        $this->info('DOKU replay and reconciliation completed.');
+        $this->info('DOKU replay and reconciliation completed.'.($escalated > 0 ? ' Escalated overdue attempts: '.$escalated.'.' : ''));
 
         return $failures ? self::FAILURE : self::SUCCESS;
     }
