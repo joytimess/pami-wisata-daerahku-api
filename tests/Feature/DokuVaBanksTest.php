@@ -61,16 +61,17 @@ function vaBooking(): array
     return [$owner, app(TicketService::class)->booking($booking->guid)];
 }
 
-function vaFakeProvider(string $bank): void
+function vaFakeProvider(string $bank, bool $paddedVa = false): void
 {
     $f = VA_BANK_FIXTURES[$bank];
     Http::fake([
         'https://api-sandbox.doku.com/authorization/v1/access-token/b2b' => Http::response(['responseCode' => '2007300', 'accessToken' => 'test-token', 'tokenType' => 'Bearer', 'expiresIn' => 900]),
-        'https://api-sandbox.doku.com/virtual-accounts/bi-snap-va/v1.1/transfer-va/create-va' => function (ClientRequest $request) use ($f) {
+        'https://api-sandbox.doku.com/virtual-accounts/bi-snap-va/v1.1/transfer-va/create-va' => function (ClientRequest $request) use ($f, $paddedVa) {
             $customer = $f['prefix'].str_pad('1', 20 - strlen($f['prefix']), '0', STR_PAD_LEFT);
 
             return Http::response(['responseCode' => '2002700', 'responseMessage' => 'Successful', 'virtualAccountData' => [
-                'partnerServiceId' => str_pad($f['partner'], 8, ' ', STR_PAD_LEFT), 'customerNo' => $customer, 'virtualAccountNo' => $f['partner'].$customer,
+                'partnerServiceId' => str_pad($f['partner'], 8, ' ', STR_PAD_LEFT), 'customerNo' => $customer,
+                'virtualAccountNo' => ($paddedVa ? str_pad($f['partner'], 8, ' ', STR_PAD_LEFT) : $f['partner']).$customer,
                 'trxId' => $request['trxId'], 'virtualAccountTrxType' => 'C', 'totalAmount' => $request['totalAmount'],
                 'expiredDate' => $request['expiredDate'], 'additionalInfo' => ['channel' => $f['doku']],
             ]]);
@@ -115,9 +116,43 @@ it('creates a fixed-bill DGPC VA with the bank-specific channel and merchant val
     Http::assertSent(fn (ClientRequest $request) => ! str_ends_with($request->url(), '/create-va') || (
         $request['additionalInfo']['channel'] === $f['doku'] && $request['additionalInfo']['virtualAccountConfig']['reusableStatus'] === false
         && $request['virtualAccountTrxType'] === 'C' && $request['totalAmount']['value'] === '20000.00'
-        && $request['partnerServiceId'] === str_pad($f['partner'], 8, ' ', STR_PAD_LEFT) && $request['customerNo'] === $f['prefix']));
+        && $request['partnerServiceId'] === str_pad($f['partner'], 8, ' ', STR_PAD_LEFT) && $request['customerNo'] === $f['prefix']
+        && $request['virtualAccountNo'] === $request['partnerServiceId'].$request['customerNo']));
     Http::assertSentCount(2);
 })->with(['bca', 'bri', 'mandiri']);
+
+it('settles once when create and notification pad the VA differently', function (string $bank, bool $paddedCreate, bool $paddedNotification) {
+    [$owner, $booking] = vaBooking();
+    vaFakeProvider($bank, $paddedCreate);
+    $attempt = vaStart($owner, $booking, $bank);
+    $stored = DB::table('payment_attempts')->where('guid', $attempt['attempt_guid'])->value('provider_reference');
+
+    expect($stored)->toMatch('/^\d+$/D')->and($attempt['instruction']['va_number'])->toBe($stored);
+    $overrides = $paddedNotification ? ['virtualAccountNo' => str_pad(VA_BANK_FIXTURES[$bank]['partner'], 8, ' ', STR_PAD_LEFT).substr($stored, strlen(VA_BANK_FIXTURES[$bank]['partner']))] : [];
+
+    vaWebhook($bank, $attempt['attempt_guid'], $overrides)->assertOk()->assertJsonPath('responseCode', '2002500');
+
+    expect(DB::table('bookings')->where('guid', $booking->guid)->value('status'))->toBe('confirmed')
+        ->and(DB::table('payment_events')->where('event_type', 'capture')->where('disposition', 'applied')->count())->toBe(1);
+})->with([
+    'bca padded create, padded notification' => ['bca', true, true],
+    'bca padded create, plain notification' => ['bca', true, false],
+    'bca plain create, padded notification' => ['bca', false, true],
+    'bri padded create, padded notification' => ['bri', true, true],
+]);
+
+it('still rejects a notification whose VA does not match its partner and customer numbers', function () {
+    [$owner, $booking] = vaBooking();
+    vaFakeProvider('bca', true);
+    $attempt = vaStart($owner, $booking, 'bca');
+    $stored = DB::table('payment_attempts')->where('guid', $attempt['attempt_guid'])->value('provider_reference');
+
+    $response = vaWebhook('bca', $attempt['attempt_guid'], ['virtualAccountNo' => '   '.substr($stored, 0, -1).'9']);
+
+    expect($response->status())->toBe(422);
+    expect(DB::table('bookings')->where('guid', $booking->guid)->value('status'))->not->toBe('confirmed')
+        ->and(DB::table('payment_events')->count())->toBe(0);
+});
 
 it('confirms the booking once from a verified paid notification and ignores the duplicate', function (string $bank) {
     [$owner, $booking] = vaBooking();

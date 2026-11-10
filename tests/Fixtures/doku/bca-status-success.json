@@ -1,0 +1,33 @@
+{
+    "responseCode": "2002600",
+    "responseMessage": "Successful",
+    "virtualAccountData": {
+        "paymentFlagReason": {
+            "english": "Success",
+            "indonesia": "Sukses"
+        },
+        "partnerServiceId": "   19008",
+        "customerNo": "90000000001",
+        "virtualAccountNo": "   1900890000000001",
+        "inquiryRequestId": "20261110000000000001",
+        "paymentRequestId": "20261110000000000001",
+        "paidAmount": {
+            "value": "10000.00",
+            "currency": "IDR"
+        },
+        "billDetails": [
+            {
+                "billAmount": {
+                    "value": "10000.00",
+                    "currency": "IDR"
+                }
+            }
+        ]
+    },
+    "additionalInfo": {
+        "acquirer": {
+            "id": "BCA"
+        },
+        "trxId": "FIXTURE-TRX-REF"
+    }
+}

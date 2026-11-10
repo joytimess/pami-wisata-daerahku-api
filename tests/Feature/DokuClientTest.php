@@ -137,6 +137,207 @@ it('creates closed nonreusable BNI VA using RSA token and HMAC transaction signa
     Http::assertSentCount(2);
 });
 
+function bcaDgpcSetup(array $dataOverrides = [], ?array $response = null): object
+{
+    config(['doku.channels' => ['va_bni', 'va_bca'], 'doku.va_banks.bca' => ['partner_service_id' => '19008', 'customer_prefix' => '9', 'notification_channel_id' => 'H2H']]);
+    $attempt = adapterAttempt();
+    $attempt->channel = 'bca';
+    Http::preventStrayRequests();
+    Http::fake([
+        'https://api-sandbox.doku.com/authorization/v1/access-token/b2b' => Http::response(['responseCode' => '2007300', 'accessToken' => 'test-token', 'tokenType' => 'Bearer', 'expiresIn' => 900]),
+        'https://api-sandbox.doku.com/virtual-accounts/bi-snap-va/v1.1/transfer-va/create-va' => Http::response($response ?? ['responseCode' => '2002700', 'responseMessage' => 'Successful',
+            'virtualAccountData' => $dataOverrides + ['partnerServiceId' => '   19008', 'customerNo' => '90000000000000000001', 'virtualAccountNo' => '   1900890000000000000000001',
+                'trxId' => 'WDK-test-reference', 'virtualAccountTrxType' => 'C', 'totalAmount' => ['value' => '30000.00', 'currency' => 'IDR'],
+                'expiredDate' => now()->addHour()->toIso8601String(), 'additionalInfo' => ['channel' => 'VIRTUAL_ACCOUNT_BCA']]]),
+    ]);
+
+    return $attempt;
+}
+
+function bcaBooking(): object
+{
+    return (object) ['visitor_name' => 'Test Visitor', 'payment_expires_at' => now()->addHour()->toDateTimeString()];
+}
+
+it('sends the BCA DGPC create-VA body in the documented SNAP shape', function () {
+    $attempt = bcaDgpcSetup();
+
+    adapterClientWithControlledWindow()->create($attempt, bcaBooking());
+
+    Http::assertSent(function (ClientRequest $request) {
+        if (! str_ends_with($request->url(), '/create-va')) {
+            return false;
+        }
+
+        return $request['partnerServiceId'] === '   19008' && $request['customerNo'] === '9'
+            && $request['virtualAccountNo'] === '   190089' && $request['virtualAccountTrxType'] === 'C'
+            && $request['additionalInfo']['channel'] === 'VIRTUAL_ACCOUNT_BCA' && $request['additionalInfo']['virtualAccountConfig']['reusableStatus'] === false
+            && $request['totalAmount'] === ['value' => '30000.00', 'currency' => 'IDR'] && $request->header('CHANNEL-ID')[0] === 'H2H'
+            && $request['virtualAccountNo'] === $request['partnerServiceId'].$request['customerNo'];
+    });
+});
+
+it('keeps the BNI create-VA body unpadded because its BIN is already eight digits', function () {
+    Http::preventStrayRequests();
+    Http::fake([
+        'https://api-sandbox.doku.com/authorization/v1/access-token/b2b' => Http::response(['responseCode' => '2007300', 'accessToken' => 'test-token', 'tokenType' => 'Bearer', 'expiresIn' => 900]),
+        'https://api-sandbox.doku.com/virtual-accounts/bi-snap-va/v1.1/transfer-va/create-va' => Http::response(adapterVaResponse()),
+    ]);
+
+    adapterClientWithControlledWindow()->create(adapterAttempt(), bcaBooking());
+
+    Http::assertSent(fn (ClientRequest $request) => ! str_ends_with($request->url(), '/create-va') || (
+        $request['partnerServiceId'] === '98829172' && $request['customerNo'] === '3' && $request['virtualAccountNo'] === '988291723'
+        && $request['additionalInfo']['channel'] === 'VIRTUAL_ACCOUNT_BNI'));
+});
+
+it('accepts a space-padded BCA VA from the provider and stores one digits-only reference', function (string $partnerServiceId, string $virtualAccountNo) {
+    $attempt = bcaDgpcSetup(['partnerServiceId' => $partnerServiceId, 'virtualAccountNo' => $virtualAccountNo]);
+
+    $result = adapterClientWithControlledWindow()->create($attempt, bcaBooking());
+
+    expect($result['status'])->toBe('pending')
+        ->and($result['provider_reference'])->toBe('1900890000000000000000001')
+        ->and($result['instruction']['va_number'])->toBe('1900890000000000000000001')
+        ->and($result['instruction']['_provider']['virtualAccountNo'])->toBe($virtualAccountNo);
+})->with([
+    'padded partner and VA' => ['   19008', '   1900890000000000000000001'],
+    'padded partner only' => ['   19008', '1900890000000000000000001'],
+    'unpadded' => ['19008', '1900890000000000000000001'],
+]);
+
+it('still quarantines a BCA create whose VA does not equal partner plus customer', function (string $virtualAccountNo) {
+    $attempt = bcaDgpcSetup(['virtualAccountNo' => $virtualAccountNo]);
+
+    expect(adapterClientWithControlledWindow()->create($attempt, bcaBooking()))
+        ->toBe(['status' => 'unknown', 'reason' => 'provider_response_mismatch']);
+})->with([
+    'other BIN' => ['   1900790000000000000000001'],
+    'wrong customer' => ['   1900890000000000000000002'],
+    'trailing space' => ['1900890000000000000000001 '],
+    'non digit' => ['   19008X0000000000000000001'],
+    'too much padding' => ['         1900890000000000000000001'],
+]);
+
+it('does not let a BCA create answer for another bank or prefix', function (array $override) {
+    $attempt = bcaDgpcSetup($override);
+
+    expect(adapterClientWithControlledWindow()->create($attempt, bcaBooking())['status'])->toBe('unknown');
+})->with([
+    'BNI channel' => [['additionalInfo' => ['channel' => 'VIRTUAL_ACCOUNT_BNI']]],
+    'foreign BIN' => [['partnerServiceId' => '98829172', 'virtualAccountNo' => '9882917290000000000000000001', 'customerNo' => '90000000000000000001']],
+    'foreign prefix' => [['customerNo' => '30000000000000000001', 'virtualAccountNo' => '   1900830000000000000000001']],
+]);
+
+it('does not send a BCA request while its merchant parameters are missing', function () {
+    config(['doku.channels' => ['va_bni', 'va_bca'], 'doku.va_banks.bca' => ['partner_service_id' => '', 'customer_prefix' => '', 'notification_channel_id' => 'H2H']]);
+    Http::preventStrayRequests();
+    Http::fake();
+    $attempt = adapterAttempt();
+    $attempt->channel = 'bca';
+
+    expect(adapterClientWithControlledWindow()->create($attempt, bcaBooking()))->toBe(['status' => 'unknown', 'reason' => 'doku_not_configured']);
+    Http::assertNothingSent();
+});
+
+it('keeps numeric zeros of the BCA customer number when it normalizes the VA', function () {
+    $attempt = bcaDgpcSetup(['customerNo' => '00000000000000000001', 'virtualAccountNo' => '   1900800000000000000000001']);
+    config(['doku.va_banks.bca.customer_prefix' => '0']);
+
+    $result = adapterClientWithControlledWindow()->create($attempt, bcaBooking());
+
+    expect($result['status'])->toBe('pending')->and($result['provider_reference'])->toBe('1900800000000000000000001')
+        ->and(strlen($result['provider_reference']))->toBe(25);
+});
+
+/** Shape of the real BCA DGPC Sandbox answer (2026-11-10): 16-digit VA, 11-digit customerNo, no additionalInfo.channel. */
+function bcaObservedAnswer(): array
+{
+    return ['partnerServiceId' => '   19008', 'customerNo' => '90000000001', 'virtualAccountNo' => '   1900890000000001',
+        'additionalInfo' => ['howToPayApi' => 'https://sandbox.doku.com/pay-instruction/bca/1900890000000001/1', 'howToPayPage' => 'https://sandbox.doku.com/how-to-pay-v2/virtual-account/bca/1900890000000001/1']];
+}
+
+it('accepts the observed BCA create answer that omits additionalInfo.channel', function () {
+    $attempt = bcaDgpcSetup(bcaObservedAnswer());
+
+    $result = adapterClientWithControlledWindow()->create($attempt, bcaBooking());
+
+    expect($result['status'])->toBe('pending')->and($result['provider_reference'])->toBe('1900890000000001')
+        ->and($result['instruction']['va_number'])->toBe('1900890000000001')->and($result['instruction'])->not->toHaveKey('howToPayApi')
+        ->and($result['instruction']['_provider'])->toBe(['partnerServiceId' => '   19008', 'customerNo' => '90000000001', 'virtualAccountNo' => '   1900890000000001']);
+});
+
+it('keeps every other BCA binding when the channel is omitted', function (array $override) {
+    $attempt = bcaDgpcSetup($override + bcaObservedAnswer());
+
+    expect(adapterClientWithControlledWindow()->create($attempt, bcaBooking())['status'])->toBe('unknown');
+})->with([
+    'wrong channel present' => [['additionalInfo' => ['channel' => 'VIRTUAL_ACCOUNT_BNI']]],
+    'empty channel' => [['additionalInfo' => ['channel' => '']]],
+    'additionalInfo not an object' => [['additionalInfo' => 'VIRTUAL_ACCOUNT_BCA']],
+    'other BIN' => [['partnerServiceId' => '   19009', 'virtualAccountNo' => '   1900990000000001']],
+    'other trxId' => [['trxId' => 'someone-elses-reference']],
+    'other amount' => [['totalAmount' => ['value' => '1.00', 'currency' => 'IDR']]],
+    'VA of another customer number' => [['virtualAccountNo' => '   1900890000000002']],
+]);
+
+it('still requires additionalInfo.channel from every bank except BCA', function (string $bank, string $partner, string $prefix, string $dokuChannel) {
+    config(['doku.channels' => ['va_bni', 'va_bri', 'va_mandiri'], 'doku.va_banks.bri' => ['partner_service_id' => '12362', 'customer_prefix' => '6', 'notification_channel_id' => 'X'],
+        'doku.va_banks.mandiri' => ['partner_service_id' => '70002', 'customer_prefix' => '4', 'notification_channel_id' => 'X']]);
+    $attempt = adapterAttempt();
+    $attempt->channel = $bank;
+    $customer = $prefix.'0000000001';
+    Http::preventStrayRequests();
+    Http::fake([
+        'https://api-sandbox.doku.com/authorization/v1/access-token/b2b' => Http::response(['responseCode' => '2007300', 'accessToken' => 'test-token', 'tokenType' => 'Bearer', 'expiresIn' => 900]),
+        'https://api-sandbox.doku.com/virtual-accounts/bi-snap-va/v1.1/transfer-va/create-va' => fn (ClientRequest $request) => Http::response(['responseCode' => '2002700', 'responseMessage' => 'Successful',
+            'virtualAccountData' => ['partnerServiceId' => str_pad($partner, 8, ' ', STR_PAD_LEFT), 'customerNo' => $customer, 'virtualAccountNo' => str_pad($partner, 8, ' ', STR_PAD_LEFT).$customer,
+                'trxId' => 'WDK-test-reference', 'virtualAccountTrxType' => 'C', 'totalAmount' => ['value' => '30000.00', 'currency' => 'IDR'],
+                'expiredDate' => now()->addHour()->toIso8601String(), 'additionalInfo' => ['howToPayApi' => 'https://sandbox.doku.com/pay-instruction/x/1']]]),
+    ]);
+
+    expect(adapterClientWithControlledWindow()->create($attempt, bcaBooking()))->toBe(['status' => 'unknown', 'reason' => 'provider_response_mismatch']);
+})->with([['bni', '98829172', '3', 'VIRTUAL_ACCOUNT_BNI'], ['bri', '12362', '6', 'VIRTUAL_ACCOUNT_BRI'], ['mandiri', '70002', '4', 'VIRTUAL_ACCOUNT_BANK_MANDIRI']]);
+
+it('queries BCA status with the raw provider VA and accepts either padding in the answer', function (string $answerVa) {
+    config(['doku.channels' => ['va_bni', 'va_bca'], 'doku.va_banks.bca' => ['partner_service_id' => '19008', 'customer_prefix' => '9', 'notification_channel_id' => 'H2H']]);
+    Http::preventStrayRequests();
+    $attempt = adapterAttempt();
+    $attempt->channel = 'bca';
+    $provider = ['partnerServiceId' => '   19008', 'customerNo' => '90000000000000000001', 'virtualAccountNo' => '   1900890000000000000000001'];
+    $attempt->instruction_ciphertext = Crypt::encryptString(json_encode(['_provider' => $provider]));
+    Http::fake([
+        'https://api-sandbox.doku.com/authorization/v1/access-token/b2b' => Http::response(['responseCode' => '2007300', 'accessToken' => 'test-token', 'tokenType' => 'Bearer', 'expiresIn' => 900]),
+        'https://api-sandbox.doku.com/orders/v1.0/transfer-va/status' => Http::response([
+            'responseCode' => '2002600', 'virtualAccountData' => ['virtualAccountNo' => $answerVa] + $provider + ['paymentFlagReason' => ['english' => 'Pending', 'indonesia' => 'Belum Terbayar']],
+            'additionalInfo' => ['trxId' => $attempt->merchant_reference, 'acquirer' => ['id' => 'BCA']],
+        ]),
+    ]);
+
+    expect(app(DokuClient::class)->status($attempt)['status'])->toBe('pending');
+    Http::assertSent(fn (ClientRequest $request) => ! str_ends_with($request->url(), '/transfer-va/status')
+        || ($request['virtualAccountNo'] === $provider['virtualAccountNo'] && $request['partnerServiceId'] === '   19008'));
+})->with(['padded answer' => ['   1900890000000000000000001'], 'plain answer' => ['1900890000000000000000001']]);
+
+it('treats a BCA status answer for another VA as a mismatch', function () {
+    config(['doku.channels' => ['va_bni', 'va_bca'], 'doku.va_banks.bca' => ['partner_service_id' => '19008', 'customer_prefix' => '9', 'notification_channel_id' => 'H2H']]);
+    Http::preventStrayRequests();
+    $attempt = adapterAttempt();
+    $attempt->channel = 'bca';
+    $provider = ['partnerServiceId' => '   19008', 'customerNo' => '90000000000000000001', 'virtualAccountNo' => '   1900890000000000000000001'];
+    $attempt->instruction_ciphertext = Crypt::encryptString(json_encode(['_provider' => $provider]));
+    Http::fake([
+        'https://api-sandbox.doku.com/authorization/v1/access-token/b2b' => Http::response(['responseCode' => '2007300', 'accessToken' => 'test-token', 'tokenType' => 'Bearer', 'expiresIn' => 900]),
+        'https://api-sandbox.doku.com/orders/v1.0/transfer-va/status' => Http::response([
+            'responseCode' => '2002600', 'virtualAccountData' => ['customerNo' => '90000000000000000002', 'virtualAccountNo' => '   1900890000000000000000002'] + $provider
+                + ['paymentFlagReason' => ['english' => 'Pending', 'indonesia' => 'Belum Terbayar']],
+            'additionalInfo' => ['trxId' => $attempt->merchant_reference, 'acquirer' => ['id' => 'BCA']],
+        ]),
+    ]);
+
+    expect(app(DokuClient::class)->status($attempt))->toBe(['status' => 'unknown', 'reason' => 'provider_response_mismatch']);
+});
+
 it('does not retry a timed out provider create', function () {
     Http::preventStrayRequests();
     Http::fake([
@@ -334,6 +535,47 @@ it('keeps credentials, VA and customer numbers, email, QR content and provider p
     foreach (['test-token', 'test-only-secret', 'Sentinel Visitor', 'Budi Santoso', 'budi.sentinel@example.test', 'va.sentinel@example.test',
         '081200000777', '9882917299999999999999', '99999999999999999999', 'SENTINELQRCONTENT', 'free text sentinel prose'] as $sentinel) {
         expect($logs)->not->toContain($sentinel);
+    }
+    @unlink($path);
+    @unlink($path.'.app');
+});
+
+it('logs which checks failed on a successful-looking create answer without writing VA or customer values', function () {
+    $path = diagnosticsLogFile();
+    $attempt = bcaDgpcSetup(['virtualAccountNo' => '   1900897777777777777777777', 'customerNo' => '90000000000000000001', 'virtualAccountName' => 'Sentinel Visitor',
+        'expiredDate' => now()->addHours(2)->toIso8601String()]);
+
+    expect(adapterClientWithControlledWindow()->create($attempt, bcaBooking()))->toBe(['status' => 'unknown', 'reason' => 'provider_response_mismatch']);
+
+    $logs = file_get_contents($path);
+    expect($logs)->toContain('doku.create_response_mismatch')->and($logs)->toContain('va_shape')->and($logs)->toContain('expiry_not_after_requested')
+        ->and($logs)->toContain('"va_leading_spaces":3')->and($logs)->toContain('"expiry_delta_seconds":3600');
+    foreach (['1900897777777777777777777', '90000000000000000001', 'Sentinel Visitor', 'test-token', 'test-only-secret'] as $sentinel) {
+        expect($logs)->not->toContain($sentinel);
+    }
+    @unlink($path);
+    @unlink($path.'.app');
+});
+
+it('reports the shape of the official BCA sample response without relaxing the VA check', function () {
+    $path = diagnosticsLogFile();
+    // Verbatim shape of DOKU's published BCA DGPC response: 26 digits after the spaces while partner (5) + customer (20) is 25.
+    $attempt = bcaDgpcSetup(['partnerServiceId' => '   19008', 'customerNo' => '00000000000000000001', 'virtualAccountNo' => '  19008000000000000000000001',
+        'additionalInfo' => ['channel' => 'VIRTUAL_ACCOUNT_BCA', 'howToPayPage' => 'https://app.doku.com/sentinel-page', 'howToPayApi' => 'https://api.doku.com/sentinel-api']]);
+    config(['doku.va_banks.bca.customer_prefix' => '0']);
+
+    expect(adapterClientWithControlledWindow()->create($attempt, bcaBooking()))->toBe(['status' => 'unknown', 'reason' => 'provider_response_mismatch']);
+
+    $entry = json_decode(substr(file_get_contents($path), strpos(file_get_contents($path), '{')), true);
+    expect($entry['failed_checks'])->toBe(['va_shape'])
+        ->and($entry['va_shape'])->toMatchArray(['va_digit_count' => 26, 'expected_digit_count' => 25, 'va_leading_spaces' => 2, 'va_starts_with_merchant_bin' => true,
+            'va_ends_with_customer_no' => true, 'va_equals_partner_plus_customer' => false])
+        ->and($entry['additional_info'])->toBe(['channel' => 'VIRTUAL_ACCOUNT_BCA', 'keys' => ['channel', 'howToPayPage', 'howToPayApi']])
+        ->and($entry['expired_date_shape'])->toMatch('/^9{4}-9{2}-9{2}T9{2}:9{2}:9{2}[+-]9{2}:9{2}$/D')
+        ->and($entry['amount_shape'])->toBe(['value' => '99999.99', 'currency' => 'IDR']);
+    $log = file_get_contents($path);
+    foreach (['19008000000000000000000001', '00000000000000000001', 'sentinel-page', 'sentinel-api', 'test-token', 'test-only-secret'] as $sentinel) {
+        expect($log)->not->toContain($sentinel);
     }
     @unlink($path);
     @unlink($path.'.app');

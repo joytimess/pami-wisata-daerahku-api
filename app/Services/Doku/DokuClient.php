@@ -22,6 +22,9 @@ class DokuClient
 
     private const STATUS_PATH = '/orders/v1.0/transfer-va/status';
 
+    /** Banks whose Sandbox create response was observed without additionalInfo.channel; evidence in DOKU-RUNBOOK.md. */
+    private const CREATE_RESPONSE_CHANNEL_OPTIONAL = ['bca'];
+
     /** @var array{request: array<string, mixed>, response: ?array<string, mixed>}|null */
     private ?array $lastExchange = null;
 
@@ -60,7 +63,7 @@ class DokuClient
      */
     public function vaBank(string $bank): ?array
     {
-        $profiles = ['bni' => ['VIRTUAL_ACCOUNT_BNI', 'BNI'], 'bca' => ['VIRTUAL_ACCOUNT_BCA', null],
+        $profiles = ['bni' => ['VIRTUAL_ACCOUNT_BNI', 'BNI'], 'bca' => ['VIRTUAL_ACCOUNT_BCA', 'BCA'],
             'bri' => ['VIRTUAL_ACCOUNT_BRI', 'BRI'], 'mandiri' => ['VIRTUAL_ACCOUNT_BANK_MANDIRI', 'MANDIRI']];
         if (! isset($profiles[$bank])) {
             return null;
@@ -138,10 +141,13 @@ class DokuClient
         if ($reason = $this->expiryWindowReason('va_'.$bank['bank'], $expiry)) {
             return ['status' => 'unknown', 'reason' => $reason];
         }
+        // DOKU's SNAP samples build virtualAccountNo from the 8-wide, space-padded partnerServiceId plus customerNo
+        // (BCA DGPC request sample: "   19008" + "0" = "   190080"). An 8-digit BIN such as BNI's is unaffected.
+        $paddedPartnerServiceId = str_pad($bank['partner_service_id'], 8, ' ', STR_PAD_LEFT);
         $body = [
-            'partnerServiceId' => str_pad($bank['partner_service_id'], 8, ' ', STR_PAD_LEFT),
+            'partnerServiceId' => $paddedPartnerServiceId,
             'customerNo' => $bank['customer_prefix'],
-            'virtualAccountNo' => $bank['partner_service_id'].$bank['customer_prefix'],
+            'virtualAccountNo' => $paddedPartnerServiceId.$bank['customer_prefix'],
             'virtualAccountName' => mb_substr($booking->visitor_name, 0, 255),
             'trxId' => $attempt->merchant_reference,
             'totalAmount' => ['value' => $attempt->amount.'.00', 'currency' => $attempt->currency],
@@ -161,19 +167,28 @@ class DokuClient
             }
             $amount = $this->parseAmount($data['totalAmount'] ?? []);
             $providerExpiry = $this->parseInstant($data['expiredDate'] ?? null);
-            if (($data['trxId'] ?? '') !== $attempt->merchant_reference || $amount !== (int) $attempt->amount
-                || ($data['virtualAccountTrxType'] ?? '') !== 'C'
-                || ($data['additionalInfo']['channel'] ?? '') !== $bank['doku_channel']
-                || ! is_string($data['partnerServiceId'] ?? null) || trim($data['partnerServiceId']) !== $bank['partner_service_id']
-                || ! $this->validVa($data) || ! str_starts_with($data['customerNo'], $bank['customer_prefix'])
-                || ! $providerExpiry || $providerExpiry->gt($expiry) || $providerExpiry->lte(now())) {
+            $failedChecks = array_keys(array_filter([
+                'trx_id' => ($data['trxId'] ?? '') === $attempt->merchant_reference,
+                'amount' => $amount === (int) $attempt->amount,
+                'trx_type' => ($data['virtualAccountTrxType'] ?? '') === 'C',
+                'channel' => $this->createResponseChannelMatches($data['additionalInfo'] ?? null, $bank),
+                'partner_service_id' => is_string($data['partnerServiceId'] ?? null) && trim($data['partnerServiceId']) === $bank['partner_service_id'],
+                'va_shape' => $this->validVa($data),
+                'customer_prefix' => is_string($data['customerNo'] ?? null) && str_starts_with($data['customerNo'], $bank['customer_prefix']),
+                'expiry_parsed' => $providerExpiry !== null,
+                'expiry_not_after_requested' => $providerExpiry !== null && ! $providerExpiry->gt($expiry),
+                'expiry_in_future' => $providerExpiry !== null && $providerExpiry->gt(now()),
+            ], fn (bool $passed) => ! $passed));
+            if ($failedChecks !== []) {
+                $this->recordCreateMismatch($this->diagnosticContext($attempt), $failedChecks, $data, $providerExpiry, $expiry, $bank['partner_service_id']);
+
                 return ['status' => 'unknown', 'reason' => 'provider_response_mismatch'];
             }
 
-            return ['status' => 'pending', 'provider_reference' => $data['virtualAccountNo'],
+            return ['status' => 'pending', 'provider_reference' => $this->canonicalVa($data['virtualAccountNo']),
                 'expires_at' => $providerExpiry->utc()->toDateTimeString(),
                 'instruction' => ['presentation_type' => 'virtual_account', 'bank_code' => $bank['bank'],
-                    'va_number' => $data['virtualAccountNo'], 'copyable' => true,
+                    'va_number' => $this->canonicalVa($data['virtualAccountNo']), 'copyable' => true,
                     '_provider' => ['partnerServiceId' => $data['partnerServiceId'], 'customerNo' => $data['customerNo'],
                         'virtualAccountNo' => $data['virtualAccountNo']]]];
         } catch (ConnectionException) {
@@ -219,8 +234,8 @@ class DokuClient
             }
             if (($response['additionalInfo']['trxId'] ?? '') !== $attempt->merchant_reference
                 || ($bank['acquirer'] !== null && ($response['additionalInfo']['acquirer']['id'] ?? '') !== $bank['acquirer'])
-                || ($data['virtualAccountNo'] ?? '') !== $provider['virtualAccountNo']
-                || ($data['partnerServiceId'] ?? '') !== $provider['partnerServiceId']
+                || ! $this->validVa($data) || $this->canonicalVa($data['virtualAccountNo']) !== $this->canonicalVa($provider['virtualAccountNo'])
+                || trim($data['partnerServiceId']) !== trim($provider['partnerServiceId'])
                 || ($data['customerNo'] ?? '') !== $provider['customerNo']) {
                 return ['status' => 'unknown', 'reason' => 'provider_response_mismatch'];
             }
@@ -277,9 +292,91 @@ class DokuClient
                 'virtualAccountName', 'trxId', 'paymentRequestId', 'paidAmount', 'virtualAccountTrxType', 'additionalInfo']))];
 
         return ['status' => 'paid', 'environment' => $this->environment(), 'method' => 'virtual_account', 'channel' => $bank['bank'], 'amount' => $amount, 'currency' => 'IDR',
-            'merchant_reference' => $data['trxId'], 'provider_reference' => $data['virtualAccountNo'],
+            'merchant_reference' => $data['trxId'], 'provider_reference' => $this->canonicalVa($data['virtualAccountNo']),
             'occurred_at' => $occurred->utc()->toDateTimeString(), 'event_key' => 'va:'.hash('sha256', $data['trxId'].':'.$data['paymentRequestId']),
             'payload_hash' => hash('sha256', $raw), 'acknowledgement' => $acknowledgement];
+    }
+
+    /**
+     * Read-only description of an inbound notification for Sandbox observation. Never throws, never aborts and never
+     * influences verification. Credentials (token, signature, secret) are not recorded; body values are masked to their
+     * shape (digits become 9, other characters x) except short upper-case enums such as the channel or currency.
+     *
+     * @return array<string, mixed>
+     */
+    public function describeNotification(Request $request): array
+    {
+        try {
+            $raw = $request->getContent();
+            $token = $request->bearerToken();
+            $timestamp = (string) $request->header('X-TIMESTAMP', '');
+            $instant = $this->parseInstant($timestamp);
+            $path = $request->getRequestUri();
+            $minified = preg_replace('/("(?:[^"\\\\]|\\\\.)*")|\s+/s', '$1', $raw);
+            $given = (string) $request->header('X-SIGNATURE', '');
+            $data = strlen($raw) <= 65536 ? json_decode($raw, true, 12) : null;
+            $data = is_array($data) && ! array_is_list($data) ? $data : null;
+            $channelId = (string) $request->header('CHANNEL-ID', '');
+            $declared = $data['additionalInfo']['channel'] ?? null;
+            $va = is_string($data['virtualAccountNo'] ?? null) ? $data['virtualAccountNo'] : null;
+            $partner = is_string($data['partnerServiceId'] ?? null) ? $data['partnerServiceId'] : null;
+            $customer = is_string($data['customerNo'] ?? null) ? $data['customerNo'] : null;
+            $banks = [];
+            foreach (['bni', 'bca', 'bri', 'mandiri'] as $bank) {
+                $banks[$bank] = $this->vaBank($bank);
+            }
+
+            return [
+                'method' => $request->method(),
+                'content_type' => preg_match('/^[\w\/+.;= -]{1,80}$/D', (string) $request->header('Content-Type', '')) === 1 ? $request->header('Content-Type') : '[unusual]',
+                'user_agent' => substr((string) preg_replace('/[^\x20-\x7E]/', '?', (string) $request->header('User-Agent', '')), 0, 60),
+                'body_bytes' => strlen($raw),
+                'header_names' => array_slice(array_values(array_filter(array_keys($request->headers->all()), fn ($name) => is_string($name) && preg_match('/^[a-z0-9-]{1,40}$/D', $name) === 1)), 0, 40),
+                'channel_id' => preg_match('/^[A-Za-z0-9_-]{1,20}$/D', $channelId) === 1 ? $channelId : ($channelId === '' ? null : '[unusual]'),
+                'partner_id_matches' => hash_equals((string) config('doku.client_id'), (string) $request->header('X-PARTNER-ID', '')),
+                'external_id' => ['length' => strlen((string) $request->header('X-EXTERNAL-ID', '')), 'digits_only' => preg_match('/^\d+$/D', (string) $request->header('X-EXTERNAL-ID', '')) === 1],
+                'timestamp_shape' => $this->shape($timestamp),
+                'timestamp_skew_seconds' => $instant ? $instant->getTimestamp() - now()->getTimestamp() : null,
+                'authorization' => ['bearer' => is_string($token) && $token !== '', 'token_length' => is_string($token) ? strlen($token) : 0],
+                'signature' => ['length' => strlen($given), 'path_matches_configured' => strtok($path, '?') === parse_url((string) config('doku.webhook_url'), PHP_URL_PATH),
+                    'matches_minified_body' => is_string($token) && $minified !== null && hash_equals($this->signature($path, $token, $minified, $timestamp), $given),
+                    'matches_raw_body' => is_string($token) && hash_equals($this->signature($path, $token, $raw, $timestamp), $given)],
+                'body_is_json_object' => $data !== null,
+                'body_shape' => $data === null ? null : $this->shapeTree($data),
+                'declared_channel' => is_string($declared) ? (preg_match('/^[A-Z_]{1,40}$/D', $declared) === 1 ? $declared : '[unusual]') : null,
+                'bank_by_declared_channel' => array_key_first(array_filter($banks, fn (array $profile) => is_string($declared) && $profile['doku_channel'] === $declared)),
+                'bank_by_channel_id' => array_key_first(array_filter($banks, fn (array $profile) => $profile['notification_channel_id'] !== '' && hash_equals($profile['notification_channel_id'], $channelId))),
+                'bank_by_partner_service_id' => array_key_first(array_filter($banks, fn (array $profile) => $partner !== null && $profile['partner_service_id'] !== '' && trim($partner) === $profile['partner_service_id'])),
+                'va_shape' => ['digit_count' => $va === null ? null : strlen(ltrim($va, ' ')), 'leading_spaces' => $va === null ? null : strlen($va) - strlen(ltrim($va, ' ')),
+                    'customer_length' => $customer === null ? null : strlen($customer),
+                    'equals_partner_plus_customer' => $va !== null && $partner !== null && $customer !== null && ltrim($va, ' ') === trim($partner).$customer],
+            ];
+        } catch (\Throwable) {
+            return ['describe_failed' => true];
+        }
+    }
+
+    private function shape(string $value): string
+    {
+        return substr((string) preg_replace(['/\d/', '/[^\x20-\x7E]/', '/[A-Za-z]/'], ['9', '?', 'x'], $value), 0, 48);
+    }
+
+    /** @param  array<mixed>  $node */
+    private function shapeTree(array $node, int $depth = 0): mixed
+    {
+        $shaped = [];
+        foreach (array_slice($node, 0, 40, true) as $key => $value) {
+            $label = is_string($key) && preg_match('/^[A-Za-z0-9_]{1,40}$/D', $key) === 1 ? $key : '[key]';
+            $shaped[$label] = match (true) {
+                is_array($value) => $depth >= 6 ? '[deep]' : $this->shapeTree($value, $depth + 1),
+                is_string($value) => preg_match('/^[A-Z][A-Z_]{0,39}$/D', $value) === 1 ? $value : $this->shape($value),
+                is_int($value) || is_float($value) => '[number]',
+                is_bool($value) => $value,
+                default => null,
+            };
+        }
+
+        return $shaped;
     }
 
     /**
@@ -429,6 +526,57 @@ class DokuClient
     }
 
     /**
+     * A 2xx create answer that failed local validation is otherwise invisible. Logs which checks failed and the shape of the
+     * VA fields (counts and lengths only); never the VA, customer number, name or any provider prose.
+     *
+     * @param  list<string>  $failedChecks
+     * @param  array<string, mixed>  $data
+     * @param  array{attempt_guid?: ?string, channel?: ?string}  $context
+     */
+    private function recordCreateMismatch(array $context, array $failedChecks, array $data, ?CarbonImmutable $providerExpiry, CarbonImmutable $requestedExpiry, string $merchantBin): void
+    {
+        $mask = fn (mixed $value): ?string => is_string($value) ? substr(preg_replace('/\d/', '9', preg_replace('/[^\x20-\x7E]/', '?', $value)), 0, 40) : null;
+        $enum = fn (mixed $value): ?string => is_string($value) ? (preg_match('/^[A-Z_]{1,40}$/D', $value) === 1 ? $value : '[non-enum]') : null;
+        $info = is_array($data['additionalInfo'] ?? null) ? $data['additionalInfo'] : null;
+        $amount = is_array($data['totalAmount'] ?? null) ? $data['totalAmount'] : [];
+        $va = is_string($data['virtualAccountNo'] ?? null) ? $data['virtualAccountNo'] : null;
+        $partner = is_string($data['partnerServiceId'] ?? null) ? $data['partnerServiceId'] : null;
+        $customer = is_string($data['customerNo'] ?? null) ? $data['customerNo'] : null;
+        $guid = $context['attempt_guid'] ?? null;
+        try {
+            Log::channel('doku_diagnostics')->warning('DOKU create response mismatch.', [
+                'event' => 'doku.create_response_mismatch',
+                'attempt_guid' => is_string($guid) && Str::isUuid($guid) ? $guid : null,
+                'environment' => $this->environment(),
+                'channel' => $context['channel'] ?? null,
+                'http_status' => $this->lastHttpStatus,
+                'failed_checks' => $failedChecks,
+                'data_keys' => array_slice(array_values(array_filter(array_keys($data), fn ($key) => is_string($key) && preg_match('/^[A-Za-z0-9_]{1,40}$/D', $key) === 1)), 0, 20),
+                'va_shape' => [
+                    'va_length' => $va === null ? null : strlen($va), 'va_leading_spaces' => $va === null ? null : strlen($va) - strlen(ltrim($va, ' ')),
+                    'va_digits_only_after_trim' => $va === null ? null : preg_match('/^\d+$/D', ltrim($va, ' ')) === 1,
+                    'partner_length' => $partner === null ? null : strlen($partner), 'partner_leading_spaces' => $partner === null ? null : strlen($partner) - strlen(ltrim($partner, ' ')),
+                    'customer_length' => $customer === null ? null : strlen($customer),
+                    'va_digit_count' => $va === null ? null : strlen(ltrim($va, ' ')),
+                    'expected_digit_count' => $partner !== null && $customer !== null ? strlen(trim($partner).$customer) : null,
+                    'va_equals_partner_plus_customer' => $va !== null && $partner !== null && $customer !== null && ltrim($va, ' ') === trim($partner).$customer,
+                    'va_starts_with_merchant_bin' => $va !== null && str_starts_with(ltrim($va, ' '), $merchantBin),
+                    'va_ends_with_customer_no' => $va !== null && $customer !== null && $customer !== '' && str_ends_with($va, $customer),
+                ],
+                'expiry_delta_seconds' => $providerExpiry === null ? null : $providerExpiry->getTimestamp() - $requestedExpiry->getTimestamp(),
+                'expiry_present' => array_key_exists('expiredDate', $data),
+                'expired_date_shape' => $mask($data['expiredDate'] ?? null),
+                'trx_type' => $enum($data['virtualAccountTrxType'] ?? null),
+                'amount_shape' => ['value' => $mask($amount['value'] ?? null), 'currency' => $enum($amount['currency'] ?? null)],
+                'additional_info' => $info === null ? null : ['channel' => $enum($info['channel'] ?? null),
+                    'keys' => array_slice(array_values(array_filter(array_keys($info), fn ($key) => is_string($key) && preg_match('/^[A-Za-z0-9_]{1,40}$/D', $key) === 1)), 0, 20)],
+            ]);
+        } catch (\Throwable) {
+            // Diagnostics must never change the payment outcome.
+        }
+    }
+
+    /**
      * B2B access token. A failure here means the payment request was never dispatched.
      *
      * @param  array{attempt_guid?: ?string, channel?: ?string}  $context
@@ -551,12 +699,40 @@ class DokuClient
         }
     }
 
+    /**
+     * DOKU may left-pad the VA number with spaces exactly like partnerServiceId (BCA samples do). The stored and compared
+     * reference is the digits-only form so create, status inquiry and notification agree on one string.
+     */
+    /**
+     * DOKU publishes additionalInfo.channel as required in every VA create response, but the BCA DGPC Sandbox answer of
+     * 2026-11-10 (HTTP 200, 2002700) carried only howToPayApi/howToPayPage. For banks listed in
+     * CREATE_RESPONSE_CHANNEL_OPTIONAL an absent channel is therefore accepted; the response stays bound to the bank by the
+     * configured BIN, the partner+customer VA equality, the customer prefix and our unique trxId. A present but different
+     * channel, and a missing channel for any other bank, are still rejected.
+     *
+     * @param  array{bank: string, doku_channel: string}  $bank
+     */
+    private function createResponseChannelMatches(mixed $additionalInfo, array $bank): bool
+    {
+        if (! is_array($additionalInfo)) {
+            return false;
+        }
+
+        return ($additionalInfo['channel'] ?? null) === $bank['doku_channel']
+            || (! array_key_exists('channel', $additionalInfo) && in_array($bank['bank'], self::CREATE_RESPONSE_CHANNEL_OPTIONAL, true));
+    }
+
+    private function canonicalVa(string $virtualAccountNo): string
+    {
+        return ltrim($virtualAccountNo, ' ');
+    }
+
     private function validVa(mixed $data): bool
     {
-        return is_array($data) && is_string($data['virtualAccountNo'] ?? null) && preg_match('/^\d{1,28}$/D', $data['virtualAccountNo'])
+        return is_array($data) && is_string($data['virtualAccountNo'] ?? null) && preg_match('/^ {0,8}\d{1,28}$/D', $data['virtualAccountNo'])
             && is_string($data['partnerServiceId'] ?? null) && is_string($data['customerNo'] ?? null)
             && preg_match('/^\d{1,20}$/D', $data['customerNo'])
-            && $data['virtualAccountNo'] === trim($data['partnerServiceId']).$data['customerNo'];
+            && $this->canonicalVa($data['virtualAccountNo']) === trim($data['partnerServiceId']).$data['customerNo'];
     }
 
     public function parseAmount(mixed $amount): ?int
