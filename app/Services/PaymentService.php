@@ -124,7 +124,7 @@ class PaymentService
             $this->gateway->demoEnabled() && DB::table('payment_intents')->where('booking_guid', $booking->guid)
                 ->where(fn ($intent) => $intent->where('provider', '!=', 'demo')->orWhere('environment', '!=', 'demo'))->exists() => 'payment_provider_conflict',
             ! $this->gateway->demoEnabled() && DB::table('payment_intents')->where('booking_guid', $booking->guid)
-                ->where(fn ($intent) => $intent->where('provider', '!=', 'doku')->orWhere('environment', '!=', config('doku.environment', 'sandbox')))->exists() => 'payment_provider_conflict',
+                ->where(fn ($intent) => $intent->where('provider', '!=', $this->gateway->activeProvider())->orWhere('environment', '!=', $this->gateway->activeEnvironment()))->exists() => 'payment_provider_conflict',
             DB::table('payment_intents')->where('booking_guid', $booking->guid)->where('status', 'needs_review')->exists() => 'payment_needs_review',
             $this->hasOverdueOpenAttempt($booking->guid) => 'payment_verification_pending',
             default => $this->gateway->capabilities($this->instructionExpiresAt($booking, CarbonImmutable::now()))['reason'],
@@ -150,8 +150,8 @@ class PaymentService
             && $booking->payment_expires_at && now()->lt($booking->payment_expires_at)
             && now()->lt(BookingRules::visitStart($booking->visit_date, $booking->destination_timezone_snapshot ?? $booking->destination_timezone))
             && DB::table('booking_status_histories')->where('booking_guid', $booking->guid)->where('new_status', 'awaiting_payment')->exists();
-        $provider = $this->gateway->demoEnabled() ? 'demo' : 'doku';
-        $environment = $provider === 'demo' ? 'demo' : config('doku.environment', 'sandbox');
+        $provider = $this->gateway->activeProvider();
+        $environment = $this->gateway->activeEnvironment();
 
         return [
             'invoice_number' => DB::table('invoices')->where('booking_guid', $booking->guid)->value('invoice_number'),
@@ -171,9 +171,11 @@ class PaymentService
 
     public function instructionExpiresAt(object $booking, CarbonImmutable $startedAt): CarbonImmutable
     {
-        return $startedAt->addMinutes(30)
-            ->min($booking->payment_expires_at ?? $startedAt)
-            ->min(BookingRules::visitStart($booking->visit_date, $booking->destination_timezone_snapshot ?? $booking->destination_timezone));
+        $deadline = $booking->payment_expires_at ?? $startedAt;
+        // Midtrans attempts share the booking's one absolute deadline; the legacy 30 minute per-attempt window applies to DOKU only.
+        $window = $this->gateway->activeProvider() === 'midtrans' ? CarbonImmutable::parse($deadline, 'UTC') : $startedAt->addMinutes(30)->min($deadline);
+
+        return $window->min(BookingRules::visitStart($booking->visit_date, $booking->destination_timezone_snapshot ?? $booking->destination_timezone));
     }
 
     /** @param list<array<string, mixed>> $methods

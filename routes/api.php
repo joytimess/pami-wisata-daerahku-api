@@ -40,7 +40,7 @@ use Illuminate\Support\Facades\Route;
 Route::prefix('v1')->group(function () {
     Route::post('webhooks/doku/va', DokuWebhookController::class)->middleware([ObserveDokuWebhook::class, 'throttle:300,1'])->name('payments.doku.webhook');
     Route::middleware(AuthenticateApiToken::class)->group(function () {
-        Route::post('bookings/{booking}/payment-attempts', [PaymentController::class, 'initiateDoku'])->middleware('throttle:30,1')->name('payments.doku.initiate');
+        Route::post('bookings/{booking}/payment-attempts', [PaymentController::class, 'initiate'])->middleware('throttle:30,1')->name('payments.doku.initiate');
         Route::post('bookings/{booking}/payment-attempts/{attempt}/refresh', [PaymentController::class, 'refreshDoku'])->whereUuid('attempt')
             ->middleware('throttle:20,1')->name('payments.doku.refresh');
         Route::get('bookings/{booking}/payment-attempts/{attempt}/qr', [PaymentController::class, 'qrisImage'])->whereUuid('attempt')

@@ -5,10 +5,13 @@ namespace App\Http\Controllers\Api\V1;
 use App\Http\Controllers\Controller;
 use App\Http\Requests\DemoPaymentRequest;
 use App\Http\Requests\DokuPaymentRequest;
+use App\Http\Requests\MidtransPaymentRequest;
 use App\Http\Requests\PaymentMethodsRequest;
 use App\Http\Resources\OperationalResource;
 use App\Services\DemoPaymentService;
 use App\Services\DokuPaymentService;
+use App\Services\MidtransPaymentService;
+use App\Services\PaymentGateway;
 use App\Services\PaymentService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -16,10 +19,17 @@ use Illuminate\Http\Response;
 
 class PaymentController extends Controller
 {
-    public function initiateDoku(DokuPaymentRequest $request, string $booking, DokuPaymentService $service): JsonResponse
+    /**
+     * Creates a payment attempt on the one active real gateway. The request class is resolved after the gateway is known so that
+     * each provider validates its own channels; Midtrans, once enabled, never falls back to DOKU.
+     */
+    public function initiate(Request $request, string $booking, PaymentGateway $gateway): JsonResponse
     {
-        return (new OperationalResource($service->initiate($request->user(), $booking, $request->validated())))
-            ->response()->header('Cache-Control', 'private, no-store');
+        $data = $gateway->activeProvider() === 'midtrans'
+            ? app(MidtransPaymentService::class)->initiate($request->user(), $booking, app(MidtransPaymentRequest::class)->validated())
+            : app(DokuPaymentService::class)->initiate($request->user(), $booking, app(DokuPaymentRequest::class)->validated());
+
+        return (new OperationalResource($data))->response()->header('Cache-Control', 'private, no-store');
     }
 
     public function refreshDoku(Request $request, string $booking, string $attempt, DokuPaymentService $doku, PaymentService $payments): JsonResponse
