@@ -24,7 +24,7 @@ class PaymentReceiptService
         $booking = DB::table('bookings')->join('destination_quotas as q', 'q.guid', '=', 'bookings.destination_quota_guid')
             ->join('destinations as d', 'd.guid', '=', 'q.destination_guid')->where('bookings.guid', $bookingGuid)
             ->first(['bookings.*', 'q.visit_date', 'd.timezone as destination_timezone']);
-        $intent = $booking ? DB::table('payment_intents')->where('booking_guid', $bookingGuid)->where('provider', 'doku')->first() : null;
+        $intent = $booking ? DB::table('payment_intents')->where('booking_guid', $bookingGuid)->first() : null;
         $attempt = $intent && $intent->applied_attempt_guid ? DB::table('payment_attempts')->where('guid', $intent->applied_attempt_guid)->first() : null;
         if (! $attempt) {
             return null;
@@ -36,8 +36,7 @@ class PaymentReceiptService
         $invoice = $ensureInvoice ? app(BookingDocumentService::class)->ensureInvoice($booking)
             : DB::table('invoices')->where('booking_guid', $bookingGuid)->first();
         $timezone = $booking->destination_timezone_snapshot ?? $booking->destination_timezone;
-        $adjusted = $status === 'reversed' ? DB::table('payment_events')->where('payment_attempt_guid', $attempt->guid)->where('verification', 'verified')
-            ->where('disposition', 'applied')->whereIn('event_type', ['refund', 'reversal'])->max('provider_occurred_at') : null;
+        $adjusted = $status === 'reversed' ? $attempt->reversed_at : null;
         $h5 = CarbonImmutable::parse($booking->visit_date, $timezone)->startOfDay()->subDays(self::ENTRY_QR_LEAD_DAYS);
 
         return [
@@ -47,7 +46,7 @@ class PaymentReceiptService
             'method_label' => $this->methodLabel($attempt->method, $attempt->channel),
             'reference_suffix' => '****'.substr((string) $attempt->provider_reference, -4),
             'paid_at' => CarbonImmutable::parse($attempt->verified_paid_at, 'UTC')->setTimezone($timezone)->format('Y-m-d H:i'),
-            'timezone' => $timezone, 'environment' => $intent->environment, 'test_only' => $intent->environment !== 'production',
+            'timezone' => $timezone, 'provider' => $intent->provider, 'environment' => $intent->environment, 'test_only' => $intent->environment !== 'production',
             'adjusted_at' => $adjusted ? CarbonImmutable::parse($adjusted, 'UTC')->setTimezone($timezone)->format('Y-m-d H:i') : null,
             'h5_date' => $h5->toDateString(), 'entry_qr_open' => CarbonImmutable::now($timezone)->gte($h5),
         ];
@@ -56,7 +55,7 @@ class PaymentReceiptService
     /** @param array<string, mixed> $receipt */
     public function title(array $receipt): string
     {
-        return ($receipt['test_only'] ? '[SANDBOX] ' : '').'Pembayaran terverifikasi';
+        return ($receipt['test_only'] ? '['.strtoupper($receipt['environment']).'] ' : '').'Pembayaran terverifikasi';
     }
 
     /** @param array<string, mixed> $receipt */
@@ -64,7 +63,7 @@ class PaymentReceiptService
     {
         $lines = [];
         if ($receipt['test_only']) {
-            $lines[] = '[SANDBOX / TEST ONLY] Ini transaksi uji DOKU. Tidak ada dana Production.';
+            $lines[] = '['.strtoupper($receipt['environment']).' / TEST ONLY] Ini transaksi uji '.strtoupper($receipt['provider']).'. Tidak ada dana Production.';
         }
         $lines[] = 'Pembayaran Anda telah terverifikasi.';
         $lines[] = 'Invoice: '.($receipt['invoice_number'] ?? '-');
@@ -91,7 +90,7 @@ class PaymentReceiptService
         $status = $receipt['state'] === 'paid' ? 'STATUS: LUNAS' : 'STATUS: PEMBAYARAN DIKEMBALIKAN ATAU DIBATALKAN';
         $html = '<h1>Bukti Pembayaran</h1>';
         if ($receipt['test_only']) {
-            $html .= '<p><strong>SANDBOX / TEST ONLY</strong> - transaksi uji DOKU, bukan dana Production.</p>';
+            $html .= '<p><strong>'.e(strtoupper($receipt['environment'])).' / TEST ONLY</strong> - transaksi uji '.e(strtoupper($receipt['provider'])).', bukan dana Production.</p>';
         }
         $html .= '<p><strong>'.e($status).'</strong></p><table>'
             .$row('Invoice', $receipt['invoice_number'] ?? '-').$row('Booking', $receipt['booking_number'])

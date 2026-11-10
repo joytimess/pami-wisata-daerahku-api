@@ -5,7 +5,6 @@ namespace App\Services;
 use App\Models\User;
 use Carbon\CarbonImmutable;
 use Illuminate\Database\Query\Builder;
-use Illuminate\Database\Query\JoinClause;
 use Illuminate\Support\Facades\DB;
 
 class FinancialAnalyticsService
@@ -25,6 +24,8 @@ class FinancialAnalyticsService
             'to' => $filters['to'] ?? now()->utc()->toDateString(), 'date_basis' => 'paid_utc', 'timezone' => 'UTC'];
         $base = $this->attempts($actor, $filters, $environment);
         $captures = $this->captures(clone $base);
+        $providers = (clone $captures)->distinct()->limit(3)->pluck('a.provider');
+        $provider = $providers->count() > 1 ? 'mixed' : ($providers->first() ?? $provider);
         $data = ['availability' => 'unavailable', 'reason' => 'no_verified_payment_source',
             'environment' => $environment, 'provider' => $provider, 'test_only' => $environment !== 'production',
             'label' => $environment === 'demo' ? 'DEMO' : strtoupper($environment), 'currency' => 'IDR',
@@ -55,7 +56,7 @@ class FinancialAnalyticsService
         $eligible = $this->scope->apply(DB::table('bookings as b')->join('destination_quotas as q', 'q.guid', '=', 'b.destination_quota_guid'), $actor, 'q.destination_guid')
             ->where('b.total_amount', '>', 0)->where('b.currency', 'IDR')
             ->whereExists(fn (Builder $intent) => $intent->selectRaw('1')->from('payment_intents as eligible_intent')
-                ->whereColumn('eligible_intent.booking_guid', 'b.guid')->where('eligible_intent.provider', $provider)->where('eligible_intent.environment', $environment))
+                ->whereColumn('eligible_intent.booking_guid', 'b.guid')->whereIn('eligible_intent.provider', $environment === 'demo' ? ['demo'] : ['doku', 'midtrans'])->where('eligible_intent.environment', $environment))
             ->whereExists(fn (Builder $history) => $history->selectRaw('1')->from('booking_status_histories as h')
                 ->whereColumn('h.booking_guid', 'b.guid')->where('h.new_status', 'awaiting_payment'));
         if (isset($filters['destination_guid'])) {
@@ -70,13 +71,16 @@ class FinancialAnalyticsService
         $mix = $mix->take(100)
             ->map(fn (object $row): array => ['method' => $row->method, 'channel' => $row->channel,
                 'successful_attempts' => (int) $row->successful_attempts, 'gross_collected' => (int) $row->gross_collected])->all();
-        $refunds = $this->between((clone $captures)->join('payment_events as refund', function (JoinClause $join): void {
-            $join->on('refund.payment_attempt_guid', '=', 'a.guid')->on('refund.payment_intent_guid', '=', 'i.guid')
-                ->on('refund.provider', '=', 'a.provider')->on('refund.environment', '=', 'a.environment')
-                ->on('refund.currency', '=', 'a.currency');
-        })->where('refund.verification', 'verified')->where('refund.event_type', 'refund')
-            ->where('refund.disposition', 'applied')->where('refund.amount', '>', 0)
-            ->whereColumn('refund.amount', '<=', 'a.amount'), 'refund.provider_occurred_at', $period)
+        $refundEvents = app(PaymentEligibility::class)->boundEvents('refund', fullAmount: false)
+            ->whereIn('e.disposition', ['applied', 'duplicate_adjustment'])->whereColumn('e.guid', 'refund.guid')
+            ->whereColumn('e.provider_occurred_at', '>=', 'a.verified_paid_at');
+        $earlierFullRefund = app(PaymentEligibility::class)->boundEvents('refund')
+            ->whereIn('e.disposition', ['applied', 'duplicate_adjustment'])->whereColumn('e.provider_occurred_at', '>=', 'a.verified_paid_at')
+            ->where(fn (Builder $earlier) => $earlier->whereColumn('e.provider_occurred_at', '<', 'refund.provider_occurred_at')
+                ->orWhere(fn (Builder $tie) => $tie->whereColumn('e.provider_occurred_at', 'refund.provider_occurred_at')->whereColumn('e.guid', '<', 'refund.guid')));
+        $refunds = $this->between((clone $captures)->join('payment_events as refund', 'refund.payment_attempt_guid', '=', 'a.guid')
+            ->whereExists($refundEvents)->where(fn (Builder $receipt) => $receipt->whereColumn('refund.amount', '<', 'a.amount')
+            ->orWhereNotExists($earlierFullRefund)), 'refund.provider_occurred_at', $period)
             ->selectRaw('COUNT(*) as receipts, SUM(refund.amount) as amount')->first();
 
         return array_replace($data, ['availability' => 'partial', 'reason' => $refunds->receipts ? 'fees_unavailable_refunds_incomplete' : 'fees_and_refunds_unavailable',
@@ -100,7 +104,7 @@ class FinancialAnalyticsService
     {
         $query = DB::table('payment_attempts as a')->join('payment_intents as i', 'i.guid', '=', 'a.payment_intent_guid')
             ->join('bookings as b', 'b.guid', '=', 'i.booking_guid')->join('destination_quotas as q', 'q.guid', '=', 'b.destination_quota_guid')
-            ->where('a.provider', $environment === 'demo' ? 'demo' : 'doku')->whereColumn('i.provider', 'a.provider')
+            ->whereIn('a.provider', $environment === 'demo' ? ['demo'] : ['doku', 'midtrans'])->whereColumn('i.provider', 'a.provider')
             ->where('a.environment', $environment)->where('i.environment', $environment)
             ->where('a.currency', 'IDR')->whereColumn('i.currency', 'a.currency')->whereColumn('b.currency', 'a.currency')
             ->where('a.amount', '>', 0)->whereColumn('a.amount', 'i.amount')->whereColumn('i.amount', 'b.total_amount');
@@ -114,14 +118,9 @@ class FinancialAnalyticsService
 
     private function captures(Builder $query): Builder
     {
-        return $query->whereNotNull('a.verified_paid_at')->whereExists(function (Builder $event): void {
-            $event->selectRaw('1')->from('payment_events as e')->whereColumn('e.payment_attempt_guid', 'a.guid')
-                ->whereColumn('e.payment_intent_guid', 'i.guid')->whereColumn('e.provider', 'a.provider')->whereColumn('e.environment', 'a.environment')
-                ->whereColumn('e.amount', 'a.amount')->whereColumn('e.currency', 'a.currency')
-                ->whereColumn('e.provider_occurred_at', 'a.verified_paid_at')
-                ->where('e.verification', 'verified')->where('e.event_type', 'capture')
-                ->whereIn('e.disposition', ['applied', 'unapplied', 'duplicate_capture']);
-        });
+        return $query->whereNotNull('a.verified_paid_at')->whereColumn('a.verified_paid_at', '>=', 'a.started_at')
+            ->whereExists(app(PaymentEligibility::class)->boundEvents('capture')
+                ->whereColumn('e.provider_occurred_at', 'a.verified_paid_at')->whereIn('e.disposition', ['applied', 'unapplied', 'duplicate_capture']));
     }
 
     private function recognitionSql(): string

@@ -67,15 +67,16 @@ class PaymentService
             ->orderByDesc('attempt_number')->first() : null;
 
         $capabilities = $this->gateway->capabilities($this->instructionExpiresAt($booking, CarbonImmutable::now()));
-        if ($intent?->provider === 'demo') {
-            $capabilities = array_replace($capabilities, ['provider' => 'demo', 'environment' => 'demo', 'test_only' => true, 'label' => 'DEMO']);
-        }
-        if ($intent?->provider === 'doku') {
-            $capabilities = array_replace($capabilities, ['provider' => 'doku', 'environment' => $intent->environment, 'test_only' => $intent->environment !== 'production']);
+        if ($intent) {
+            $capabilities = array_replace($capabilities, ['provider' => $intent->provider, 'environment' => $intent->environment,
+                'test_only' => $intent->environment !== 'production', 'label' => strtoupper($intent->environment)]);
         }
         $instruction = ['presentation_type' => $intent?->provider === 'demo' && $this->gateway->demoEnabled() ? 'demo_simulator' : 'unavailable'];
         if ($intent?->provider === 'doku' && $attempt) {
             $instruction = app(DokuPaymentService::class)->response($booking, $intent, $attempt)['instruction'];
+        }
+        if ($intent?->provider === 'midtrans' && $attempt) {
+            $instruction = app(MidtransPaymentService::class)->response($booking, $intent, $attempt)['instruction'];
         }
         $contract = $this->bookingContract($booking);
         if (! $contract['can_pay'] && $capabilities['can_pay']) {

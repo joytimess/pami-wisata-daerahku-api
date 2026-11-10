@@ -61,7 +61,7 @@ class BookingRefundService
                 throw new BookingException('A refund request is already open for this booking.', 'refund_already_requested', ['refund_guid' => $active->guid]);
             }
             $intent = DB::table('payment_intents')->where('booking_guid', $guid)->where('provider', 'doku')->lockForUpdate()->first();
-            if (! $intent || $intent->applied_attempt_guid === null || $booking->status !== 'confirmed' || $this->payments->status($booking) !== 'paid') {
+            if (! $intent || $intent->applied_attempt_guid === null || $booking->status !== 'confirmed' || $this->payments->entitlement($booking) !== 'paid') {
                 throw new BookingException('This booking has no verified payment that can be refunded.', 'refund_not_available');
             }
             if ($this->usedAdmission($guid)) {
@@ -105,7 +105,7 @@ class BookingRefundService
             $note = isset($input['note']) ? trim((string) $input['note']) : null;
             if ($input['decision'] === 'reject') {
                 $this->move($request, 'rejected', $actor->guid, $note, ['active' => null, 'decided_by_user_guid' => $actor->guid, 'decided_at' => now(), 'decision_note' => $note]);
-            } elseif ($this->usedAdmission($bookingGuid) || $this->payments->status($booking) !== 'paid' || $booking->status !== 'confirmed'
+            } elseif ($this->usedAdmission($bookingGuid) || $this->payments->entitlement($booking) !== 'paid' || $booking->status !== 'confirmed'
                 || DB::table('booking_refund_requests')->where('booking_guid', $bookingGuid)->whereIn('status', self::SETTLED_STATUSES)->exists()) {
                 $this->move($request, 'needs_review', $actor->guid, $note, ['review_reason' => 'usage_or_payment_changed', 'decided_by_user_guid' => $actor->guid, 'decided_at' => now()]);
             } else {
@@ -159,7 +159,7 @@ class BookingRefundService
 
                 return ['blocked' => 'ticket_already_used'];
             }
-            if ($this->payments->status($booking) !== 'paid') {
+            if ($this->payments->entitlement($booking) !== 'paid') {
                 throw new BookingException('The payment was already adjusted by the provider; verify before settling manually.', 'refund_payment_changed');
             }
             if ((int) $input['settlement_amount'] !== (int) $request->amount) {
