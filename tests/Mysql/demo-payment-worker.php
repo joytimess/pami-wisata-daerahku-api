@@ -10,8 +10,10 @@ require __DIR__.'/../../vendor/autoload.php';
 $app = require __DIR__.'/../../bootstrap/app.php';
 $app->make(Kernel::class)->bootstrap();
 
-if (! env('MYSQL_CONCURRENCY_TESTS') || config('database.default') !== 'mysql'
-    || ! preg_match('/^pami_phase1b_demo_[a-z0-9]{12}_test$/D', (string) config('database.connections.mysql.database'))) {
+require_once __DIR__.'/DisposableMysqlGuard.php';
+try {
+    assertDisposableMysqlAccount(config('database.connections.mysql'), (string) getenv('DB_DATABASE'));
+} catch (RuntimeException) {
     exit(2);
 }
 config(['operations.demo_payments_enabled' => true, 'operations.doku_enabled' => false]);

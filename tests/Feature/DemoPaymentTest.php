@@ -111,7 +111,7 @@ it('labels demo read contracts and closes can pay after success or when the gate
     $this->getJson($path, $headers)->assertOk()->assertJsonPath('data.payment_status', 'paid')->assertJsonPath('data.can_pay', false);
     config(['operations.demo_payments_enabled' => false]);
     $this->getJson($path, $headers)->assertOk()->assertJsonPath('data.provider', 'demo')->assertJsonPath('data.label', 'DEMO')
-        ->assertJsonPath('data.test_only', true)->assertJsonPath('data.can_pay', false)->assertJsonPath('data.payment_status', 'unverified')
+        ->assertJsonPath('data.test_only', true)->assertJsonPath('data.can_pay', false)->assertJsonPath('data.payment_status', 'paid')
         ->assertJsonPath('data.instruction.presentation_type', 'unavailable');
 });
 
@@ -329,7 +329,7 @@ it('uses the real demo ledger for H5 QR and local visit day check in then fails 
     $otherTicket = DB::table('booking_tickets')->where('booking_guid', $booking->guid)->orderByDesc('sequence')->first();
     $otherPayload = Crypt::decryptString($otherTicket->qr_token_encrypted);
     config(['operations.demo_payments_enabled' => false]);
-    $this->getJson($path, bearer($owner))->assertOk()->assertJsonPath('data.payment_status', 'unverified');
+    $this->getJson($path, bearer($owner))->assertOk()->assertJsonPath('data.payment_status', 'paid')->assertJsonPath('data.entitlement', 'unverified');
     $this->get('/api/v1/bookings/'.$booking->guid.'/tickets/'.$otherTicket->guid.'/qr', bearer($owner))->assertConflict();
     $this->postJson('/api/v1/admin/ticket-check-ins/preview', ['qr_payload' => $otherPayload], bearer($staff))->assertConflict();
     config(['operations.demo_payments_enabled' => true]);

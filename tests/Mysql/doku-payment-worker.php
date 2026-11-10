@@ -14,13 +14,11 @@ use Illuminate\Support\Facades\Http;
 require __DIR__.'/../../vendor/autoload.php';
 $app = require __DIR__.'/../../bootstrap/app.php';
 $app->make(Kernel::class)->bootstrap();
-if (! env('MYSQL_CONCURRENCY_TESTS') || config('database.default') !== 'mysql'
-    || config('database.connections.mysql.url') || config('database.connections.mysql.read') || config('database.connections.mysql.write')
-    || app()->configurationIsCached()
-    || ! preg_match('/^pami_doku_[a-z0-9]{12}_test$/D', (string) config('database.connections.mysql.database'))) {
-    exit(2);
-}
-if (DB::selectOne('SELECT DATABASE() AS db')->db !== config('database.connections.mysql.database')) {
+
+require_once __DIR__.'/DisposableMysqlGuard.php';
+try {
+    assertDisposableMysqlAccount(config('database.connections.mysql'), (string) getenv('DB_DATABASE'));
+} catch (RuntimeException) {
     exit(2);
 }
 [, $ready, $go, $json, $resultFile, $calls] = $argv;

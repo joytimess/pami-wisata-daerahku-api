@@ -14,29 +14,28 @@ use Symfony\Component\Process\Process;
 /** Each case owns a disposable database; the configured database is never migrated. */
 function withPaymentFoundationMysql(Closure $test): void
 {
-    if (! env('MYSQL_CONCURRENCY_TESTS') || config('database.default') !== 'mysql'
-        || ! str_ends_with((string) config('database.connections.mysql.database'), '_test')) {
+    if (! env('MYSQL_CONCURRENCY_TESTS')) {
         test()->markTestSkipped('Requires dedicated MySQL test configuration.');
     }
     $original = config('database.connections.mysql');
-    if (! empty($original['url']) || isset($original['read']) || isset($original['write']) || app()->configurationIsCached()) {
-        throw new RuntimeException('Disposable MySQL tests reject URL, replica overrides and cached configuration.');
-    }
     assertDisposableMysqlAccount($original);
-    $database = 'pami_phase1b_'.strtolower(Str::random(12)).'_test';
-    DB::statement('CREATE DATABASE `'.$database.'`');
+    $database = 'pami_payment_'.strtolower(Str::random(12)).'_test';
+    if (! DB::statement('CREATE DATABASE `'.$database.'`')) {
+        throw new RuntimeException('Could not create disposable MySQL database.');
+    }
     try {
         config(['database.connections.mysql.database' => $database]);
         DB::purge('mysql');
-        expect(DB::selectOne('SELECT DATABASE() AS db')->db)->toBe($database);
+        assertDisposableMysqlAccount(config('database.connections.mysql'), $database);
         expect(DB::select('SHOW TABLES'))->toBeEmpty();
         expect(Artisan::call('migrate', ['--force' => true, '--no-interaction' => true]))->toBe(0);
         $test($original, $database);
     } finally {
         config(['database.connections.mysql' => $original]);
         DB::purge('mysql');
-        if (preg_match('/^pami_phase1b_[a-z0-9]{12}_test$/D', $database)) {
-            DB::statement('DROP DATABASE `'.$database.'`');
+        if (preg_match('/^pami_payment_[a-z0-9]{12}_test$/D', $database)) {
+            assertDisposableMysqlAccount($original);
+            expect(DB::statement('DROP DATABASE `'.$database.'`'))->toBeTrue();
             expect((int) DB::selectOne('SELECT COUNT(*) AS total FROM information_schema.schemata WHERE schema_name = ?', [$database])->total)->toBe(0);
         }
     }

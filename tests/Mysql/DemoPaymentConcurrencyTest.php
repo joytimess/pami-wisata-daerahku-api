@@ -1,5 +1,7 @@
 <?php
 
+require_once __DIR__.'/DisposableMysqlGuard.php';
+
 use App\Services\BookingService;
 use App\Services\DemoPaymentService;
 use App\Services\FinancialAnalyticsService;
@@ -11,23 +13,29 @@ use Symfony\Component\Process\Process;
 
 function withDemoMysql(Closure $test): void
 {
-    if (! env('MYSQL_CONCURRENCY_TESTS') || config('database.default') !== 'mysql'
-        || ! str_ends_with((string) config('database.connections.mysql.database'), '_test')) {
+    if (! env('MYSQL_CONCURRENCY_TESTS')) {
         test()->markTestSkipped('Requires isolated MySQL test configuration.');
     }
     $original = config('database.connections.mysql');
-    $database = 'pami_phase1b_demo_'.strtolower(Str::random(12)).'_test';
-    DB::statement('CREATE DATABASE `'.$database.'`');
+    assertDisposableMysqlAccount($original);
+    $database = 'pami_payment_'.strtolower(Str::random(12)).'_test';
+    if (! DB::statement('CREATE DATABASE `'.$database.'`')) {
+        throw new RuntimeException('Could not create disposable MySQL database.');
+    }
     try {
         config(['database.connections.mysql.database' => $database, 'operations.demo_payments_enabled' => true]);
         DB::purge('mysql');
+        assertDisposableMysqlAccount(config('database.connections.mysql'), $database);
+        expect(DB::select('SHOW TABLES'))->toBeEmpty();
         expect(Artisan::call('migrate', ['--force' => true, '--no-interaction' => true]))->toBe(0);
         $test($original, $database);
     } finally {
         config(['database.connections.mysql' => $original]);
         DB::purge('mysql');
-        if (preg_match('/^pami_phase1b_demo_[a-z0-9]{12}_test$/D', $database)) {
-            DB::statement('DROP DATABASE `'.$database.'`');
+        if (preg_match('/^pami_payment_[a-z0-9]{12}_test$/D', $database)) {
+            assertDisposableMysqlAccount($original);
+            expect(DB::statement('DROP DATABASE `'.$database.'`'))->toBeTrue();
+            expect((int) DB::selectOne('SELECT COUNT(*) AS total FROM information_schema.schemata WHERE schema_name = ?', [$database])->total)->toBe(0);
         }
     }
 }

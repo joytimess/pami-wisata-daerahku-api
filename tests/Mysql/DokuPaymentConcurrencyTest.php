@@ -13,29 +13,28 @@ use Symfony\Component\Process\Process;
 
 function withDokuMysql(Closure $test): void
 {
-    if (! env('MYSQL_CONCURRENCY_TESTS') || config('database.default') !== 'mysql'
-        || ! str_ends_with((string) config('database.connections.mysql.database'), '_test')) {
+    if (! env('MYSQL_CONCURRENCY_TESTS')) {
         test()->markTestSkipped('Requires isolated MySQL test configuration.');
     }
     $original = config('database.connections.mysql');
-    if (! empty($original['url']) || isset($original['read']) || isset($original['write']) || app()->configurationIsCached()) {
-        throw new RuntimeException('Disposable MySQL tests reject URL, replica overrides and cached configuration.');
-    }
     assertDisposableMysqlAccount($original);
-    $database = 'pami_doku_'.strtolower(Str::random(12)).'_test';
-    DB::statement('CREATE DATABASE `'.$database.'`');
+    $database = 'pami_payment_'.strtolower(Str::random(12)).'_test';
+    if (! DB::statement('CREATE DATABASE `'.$database.'`')) {
+        throw new RuntimeException('Could not create disposable MySQL database.');
+    }
     try {
         config(['database.connections.mysql.database' => $database, 'operations.demo_payments_enabled' => false, 'doku.environment' => 'sandbox']);
         DB::purge('mysql');
-        expect(DB::selectOne('SELECT DATABASE() AS db')->db)->toBe($database);
+        assertDisposableMysqlAccount(config('database.connections.mysql'), $database);
         expect(DB::select('SHOW TABLES'))->toBeEmpty();
         expect(Artisan::call('migrate', ['--force' => true, '--no-interaction' => true]))->toBe(0);
         $test($original, $database);
     } finally {
         config(['database.connections.mysql' => $original]);
         DB::purge('mysql');
-        if (preg_match('/^pami_doku_[a-z0-9]{12}_test$/D', $database)) {
-            DB::statement('DROP DATABASE `'.$database.'`');
+        if (preg_match('/^pami_payment_[a-z0-9]{12}_test$/D', $database)) {
+            assertDisposableMysqlAccount($original);
+            expect(DB::statement('DROP DATABASE `'.$database.'`'))->toBeTrue();
             expect((int) DB::selectOne('SELECT COUNT(*) AS total FROM information_schema.schemata WHERE schema_name = ?', [$database])->total)->toBe(0);
         }
     }
@@ -263,13 +262,24 @@ it('settles a manual refund exactly once under concurrent calls and revokes unus
         $settle = fn (string $reference) => ['action' => 'refund_settle', 'user_guid' => $admin->guid, 'booking_guid' => $booking->guid, 'refund_guid' => $refund,
             'input' => ['settlement_method' => 'bank_transfer', 'settlement_reference' => $reference, 'settlement_amount' => $amount,
                 'settled_at' => now()->toIso8601String(), 'evidence_note' => 'Bukti transfer diperiksa dan cocok']];
+        $references = ['TRX-RACE-0001', 'TRX-RACE-0001', 'TRX-RACE-0002'];
 
-        $run = runDokuWorkers([$settle('TRX-RACE-0001'), $settle('TRX-RACE-0001'), $settle('TRX-RACE-0002')], $connection, $database);
+        $run = runDokuWorkers(array_map($settle, $references), $connection, $database);
 
-        expect(collect($run['results'])->where('ok', true)->count())->toBe(1);
-        expect(collect($run['results'])->where('ok', false)->pluck('code')->unique()->all())->toBe(['refund_not_settleable']);
         $row = DB::table('booking_refund_requests')->where('guid', $refund)->first();
         expect($row->status)->toBe('manual_refunded')->and($row->active)->toBeNull()->and($row->refund_channel)->toBe('manual');
+        // Exactly one reference won the race. A retry carrying that same reference is an idempotent acknowledgement (ok), never a second
+        // settlement; every call with a different reference is rejected. Acknowledgements and financial effects are asserted separately below.
+        $winningReference = $row->settlement_reference;
+        expect($winningReference)->toBeIn(['TRX-RACE-0001', 'TRX-RACE-0002']);
+        foreach ($run['results'] as $index => $result) {
+            if ($references[$index] === $winningReference) {
+                expect($result['ok'])->toBeTrue();
+            } else {
+                expect($result)->toMatchArray(['ok' => false, 'code' => 'refund_not_settleable']);
+            }
+        }
+        expect(collect($run['results'])->where('ok', true)->count())->toBe(count(array_keys($references, $winningReference, true)));
         expect(DB::table('booking_refund_request_events')->where('refund_request_guid', $refund)->where('to_status', 'manual_refunded')->count())->toBe(1);
         expect(DB::table('booking_tickets')->where('booking_guid', $booking->guid)->whereNotNull('qr_token_hash')->whereNull('qr_revoked_at')->count())->toBe(0);
         expect(DB::table('booking_refund_requests')->whereNotNull('settlement_reference')->count())->toBe(1);
