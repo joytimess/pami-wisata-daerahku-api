@@ -22,7 +22,7 @@ use Illuminate\Support\Str;
 if (! function_exists('mtxConfig')) {
     function mtxConfig(array $override = []): void
     {
-        config(['operations.demo_payments_enabled' => false, 'doku.enabled' => false, 'midtrans' => array_replace_recursive([
+        config(['operations.demo_payments_enabled' => false, 'midtrans' => array_replace_recursive([
             'enabled' => true, 'environment' => 'sandbox', 'server_key' => 'SB-Mid-server-FIXTURE0000000000', 'merchant_id' => 'G000000001',
             'channels' => ['va_bca', 'va_bni', 'qris'], 'verified_channels' => [], 'production_approved' => false,
             'base_urls' => ['sandbox' => 'https://api.sandbox.midtrans.com', 'production' => 'https://api.midtrans.com'],

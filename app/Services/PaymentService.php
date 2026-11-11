@@ -71,10 +71,8 @@ class PaymentService
             $capabilities = array_replace($capabilities, ['provider' => $intent->provider, 'environment' => $intent->environment,
                 'test_only' => $intent->environment !== 'production', 'label' => strtoupper($intent->environment)]);
         }
+        // Historical DOKU attempts are read-only ledger data and never present a payable instruction.
         $instruction = ['presentation_type' => $intent?->provider === 'demo' && $this->gateway->demoEnabled() ? 'demo_simulator' : 'unavailable'];
-        if ($intent?->provider === 'doku' && $attempt) {
-            $instruction = app(DokuPaymentService::class)->response($booking, $intent, $attempt)['instruction'];
-        }
         if ($intent?->provider === 'midtrans' && $attempt) {
             $instruction = app(MidtransPaymentService::class)->response($booking, $intent, $attempt)['instruction'];
         }
@@ -177,7 +175,7 @@ class PaymentService
     public function instructionExpiresAt(object $booking, CarbonImmutable $startedAt): CarbonImmutable
     {
         $deadline = $booking->payment_expires_at ?? $startedAt;
-        // Midtrans attempts share the booking's one absolute deadline; the legacy 30 minute per-attempt window applies to DOKU only.
+        // Midtrans attempts share the booking's one absolute deadline; DEMO keeps its legacy 30 minute per-attempt window.
         $window = $this->gateway->activeProvider() === 'midtrans' ? CarbonImmutable::parse($deadline, 'UTC') : $startedAt->addMinutes(30)->min($deadline);
 
         return $window->min(BookingRules::visitStart($booking->visit_date, $booking->destination_timezone_snapshot ?? $booking->destination_timezone));

@@ -1,7 +1,6 @@
 <?php
 
 use App\Http\Controllers\AppLinkController;
-use App\Http\Controllers\PaymentReturnController;
 use App\Http\Controllers\TicketLinkController;
 use Illuminate\Cookie\Middleware\AddQueuedCookiesToResponse;
 use Illuminate\Cookie\Middleware\EncryptCookies;
@@ -14,10 +13,9 @@ Route::get('/', function () {
     return view('welcome');
 });
 
-// Stateless public pages: no session, cookies or CSRF, so a wallet redirect never creates server state.
+// Stateless public pages: no session, cookies or CSRF, so an app link never creates server state.
 Route::withoutMiddleware([StartSession::class, ShareErrorsFromSession::class, PreventRequestForgery::class, EncryptCookies::class, AddQueuedCookiesToResponse::class])
     ->group(function () {
-        Route::get('/payment/return', PaymentReturnController::class)->middleware('throttle:120,1')->name('payment.return');
         Route::get('/tickets/{booking}', TicketLinkController::class)->whereUuid('booking')->middleware('throttle:120,1')->name('tickets.link');
         Route::get('/.well-known/assetlinks.json', AppLinkController::class)->name('app-links.assetlinks');
     });

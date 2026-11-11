@@ -44,7 +44,7 @@ return Application::configure(basePath: dirname(__DIR__))
                 ->header('Cache-Control', 'private, no-store');
         });
         $exceptions->render(function (Throwable $exception, Request $request) {
-            if (! $request->is('api/v1/admin/dashboard/*', 'api/v1/admin/approval-queue', 'api/v1/admin/bookings/*/claim', 'api/v1/admin/bookings/*/release', 'api/v1/admin/bookings/*/payment-intent', 'api/v1/superadmin/bookings/*/reassign', 'api/v1/bookings/*/payment-preview', 'api/v1/bookings/*/payment-intent', 'api/v1/bookings/*/payment-attempts', 'api/v1/bookings/*/payment-attempts/*', 'api/v1/webhooks/doku/*', 'api/v1/webhooks/midtrans', 'api/v1/bookings/*/demo-payment', 'api/v1/bookings/*/demo-payment/*', 'api/v1/payments/*') || $exception instanceof BookingException) {
+            if (! $request->is('api/v1/admin/dashboard/*', 'api/v1/admin/approval-queue', 'api/v1/admin/bookings/*/claim', 'api/v1/admin/bookings/*/release', 'api/v1/admin/bookings/*/payment-intent', 'api/v1/superadmin/bookings/*/reassign', 'api/v1/bookings/*/payment-preview', 'api/v1/bookings/*/payment-intent', 'api/v1/bookings/*/payment-attempts', 'api/v1/bookings/*/payment-attempts/*', 'api/v1/webhooks/midtrans', 'api/v1/bookings/*/demo-payment', 'api/v1/bookings/*/demo-payment/*', 'api/v1/payments/*') || $exception instanceof BookingException) {
                 return null;
             }
             if ($exception instanceof ValidationException) {

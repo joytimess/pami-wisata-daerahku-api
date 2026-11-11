@@ -10,7 +10,6 @@ use App\Http\Controllers\Api\V1\BookingDocumentController;
 use App\Http\Controllers\Api\V1\BookingRefundController;
 use App\Http\Controllers\Api\V1\CategoryController;
 use App\Http\Controllers\Api\V1\DestinationController;
-use App\Http\Controllers\Api\V1\DokuWebhookController;
 use App\Http\Controllers\Api\V1\FacilityController;
 use App\Http\Controllers\Api\V1\FavoriteController;
 use App\Http\Controllers\Api\V1\FinancialDashboardController;
@@ -26,7 +25,6 @@ use App\Http\Controllers\Api\V1\TicketCheckInController;
 use App\Http\Controllers\Api\V1\TicketController;
 use App\Http\Controllers\Api\V1\VisitController;
 use App\Http\Middleware\AuthenticateApiToken;
-use App\Http\Middleware\ObserveDokuWebhook;
 use App\Http\Middleware\ThrottlePasswordReset;
 use Illuminate\Support\Facades\Route;
 
@@ -40,14 +38,13 @@ use Illuminate\Support\Facades\Route;
 | See docs/API-ROUTES.md for the endpoint inventory and conventions.
 */
 Route::prefix('v1')->group(function () {
-    Route::post('webhooks/doku/va', DokuWebhookController::class)->middleware([ObserveDokuWebhook::class, 'throttle:300,1'])->name('payments.doku.webhook');
     Route::post('webhooks/midtrans', MidtransWebhookController::class)->middleware('throttle:300,1')->name('payments.midtrans.webhook');
     Route::middleware(AuthenticateApiToken::class)->group(function () {
-        Route::post('bookings/{booking}/payment-attempts', [PaymentController::class, 'initiate'])->middleware('throttle:30,1')->name('payments.doku.initiate');
+        Route::post('bookings/{booking}/payment-attempts', [PaymentController::class, 'initiate'])->middleware('throttle:30,1')->name('payments.initiate');
         Route::post('bookings/{booking}/payment-attempts/{attempt}/refresh', [PaymentController::class, 'refresh'])->whereUuid('attempt')
-            ->middleware('throttle:20,1')->name('payments.doku.refresh');
+            ->middleware('throttle:20,1')->name('payments.refresh');
         Route::get('bookings/{booking}/payment-attempts/{attempt}/qr', [PaymentController::class, 'qrisImage'])->whereUuid('attempt')
-            ->middleware('throttle:60,1')->name('payments.doku.qr');
+            ->middleware('throttle:60,1')->name('payments.qr');
         Route::get('payments/methods', [PaymentController::class, 'methods'])->middleware('throttle:60,1');
         Route::get('bookings/{booking}/payment-intent', [PaymentController::class, 'show'])->middleware('throttle:60,1');
         Route::get('admin/bookings/{booking}/payment-intent', [PaymentController::class, 'adminShow'])->middleware('throttle:60,1');

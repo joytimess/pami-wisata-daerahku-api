@@ -21,7 +21,6 @@ try {
 
 [, $ready, $go, $json, $resultFile] = $argv;
 $job = json_decode($json, true, flags: JSON_THROW_ON_ERROR);
-config(['operations.doku_enabled' => false]);
 Http::preventStrayRequests();
 touch($ready);
 $deadline = microtime(true) + 25;

@@ -2,7 +2,6 @@
 
 use App\Exceptions\BookingException;
 use App\Services\BookingService;
-use App\Services\Doku\DokuClient;
 use App\Services\PaymentEligibility;
 use App\Services\PaymentService;
 use App\Support\PaymentStates;
@@ -17,7 +16,7 @@ uses(RefreshDatabase::class);
 
 beforeEach(function () {
     $this->freezeTime();
-    config(['operations.demo_payments_enabled' => false, 'doku.enabled' => false]);
+    config(['operations.demo_payments_enabled' => false]);
 });
 
 function foundationBooking(int $price = 15000): array
@@ -77,13 +76,12 @@ it('keeps methods and status read only using server amounts even when client val
     $historyCount = DB::table('booking_status_histories')->count();
     Http::preventStrayRequests();
     Http::fake();
-    config(['operations.doku_enabled' => true]);
 
     $this->getJson('/api/v1/payments/methods?booking_guid='.$guid.'&amount=1&currency=USD&payment_status=paid', $headers)
         ->assertOk()->assertJsonPath('data.amount', 30000)->assertJsonPath('data.currency', 'IDR')
         ->assertJsonPath('data.can_pay', false)->assertJsonPath('data.payment_status', 'unverified')
-        ->assertJsonCount(3, 'data.methods')->assertJsonPath('data.methods.0.available', false)
-        ->assertJsonPath('data.methods.1.available', false)->assertJsonPath('data.methods.2.available', false)
+        ->assertJsonCount(2, 'data.methods')->assertJsonPath('data.methods.0.available', false)
+        ->assertJsonPath('data.methods.1.available', false)
         ->assertHeader('Cache-Control', 'no-store, private');
     $this->getJson('/api/v1/bookings/'.$guid.'/payment-intent?status=paid', $headers)
         ->assertOk()->assertJsonPath('data.intent_guid', null)->assertJsonPath('data.status', 'not_created')
@@ -102,9 +100,6 @@ it('keeps methods and status read only using server amounts even when client val
 
 it('disables nested channels with their parent booking and exposes only persisted invoice data', function () {
     [$owner, $guid] = foundationBooking();
-    $client = Mockery::mock(DokuClient::class)->makePartial();
-    $client->shouldReceive('readinessReason')->andReturn(null);
-    app()->instance(DokuClient::class, $client);
 
     $this->getJson('/api/v1/payments/methods?booking_guid='.$guid, bearer($owner))->assertOk()
         ->assertJsonPath('data.methods.1.available', false)->assertJsonPath('data.methods.1.channels.0.available', false)
@@ -114,19 +109,19 @@ it('disables nested channels with their parent booking and exposes only persiste
     $this->assertDatabaseCount('invoices', 0);
 });
 
-it('keeps the one hour DOKU cutoff and expires an untouched booking while releasing its quota', function () {
+it('keeps the 15 minute cutoff without falling back to DOKU and expires an untouched booking while releasing its quota', function () {
     [$owner, $guid, $destination, $date] = foundationBooking();
     $service = app(BookingService::class);
     $service->decide(makeUser(2), $guid, true);
     $headers = bearer($owner);
     $before = DB::table('bookings')->where('guid', $guid)->first();
-    expect($before->payment_expires_at)->toBe(now()->addHour()->format('Y-m-d H:i:s'));
-    expect($before->notification_grace_expires_at)->toBe(now()->addMinutes(75)->format('Y-m-d H:i:s'));
+    expect($before->payment_expires_at)->toBe(now()->addMinutes(15)->format('Y-m-d H:i:s'));
+    expect($before->notification_grace_expires_at)->toBe(now()->addMinutes(30)->format('Y-m-d H:i:s'));
 
-    $this->travel(59)->minutes();
+    $this->travel(14)->minutes();
     $service->expireDue();
     $this->getJson('/api/v1/bookings/'.$guid.'/payment-intent', $headers)->assertOk()
-        ->assertJsonPath('data.booking_status', 'awaiting_payment')->assertJsonPath('data.reason', 'doku_not_configured');
+        ->assertJsonPath('data.booking_status', 'awaiting_payment')->assertJsonPath('data.provider', 'midtrans')->assertJsonPath('data.reason', 'midtrans_disabled');
     $this->travel(1)->minutes();
     $this->getJson('/api/v1/bookings/'.$guid.'/payment-intent', $headers)->assertOk()->assertJsonPath('data.reason', 'payment_window_closed');
     $service->expireDue();
@@ -144,7 +139,8 @@ it('holds the quota of a booking with an unresolved legacy attempt through verif
     foundationLedger($guid);
     $before = DB::table('bookings')->where('guid', $guid)->first();
 
-    $this->travel(59)->minutes();
+    // Approval now always uses the 15 minute deadline (DOKU can no longer be the active gateway); the legacy attempt still holds the quota.
+    $this->travel(14)->minutes();
     $service->expireDue();
     $this->getJson('/api/v1/bookings/'.$guid.'/payment-intent', bearer($owner))->assertOk()->assertJsonPath('data.booking_status', 'awaiting_payment');
     $this->travel(1)->minutes();

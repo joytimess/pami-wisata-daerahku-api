@@ -3,7 +3,6 @@
 use App\Exceptions\BookingException;
 use App\Services\BookingRefundService;
 use App\Services\BookingService;
-use App\Services\Doku\DokuClient;
 use App\Services\FinancialAnalyticsService;
 use App\Services\PaymentEligibility;
 use App\Services\PaymentReceiptService;
@@ -181,9 +180,8 @@ function historicalPendingPayment(string $provider = 'midtrans'): array
     return $fixture;
 }
 
-it('applies a bound capture once without resolving DOKU transport or active channel configuration', function (string $provider) {
+it('applies a bound capture once without any provider transport or active channel configuration', function (string $provider) {
     [, $booking, $intent, $attempt, $event] = historicalPendingPayment($provider);
-    app()->bind(DokuClient::class, fn () => throw new RuntimeException('Transport must not be resolved'));
     $settlements = app(PaymentSettlementService::class);
 
     $settlements->apply($event);

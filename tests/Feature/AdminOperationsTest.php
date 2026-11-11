@@ -121,7 +121,6 @@ it('keeps payment preview gated owner scoped and read only without QR or gateway
     expect(DB::table('booking_status_histories')->count())->toBe($count);
     expect(DB::table('booking_tickets')->whereNotNull('qr_token_hash')->count())->toBe(0);
     expect(app(PaymentEligibility::class)->status($before))->toBe('unverified');
-    expect(config('operations.doku_enabled'))->toBeFalse();
 });
 
 it('hides revoked admin inbox entries and cancels their queued deliveries', function () {

@@ -16,7 +16,7 @@ try {
 } catch (RuntimeException) {
     exit(2);
 }
-config(['operations.demo_payments_enabled' => true, 'operations.doku_enabled' => false]);
+config(['operations.demo_payments_enabled' => true]);
 Http::preventStrayRequests();
 [, $ready, $go, $json, $resultFile] = $argv;
 $job = json_decode($json, true, flags: JSON_THROW_ON_ERROR);

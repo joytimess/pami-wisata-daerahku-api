@@ -34,13 +34,13 @@ function hardeningBookingTimes(object $booking): array
     return [$approved, CarbonImmutable::parse($row->payment_expires_at, 'UTC'), CarbonImmutable::parse($row->notification_grace_expires_at, 'UTC')];
 }
 
-it('keeps the historical one hour approval window and grace when DOKU is the active gateway', function () {
+it('keeps the 900 second Midtrans deadline while Midtrans is disabled instead of the legacy DOKU hour', function () {
     config(['operations.demo_payments_enabled' => false, 'midtrans.enabled' => false]);
 
     [, $booking] = mtxPayable();
 
     [$approved, $deadline, $grace] = hardeningBookingTimes($booking);
-    expect($deadline->equalTo($approved->addSeconds(3600)))->toBeTrue()->and($grace->equalTo($approved->addSeconds(3600 + 900)))->toBeTrue();
+    expect($deadline->equalTo($approved->addSeconds(900)))->toBeTrue()->and($grace->equalTo($approved->addSeconds(900 + 900)))->toBeTrue();
 });
 
 it('keeps the historical one hour approval window and grace when DEMO is the active gateway', function () {

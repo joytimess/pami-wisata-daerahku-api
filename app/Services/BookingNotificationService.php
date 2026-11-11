@@ -17,8 +17,7 @@ class BookingNotificationService
             'expired' => ['Booking kedaluwarsa', 'Booking Anda telah kedaluwarsa.', false],
             'payment_review' => ['Pembayaran perlu ditinjau', 'Status pembayaran booking perlu ditinjau.', true],
             'demo_paid' => ['DEMO pembayaran berhasil', 'Simulasi DEMO berhasil. Tidak ada pembayaran uang nyata.', false],
-            'sandbox_paid' => ['SANDBOX pembayaran terverifikasi', 'Pembayaran uji DOKU terverifikasi. Tidak ada dana Production.', false],
-            'doku_paid' => ['Pembayaran terverifikasi', 'Pembayaran booking Anda telah terverifikasi.', false],
+            'sandbox_paid' => ['SANDBOX pembayaran terverifikasi', 'Pembayaran uji terverifikasi. Tidak ada dana Production.', false],
         };
         $users = $admin
             ? DB::table('users')->where('status', 'active')->where(fn ($users) => $users->where('role', 2)->orWhere(fn ($users) => $users->where('role', 1)

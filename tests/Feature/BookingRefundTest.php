@@ -4,8 +4,7 @@ use App\Models\Destination;
 use App\Models\User;
 use App\Services\BookingRefundService;
 use App\Services\BookingService;
-use App\Services\Doku\DokuClient;
-use App\Services\DokuPaymentService;
+use App\Services\PaymentSettlementService;
 use App\Services\TicketService;
 use Carbon\CarbonImmutable;
 use Illuminate\Foundation\Testing\RefreshDatabase;
@@ -18,7 +17,7 @@ uses(RefreshDatabase::class);
 
 beforeEach(function () {
     $this->travelTo(CarbonImmutable::parse('2026-11-08 08:00:00', 'UTC'));
-    config(['operations.demo_payments_enabled' => false, 'doku.environment' => 'sandbox', 'doku.verified_channels' => ['va_bni']]);
+    config(['operations.demo_payments_enabled' => false]);
     Http::preventStrayRequests();
 });
 
@@ -30,17 +29,17 @@ function refundPaidBooking(bool $pay = true): array
     $booking = app(BookingService::class)->create($owner, bookingPayload($destination, $date, 2) + ['idempotency_key' => (string) Str::uuid()]);
     app(BookingService::class)->decide(makeUser(2), $booking->guid, true);
     $booking = app(TicketService::class)->booking($booking->guid);
-    $client = Mockery::mock(DokuClient::class)->makePartial();
-    $client->shouldReceive('readinessReason')->andReturn(null);
-    $client->shouldReceive('configured')->andReturn(true);
-    $client->shouldReceive('environment')->andReturn('sandbox');
-    $client->shouldReceive('expiryWindowReason')->andReturn(null);
-    $client->shouldReceive('create')->andReturnUsing(fn (object $attempt) => ['status' => 'pending', 'provider_reference' => '98812'.random_int(1000000, 9999999),
-        'expires_at' => $attempt->instruction_expires_at, 'instruction' => ['presentation_type' => 'virtual_account', 'bank_code' => 'bni',
-            'va_number' => '988123456789', 'copyable' => true, '_provider' => ['partner_service_id' => '988', 'customer_no' => '123456789']]]);
-    app()->instance(DokuClient::class, $client);
-    $attempt = test()->postJson('/api/v1/bookings/'.$booking->guid.'/payment-attempts', ['method_code' => 'virtual_account', 'channel' => 'bni'],
-        bearer($owner) + ['Idempotency-Key' => 'start'])->assertOk()->json('data.attempt_guid');
+    // A persisted historical DOKU Sandbox VA attempt: the ledger stays readable and refundable without any DOKU transport.
+    $intent = (string) Str::uuid();
+    $attempt = (string) Str::uuid();
+    DB::table('payment_intents')->insert(['guid' => $intent, 'booking_guid' => $booking->guid, 'provider' => 'doku', 'environment' => 'sandbox',
+        'currency' => 'IDR', 'amount' => (int) $booking->total_amount, 'status' => 'processing', 'merchant_reference' => (string) Str::uuid(),
+        'expires_at' => $booking->payment_expires_at, 'created_at' => now(), 'updated_at' => now()]);
+    DB::table('payment_attempts')->insert(['guid' => $attempt, 'payment_intent_guid' => $intent, 'provider' => 'doku', 'environment' => 'sandbox',
+        'attempt_number' => 1, 'method' => 'virtual_account', 'channel' => 'bni', 'merchant_reference' => (string) Str::uuid(),
+        'provider_request_id' => (string) Str::uuid(), 'provider_reference' => '98812'.random_int(1000000, 9999999), 'request_hash' => str_repeat('a', 64),
+        'amount' => (int) $booking->total_amount, 'currency' => 'IDR', 'status' => 'pending', 'presentation_type' => 'virtual_account',
+        'instruction_expires_at' => $booking->payment_expires_at, 'started_at' => now(), 'created_at' => now(), 'updated_at' => now()]);
     if ($pay) {
         refundEvent($attempt, 'paid');
     }
@@ -48,12 +47,27 @@ function refundPaidBooking(bool $pay = true): array
     return [$owner, $booking, $attempt, $destination];
 }
 
+/** Records one verified provider outcome for the attempt and applies it through the shared, provider-neutral settlement. */
 function refundEvent(string $attemptGuid, string $status, array $overrides = []): void
 {
     $attempt = DB::table('payment_attempts')->where('guid', $attemptGuid)->first();
-    app(DokuPaymentService::class)->receive(array_replace(['status' => $status, 'merchant_reference' => $attempt->merchant_reference,
-        'provider_reference' => $attempt->provider_reference, 'amount' => (int) $attempt->amount, 'currency' => $attempt->currency,
-        'occurred_at' => now()->toIso8601String(), 'event_key' => $status.'-'.$attemptGuid, 'payload_hash' => hash('sha256', $status.'-'.$attemptGuid)], $overrides));
+    $occurredAt = CarbonImmutable::parse($overrides['occurred_at'] ?? now()->toIso8601String())->utc();
+    $amount = (int) ($overrides['amount'] ?? $attempt->amount);
+    $key = $status.'-'.$attemptGuid;
+    if (DB::table('payment_events')->where('provider', $attempt->provider)->where('provider_event_key', $key)->exists()) {
+        return; // A replayed provider event is recorded once.
+    }
+    $guid = (string) Str::uuid();
+    DB::table('payment_events')->insert(['guid' => $guid, 'payment_intent_guid' => $attempt->payment_intent_guid, 'payment_attempt_guid' => $attempt->guid,
+        'provider' => $attempt->provider, 'environment' => $attempt->environment, 'provider_event_key' => $key, 'payload_hash' => hash('sha256', $key),
+        'verification' => 'verified', 'event_type' => match ($status) {
+            'paid' => 'capture', 'refunded' => 'refund', default => 'reversal'
+        },
+        'disposition' => 'recorded', 'amount' => $amount, 'currency' => $attempt->currency, 'provider_occurred_at' => $occurredAt, 'received_at' => now(),
+        'metadata' => json_encode(['source' => 'historical_verified_ledger', 'outcome' => ['status' => $status, 'merchant_reference' => $attempt->merchant_reference,
+            'provider_reference' => $attempt->provider_reference, 'amount' => $amount, 'currency' => $attempt->currency,
+            'occurred_at' => $occurredAt->toIso8601String(), 'method' => $attempt->method, 'channel' => $attempt->channel]], JSON_THROW_ON_ERROR)]);
+    app(PaymentSettlementService::class)->apply($guid);
 }
 
 function refundRequest(User $owner, object $booking, string $key = 'refund-1', string $reason = 'Perubahan rencana perjalanan'): TestResponse

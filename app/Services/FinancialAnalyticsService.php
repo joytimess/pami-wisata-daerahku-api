@@ -19,7 +19,7 @@ class FinancialAnalyticsService
         }
         $environment = $filters['environment'] ?? 'production';
         abort_unless(in_array($environment, ['sandbox', 'demo', 'production'], true), 422);
-        $provider = $environment === 'demo' ? 'demo' : 'doku';
+        $provider = $environment === 'demo' ? 'demo' : 'midtrans';
         $period = ['from' => $filters['from'] ?? now()->utc()->startOfMonth()->toDateString(),
             'to' => $filters['to'] ?? now()->utc()->toDateString(), 'date_basis' => 'paid_utc', 'timezone' => 'UTC'];
         $base = $this->attempts($actor, $filters, $environment);

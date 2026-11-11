@@ -20,7 +20,7 @@ uses(RefreshDatabase::class);
  */
 beforeEach(function () {
     $this->travelTo(CarbonImmutable::parse('2026-11-08 08:00:00', 'UTC'));
-    config(['operations.demo_payments_enabled' => false, 'doku.enabled' => false, 'midtrans' => [
+    config(['operations.demo_payments_enabled' => false, 'midtrans' => [
         'enabled' => true, 'environment' => 'sandbox', 'server_key' => 'SB-Mid-server-FIXTURE0000000000', 'merchant_id' => 'G000000001',
         'channels' => ['va_bca', 'va_bni', 'qris'], 'verified_channels' => [], 'production_approved' => false,
         'base_urls' => ['sandbox' => 'https://api.sandbox.midtrans.com', 'production' => 'https://api.midtrans.com'],
@@ -95,11 +95,14 @@ it('reports unavailable with a stable reason when Midtrans is disabled or miscon
     'no enabled channel' => [['channels' => []], 'channel_not_enabled'],
 ]);
 
-it('keeps the DOKU contract while Midtrans is disabled', function () {
+it('stays Midtrans and fails closed while Midtrans is disabled, never DOKU', function () {
     config(['midtrans.enabled' => false]);
     [$owner, $booking] = midtransPayable();
 
-    $this->getJson('/api/v1/payments/methods?booking_guid='.$booking->guid, bearer($owner))->assertOk()->assertJsonPath('data.provider', 'doku');
+    $this->getJson('/api/v1/payments/methods?booking_guid='.$booking->guid, bearer($owner))->assertOk()
+        ->assertJsonPath('data.provider', 'midtrans')->assertJsonPath('data.can_pay', false)->assertJsonPath('data.reason', 'midtrans_disabled');
+    midtransStart($owner, $booking)->assertConflict()->assertJsonPath('code', 'midtrans_disabled');
+    $this->assertDatabaseCount('payment_attempts', 0);
 });
 
 it('protects creation with authentication ownership and server authority', function () {

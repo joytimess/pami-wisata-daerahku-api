@@ -265,7 +265,7 @@ class BookingService
             $updates = ['status' => $status, 'updated_at' => $now];
             if ($status === 'awaiting_payment') {
                 // One absolute deadline from the very instant recorded in the status history below; every attempt inherits it. Midtrans
-                // approvals get 15 minutes; DOKU and DEMO keep their historical one hour window.
+                // approvals get 15 minutes; DEMO keeps its historical one hour window.
                 $window = BookingRules::paymentWindowSeconds(app(PaymentGateway::class)->activeProvider());
                 $updates['payment_expires_at'] = $now->copy()->addSeconds($window);
                 $updates['notification_grace_expires_at'] = $now->copy()->addSeconds($window + BookingRules::PAYMENT_GRACE_SECONDS);

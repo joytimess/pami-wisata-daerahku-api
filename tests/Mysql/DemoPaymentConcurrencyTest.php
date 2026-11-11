@@ -57,7 +57,7 @@ function runDemoWorkers(array $jobs, array $connection, string $database): array
     $workers = [];
     $environment = ['APP_ENV' => 'testing', 'DB_CONNECTION' => 'mysql', 'DB_DATABASE' => $database,
         'DB_URL' => '', 'MYSQL_CONCURRENCY_TESTS' => '1', 'CACHE_STORE' => 'array', 'MAIL_MAILER' => 'array',
-        'QUEUE_CONNECTION' => 'sync', 'FIREBASE_CREDENTIALS' => '', 'DOKU_ENABLED' => 'false'];
+        'QUEUE_CONNECTION' => 'sync', 'FIREBASE_CREDENTIALS' => ''];
     foreach (['host', 'port', 'username', 'password'] as $key) {
         $environment['DB_'.strtoupper($key)] = (string) $connection[$key];
     }

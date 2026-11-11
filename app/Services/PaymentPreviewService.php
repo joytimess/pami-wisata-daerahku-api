@@ -15,7 +15,7 @@ class PaymentPreviewService
 
         return ['booking_guid' => $guid, 'availability' => $booking->status === 'awaiting_payment' ? 'preview_only' : 'unavailable',
             'reason' => $booking->status === 'awaiting_payment' ? null : 'booking_not_awaiting_payment',
-            'provider' => 'doku', 'integration_status' => 'not_configured', 'can_pay' => false,
-            'payment_status' => 'unverified', 'presentation_styles' => ['qris', 'virtual_account', 'ewallet']];
+            'provider' => 'midtrans', 'integration_status' => 'not_configured', 'can_pay' => false,
+            'payment_status' => 'unverified', 'presentation_styles' => ['qris', 'virtual_account']];
     }
 }
