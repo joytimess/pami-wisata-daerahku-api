@@ -349,7 +349,9 @@ it('never writes the payload, signature or server key to the log', function () {
     config(['logging.default' => 'mtx_capture', 'logging.channels.mtx_capture' => ['driver' => 'monolog', 'handler' => TestHandler::class]]);
     $payload = mtxNotification($attempt);
 
-    $this->postJson(MTX_WEBHOOK, ['signature_key' => 'f'.substr($payload['signature_key'], 1)] + $payload)->assertUnauthorized();
+    // Always change the first hex digit; a fixed 'f' left the signature valid whenever it already started with 'f'.
+    $tampered = ($payload['signature_key'][0] === 'f' ? 'e' : 'f').substr($payload['signature_key'], 1);
+    $this->postJson(MTX_WEBHOOK, ['signature_key' => $tampered] + $payload)->assertUnauthorized();
     $this->postJson(MTX_WEBHOOK, $payload)->assertOk();
     mtxFakeStatus(mtxStatusBody($attempt, 'settlement'));
     mtxDrain();

@@ -31,4 +31,6 @@ return [
         'qris_api_enabled' => (bool) env('MIDTRANS_QRIS_REFUND_ENABLED', false),
         'qris_window_days' => (int) env('MIDTRANS_QRIS_REFUND_WINDOW_DAYS', 14),
     ],
+    // SIGNATURE KEY KETINGGALAN
+    'signature_secret_key' => env('MIDTRANS_SIGNATURE_SECRET_KEY', ''),
 ];

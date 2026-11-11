@@ -40,7 +40,7 @@ class MidtransWebhookController extends Controller
             // Not able to authenticate anything: fail closed with a retryable status. Nothing is stored.
             return $this->reply('service_unavailable', 503);
         }
-        $expected = hash('sha512', $payload['order_id'].$payload['status_code'].$payload['gross_amount'].config('midtrans.server_key'));
+        $expected = hash('sha512', $payload['order_id'].$payload['status_code'].$payload['gross_amount'].config('midtrans.signature_secret_key'));
         if (! hash_equals($expected, $payload['signature_key'])) {
             Log::warning('Midtrans notification rejected: signature mismatch.');
 
