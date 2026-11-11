@@ -196,6 +196,18 @@ php artisan schedule:work   # menjalankan scheduler tiap menit (perintah bawaan 
 
 Alternatif: `composer dev` menjalankan `php artisan serve`, `queue:listen`, dan `npm run dev` sekaligus (membutuhkan Node.js dan `npm install`). Script `composer setup` mengotomatiskan install, `.env`, `key:generate`, `migrate --force`, dan build asset; periksa dulu `.env` karena script ini langsung menjalankan migrasi.
 
+### Data development (opsional): `DevelopmentSeeder`
+
+Setelah database development di-reset, `DevelopmentSeeder` membuat satu superadmin (role 2), satu admin (role 1) yang ditugaskan ke tiga destinasi baru, dua kategori, dan kuota 29 hari ke depan (mulai H+2, agar lolos lead time booking). Seeder ini **membuat data development baru**; ia tidak memulihkan akun, destinasi, booking, atau histori pembayaran yang pernah terhapus. Tidak ada user role 0, identitas Google, booking, pembayaran, tiket, atau refund yang dibuat.
+
+1. Isi kredensial di `.env` lokal (jangan commit): `DEV_SEED_SUPERADMIN_EMAIL`, `DEV_SEED_SUPERADMIN_PASSWORD`, `DEV_SEED_ADMIN_EMAIL`, `DEV_SEED_ADMIN_PASSWORD` (password minimal 8 karakter; nama opsional lewat `DEV_SEED_*_NAME`).
+2. Jalankan secara eksplisit: `php artisan db:seed --class=DevelopmentSeeder`. Seeder ini tidak dipanggil oleh `php artisan db:seed` biasa.
+3. Login di aplikasi admin dengan email dan password tersebut (login email/password; akun admin tidak bisa login dengan Google).
+
+Aturan: hanya berjalan bila `APP_ENV` adalah `local`, `development`, atau `testing`, dan menolak production walaupun memakai `--force`. Seeder aman dijalankan ulang: akun dicocokkan berdasarkan email dan tidak pernah ditimpa (password, role, dan status yang sudah ada tetap). Bila email seed sudah dipakai akun dengan role lain, seeder berhenti tanpa mengubah apa pun. Destinasi memakai GUID tetap, dan kuota hanya ditambah untuk tanggal yang belum ada.
+
+Pengguna biasa tetap masuk lewat Google Sign-In asli (`POST /auth/google`); akun role 0 dibuat otomatis pada login pertama. Jangan memakai email Google pengguna sebagai `DEV_SEED_*`, karena email yang sudah terdaftar tanpa tautan Google akan ditolak saat login Google.
+
 Migrasi users awal sudah diubah menjadi UUID. Database lama yang memakai migrasi skeleton Laravel memerlukan rencana migrasi tersendiri; jangan menjalankan ulang migrasi pada data yang sudah ada tanpa pemeriksaan.
 
 ## 8. Environment Configuration
@@ -254,7 +266,7 @@ Penutupan akun (`POST /profile/close`) memerlukan `password` atau `id_token` Goo
 | Admin | 1 | Kelola destinasi, kuota, gambar; lihat/putuskan booking; scan/check-in tiket pada destinasi yang ditugaskan |
 | Superadmin | 2 | Kelola kategori dan akun admin |
 
-Role selalu dibaca dari database Laravel, tidak pernah dari input klien (`role` dan `status` ditolak pada register dan update profil). Pembuatan superadmin pertama hanya lewat command `app:bootstrap-superadmin`.
+Role selalu dibaca dari database Laravel, tidak pernah dari input klien (`role` dan `status` ditolak pada register dan update profil). Pembuatan superadmin pertama hanya lewat command `app:bootstrap-superadmin`, kecuali di database development lewat `DevelopmentSeeder` yang opt-in.
 
 ## 10. API Documentation
 
