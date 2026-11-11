@@ -114,16 +114,16 @@ it('disables nested channels with their parent booking and exposes only persiste
     $this->assertDatabaseCount('invoices', 0);
 });
 
-it('applies the fifteen minute cutoff and expires an untouched booking while releasing its quota', function () {
+it('keeps the one hour DOKU cutoff and expires an untouched booking while releasing its quota', function () {
     [$owner, $guid, $destination, $date] = foundationBooking();
     $service = app(BookingService::class);
     $service->decide(makeUser(2), $guid, true);
     $headers = bearer($owner);
     $before = DB::table('bookings')->where('guid', $guid)->first();
-    expect($before->payment_expires_at)->toBe(now()->addMinutes(15)->format('Y-m-d H:i:s'));
-    expect($before->notification_grace_expires_at)->toBe(now()->addMinutes(30)->format('Y-m-d H:i:s'));
+    expect($before->payment_expires_at)->toBe(now()->addHour()->format('Y-m-d H:i:s'));
+    expect($before->notification_grace_expires_at)->toBe(now()->addMinutes(75)->format('Y-m-d H:i:s'));
 
-    $this->travel(14)->minutes();
+    $this->travel(59)->minutes();
     $service->expireDue();
     $this->getJson('/api/v1/bookings/'.$guid.'/payment-intent', $headers)->assertOk()
         ->assertJsonPath('data.booking_status', 'awaiting_payment')->assertJsonPath('data.reason', 'doku_not_configured');
@@ -144,7 +144,10 @@ it('holds the quota of a booking with an unresolved legacy attempt through verif
     foundationLedger($guid);
     $before = DB::table('bookings')->where('guid', $guid)->first();
 
-    $this->travel(15)->minutes();
+    $this->travel(59)->minutes();
+    $service->expireDue();
+    $this->getJson('/api/v1/bookings/'.$guid.'/payment-intent', bearer($owner))->assertOk()->assertJsonPath('data.booking_status', 'awaiting_payment');
+    $this->travel(1)->minutes();
     $service->expireDue();
     $this->getJson('/api/v1/bookings/'.$guid.'/payment-intent', bearer($owner))->assertOk()->assertJsonPath('data.booking_status', 'payment_verification');
     expect(fn () => $service->create(makeUser(), bookingPayload($destination, $date) + ['idempotency_key' => 'verification-capacity']))

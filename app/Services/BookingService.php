@@ -264,9 +264,11 @@ class BookingService
             $status = ! $approve ? 'rejected' : ($booking->total_amount == 0 ? 'confirmed' : 'awaiting_payment');
             $updates = ['status' => $status, 'updated_at' => $now];
             if ($status === 'awaiting_payment') {
-                // One absolute deadline from the very instant recorded in the status history below; every attempt inherits it.
-                $updates['payment_expires_at'] = $now->copy()->addSeconds(BookingRules::PAYMENT_WINDOW_SECONDS);
-                $updates['notification_grace_expires_at'] = $now->copy()->addSeconds(BookingRules::PAYMENT_WINDOW_SECONDS + BookingRules::PAYMENT_GRACE_SECONDS);
+                // One absolute deadline from the very instant recorded in the status history below; every attempt inherits it. Midtrans
+                // approvals get 15 minutes; DOKU and DEMO keep their historical one hour window.
+                $window = BookingRules::paymentWindowSeconds(app(PaymentGateway::class)->activeProvider());
+                $updates['payment_expires_at'] = $now->copy()->addSeconds($window);
+                $updates['notification_grace_expires_at'] = $now->copy()->addSeconds($window + BookingRules::PAYMENT_GRACE_SECONDS);
             }
             DB::table('bookings')->where('guid', $guid)->update($updates);
             if ($approve) {
@@ -285,9 +287,12 @@ class BookingService
         DB::table('bookings')->where(function ($q) {
             $q->where(fn ($q) => $q->where('status', 'pending_approval')->where('approval_expires_at', '<=', now()))
                 ->orWhere(fn ($q) => $q->where('status', 'awaiting_payment')->where('payment_expires_at', '<=', now()))
-                // Held payment states are re-examined every pass. Legacy (DOKU/DEMO) intents are never auto-closed, so once they reach
-                // payment_review (their last state) they are not re-locked on every pass.
-                ->orWhere(fn ($q) => $q->where('status', 'payment_verification')->where('payment_expires_at', '<=', now()))
+                // Held payment states are re-examined every pass. Legacy (DOKU/DEMO) intents are never auto-closed, so they keep their
+                // historical timing: payment_verification waits for the grace, and payment_review (their last state) is not re-locked.
+                ->orWhere(fn ($q) => $q->where('status', 'payment_verification')->where('payment_expires_at', '<=', now())
+                    ->where(fn ($held) => $held->where('notification_grace_expires_at', '<=', now())
+                        ->orWhereNotExists(fn ($legacy) => $legacy->select(DB::raw(1))->from('payment_intents')
+                            ->whereColumn('payment_intents.booking_guid', 'bookings.guid')->where('payment_intents.provider', '!=', 'midtrans'))))
                 ->orWhere(fn ($q) => $q->where('status', 'payment_review')->where('payment_expires_at', '<=', now())
                     ->whereNotExists(fn ($legacy) => $legacy->select(DB::raw(1))->from('payment_intents')
                         ->whereColumn('payment_intents.booking_guid', 'bookings.guid')->where('payment_intents.provider', '!=', 'midtrans')));
