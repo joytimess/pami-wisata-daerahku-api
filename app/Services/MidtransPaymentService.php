@@ -3,11 +3,14 @@
 namespace App\Services;
 
 use App\Exceptions\BookingException;
+use App\Jobs\ProcessMidtransPaymentEvent;
 use App\Models\User;
 use App\Services\Midtrans\MidtransChannelRegistry;
 use App\Services\Midtrans\MidtransClient;
 use App\Support\BookingRules;
 use Carbon\CarbonImmutable;
+use Closure;
+use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Support\Facades\Crypt;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -15,11 +18,14 @@ use Illuminate\Support\Str;
 use Throwable;
 
 /**
- * Creates Midtrans Core API payment attempts.
+ * Creates Midtrans Core API payment attempts and verifies them afterwards.
  *
  * The attempt is reserved and committed BEFORE the network call, so a crash or timeout after the provider accepted the Charge
  * leaves a durable `initiating`/`unknown` attempt on a known order id. A retry with the same key (or any later request) returns
  * that attempt; a second order is never created for it.
+ *
+ * Money is only ever confirmed from an authenticated Status lookup of a stored order. A notification is a durable trigger, never
+ * evidence; the webhook, the scheduler and the owner refresh all go through the same claimed lookup.
  */
 class MidtransPaymentService
 {
@@ -27,6 +33,28 @@ class MidtransPaymentService
     private const OPEN_ATTEMPT_STATUSES = ['initiating', 'pending', 'unknown'];
 
     private const OPERATION = 'midtrans_payment.initiate';
+
+    /** Claim lease of one provider lookup: longer than the HTTP timeout, short enough that a crashed worker is retried soon. */
+    private const LEASE_SECONDS = 90;
+
+    private const RECEIPT_LEASE_SECONDS = 120;
+
+    private const RECEIPT_MAX_ATTEMPTS = 10;
+
+    private const REFRESH_MIN_INTERVAL_SECONDS = 10;
+
+    private const NOTIFICATION_MIN_INTERVAL_SECONDS = 5;
+
+    /**
+     * Provider evidence that is neither payable nor safely retryable: the payment is held for a human instead of being retried
+     * or guessed. (`merchant_mismatch` here is the PROVIDER's merchant differing from the bound one.)
+     */
+    private const REVIEW_REASONS = ['partial_adjustment_review', 'fraud_status_review', 'merchant_mismatch', 'transaction_mismatch'];
+
+    /** Evidence that does not match the stored attempt. Retried a bounded number of consecutive rounds, then reviewed. */
+    private const INVALID_REASONS = ['provider_response_invalid', 'provider_expiry_invalid'];
+
+    private const INVALID_ESCALATION_ROUNDS = 5;
 
     public function __construct(private MidtransClient $client, private MidtransChannelRegistry $registry, private TicketService $tickets) {}
 

@@ -22,6 +22,17 @@ class MidtransChannelRegistry
         ];
     }
 
+    /**
+     * Method/channel pairs whose verified evidence may settle a booking. Static on purpose: a later kill switch, channel allowlist
+     * or Production gate must never stop money that was genuinely received on an existing order from being recognised.
+     *
+     * @return list<array{0: string, 1: string}>
+     */
+    public function settlingPairs(): array
+    {
+        return array_values(array_map(fn (array $definition): array => [$definition['method'], $definition['channel']], $this->all()));
+    }
+
     /** @return array<string, string> method code => family presentation type, in public order */
     public function families(): array
     {
@@ -60,6 +71,22 @@ class MidtransChannelRegistry
         if (! config('midtrans.enabled')) {
             return 'midtrans_disabled';
         }
+        if ($reason = $this->verificationReason()) {
+            return $reason;
+        }
+        if ($this->environment() === 'production' && ! config('midtrans.production_approved')) {
+            return 'midtrans_production_not_approved';
+        }
+
+        return null;
+    }
+
+    /**
+     * Credential, environment and host gates only. This is what notifications, Status lookups and reconciliation of orders the
+     * provider already holds need: the new-charge kill switch and the Production approval deliberately do not apply to them.
+     */
+    public function verificationReason(): ?string
+    {
         $environment = $this->environment();
         $key = (string) config('midtrans.server_key');
         $prefix = $environment === 'production' ? self::PRODUCTION_KEY_PREFIX : self::SANDBOX_KEY_PREFIX;
@@ -67,9 +94,6 @@ class MidtransChannelRegistry
         if (! in_array($environment, ['sandbox', 'production'], true) || ! $keyMatches || $this->baseUrl() === null
             || ($environment === 'production' && trim((string) config('midtrans.merchant_id')) === '')) {
             return 'midtrans_not_configured';
-        }
-        if ($environment === 'production' && ! config('midtrans.production_approved')) {
-            return 'midtrans_production_not_approved';
         }
 
         return null;

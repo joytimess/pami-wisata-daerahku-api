@@ -17,3 +17,4 @@ Schedule::command('avatars:cleanup')->everyMinute()->withoutOverlapping();
 
 Schedule::command('tickets:issue-qr')->everyMinute()->withoutOverlapping();
 Schedule::command('payments:reconcile-doku')->everyMinute()->withoutOverlapping();
+Schedule::command('payments:reconcile-midtrans')->everyMinute()->withoutOverlapping(10);

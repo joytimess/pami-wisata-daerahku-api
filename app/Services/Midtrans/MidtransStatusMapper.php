@@ -6,10 +6,11 @@ use Carbon\CarbonImmutable;
 use Throwable;
 
 /**
- * Turns a Midtrans transaction response (Charge, authenticated Status or, later, a notification) into one normalized outcome.
+ * Turns a Midtrans transaction response (Charge or authenticated Status) into one normalized outcome.
  *
  * The mapper trusts nothing in the payload: every identity field must equal the stored attempt, otherwise the result is
- * `unknown` and carries no instruction and no paid evidence. Money is integer IDR; Midtrans times are GMT+7.
+ * `unknown` and carries no instruction and no paid evidence. Money is integer IDR; Midtrans times are GMT+7. An HTTP(S)
+ * notification is never an evidence source: it only triggers an authenticated Status lookup of a stored order.
  */
 class MidtransStatusMapper
 {
@@ -19,18 +20,22 @@ class MidtransStatusMapper
 
     /**
      * @param  array<string, mixed>  $response
-     * @param  'charge'|'status'|'notification'  $evidenceSource
+     * @param  'charge'|'status'  $evidenceSource
      * @return array<string, mixed>
      */
     public function normalize(array $response, object $attempt, string $evidenceSource): array
     {
+        if (! in_array($evidenceSource, ['charge', 'status'], true)) {
+            return $this->unknown('evidence_source_invalid');
+        }
         $transactionId = $response['transaction_id'] ?? null;
         $amount = $this->amount($response['gross_amount'] ?? null);
         if (($response['order_id'] ?? null) !== $attempt->merchant_reference || ! is_string($transactionId) || $transactionId === '' || strlen($transactionId) > 128
             || $amount === null || $amount !== (int) $attempt->amount || ($response['currency'] ?? null) !== $attempt->currency) {
             return $this->unknown('provider_response_invalid');
         }
-        $merchant = trim((string) config('midtrans.merchant_id'));
+        // The merchant bound to the attempt at reservation wins over today's configuration.
+        $merchant = trim((string) ($attempt->merchant_id ?? '')) ?: trim((string) config('midtrans.merchant_id'));
         $responseMerchant = $response['merchant_id'] ?? null;
         if (($responseMerchant !== null && (! is_string($responseMerchant) || ($merchant !== '' && $responseMerchant !== $merchant)))
             || ($responseMerchant === null && $this->registry->environment() === 'production')) {
@@ -38,6 +43,10 @@ class MidtransStatusMapper
         }
         if (! $this->bound($response, $attempt)) {
             return $this->unknown('provider_response_invalid');
+        }
+        $boundTransaction = $attempt->provider_reference ?? null;
+        if (is_string($boundTransaction) && $boundTransaction !== '' && $boundTransaction !== $transactionId) {
+            return $this->unknown('transaction_mismatch');
         }
 
         $base = ['merchant_reference' => $attempt->merchant_reference, 'provider_reference' => $transactionId, 'amount' => $amount,
@@ -50,7 +59,7 @@ class MidtransStatusMapper
         }
 
         return match ($status) {
-            'pending' => ['status' => 'pending'] + $base + $this->occurred($response['transaction_time'] ?? null),
+            'pending' => $this->pendingStatus($response, $attempt, $base),
             'settlement' => $this->settlement($response, $base),
             'expire' => ['status' => 'expired', 'reason' => 'provider_expire'] + $base + $this->occurred($response['transaction_time'] ?? null),
             'deny', 'cancel', 'failure' => ['status' => 'failed', 'reason' => 'provider_'.$status] + $base + $this->occurred($response['transaction_time'] ?? null),
@@ -60,9 +69,36 @@ class MidtransStatusMapper
         };
     }
 
+    /**
+     * A pending order is only kept pending while its provider expiry does not outlive the booking deadline. While it is still
+     * payable the instruction is rebuilt too, so an attempt whose Charge response was lost can be shown again.
+     *
+     * @return array<string, mixed>
+     */
+    private function pendingStatus(array $response, object $attempt, array $base): array
+    {
+        $expiry = $this->time($response['expiry_time'] ?? null);
+        $deadline = ($attempt->instruction_expires_at ?? null) !== null ? CarbonImmutable::parse($attempt->instruction_expires_at, 'UTC') : null;
+        if ($expiry !== null && $deadline !== null && $expiry->gt($deadline)) {
+            return $this->unknown('provider_expiry_invalid');
+        }
+        $result = ['status' => 'pending'] + $base + $this->occurred($response['transaction_time'] ?? null);
+        if ($expiry !== null && $expiry->gt(now())) {
+            $instruction = $attempt->method === 'qris' ? $this->qrisInstruction($response, $base['provider_reference']) : $this->vaInstruction($response, $attempt);
+            if ($instruction !== null) {
+                $result += ['expires_at' => $expiry->toIso8601String(), 'presentation_type' => $instruction['presentation_type'], 'instruction' => $instruction];
+            }
+        }
+
+        return $result;
+    }
+
     /** @return array<string, mixed> */
     private function settlement(array $response, array $base): array
     {
+        if ((string) ($response['status_code'] ?? '') !== '200') {
+            return $this->unknown('provider_response_invalid');
+        }
         $fraud = $response['fraud_status'] ?? null;
         if ($fraud !== null && $fraud !== 'accept') {
             return $this->unknown('fraud_status_review');

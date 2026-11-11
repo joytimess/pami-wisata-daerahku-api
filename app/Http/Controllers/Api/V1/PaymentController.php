@@ -16,6 +16,7 @@ use App\Services\PaymentService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Http\Response;
+use Illuminate\Support\Facades\DB;
 
 class PaymentController extends Controller
 {
@@ -32,9 +33,20 @@ class PaymentController extends Controller
         return (new OperationalResource($data))->response()->header('Cache-Control', 'private, no-store');
     }
 
-    public function refreshDoku(Request $request, string $booking, string $attempt, DokuPaymentService $doku, PaymentService $payments): JsonResponse
+    /**
+     * Owner refresh of one attempt. The attempt's OWN provider decides who verifies it, whichever gateway is active for new
+     * payments: a Midtrans attempt is only ever checked against Midtrans (never DOKU), and a historical DOKU attempt keeps its
+     * original path. Neither creates a Charge.
+     */
+    public function refresh(Request $request, string $booking, string $attempt, DokuPaymentService $doku, MidtransPaymentService $midtrans, PaymentService $payments): JsonResponse
     {
-        $doku->refresh($request->user(), $booking, $attempt);
+        $provider = DB::table('payment_attempts as a')->join('payment_intents as i', 'i.guid', '=', 'a.payment_intent_guid')
+            ->where('i.booking_guid', $booking)->where('a.guid', $attempt)->value('a.provider');
+        if ($provider === 'midtrans') {
+            $midtrans->refresh($request->user(), $booking, $attempt);
+        } else {
+            $doku->refresh($request->user(), $booking, $attempt);
+        }
 
         return (new OperationalResource($payments->show($request->user(), $booking)))
             ->response()->header('Cache-Control', 'private, no-store');

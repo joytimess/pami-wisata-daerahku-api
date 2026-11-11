@@ -137,18 +137,18 @@ it('creates one BCA attempt: durable reservation, one Charge, absolute deadline 
     expect($reserved)->not->toBeNull()->and($reserved->status)->toBe('initiating')
         ->and($data)->toMatchArray(['provider' => 'midtrans', 'environment' => 'sandbox', 'test_only' => true, 'status' => 'pending',
             'method_code' => 'virtual_account', 'channel' => 'bca', 'amount' => 20000, 'currency' => 'IDR', 'booking_status' => 'awaiting_payment',
-            'payment_status' => 'unverified', 'server_time' => '2026-11-08T08:00:00+00:00', 'expires_at' => '2026-11-08T09:00:00+00:00'])
+            'payment_status' => 'unverified', 'server_time' => '2026-11-08T08:00:00+00:00', 'expires_at' => '2026-11-08T08:15:00+00:00'])
         ->and($data['instruction'])->toBe(['presentation_type' => 'virtual_account', 'bank_code' => 'bca', 'va_number' => '81234500001', 'copyable' => true]);
     $attempt = DB::table('payment_attempts')->first();
     $intent = DB::table('payment_intents')->first();
     expect($attempt->provider)->toBe('midtrans')->and($attempt->environment)->toBe('sandbox')
         ->and($attempt->merchant_reference)->toBe('PAMI-'.$attempt->guid)->and($attempt->provider_reference)->toBe('trx-bca')
         ->and($attempt->status)->toBe('pending')->and($attempt->presentation_type)->toBe('virtual_account')
-        ->and($attempt->instruction_expires_at)->toBe('2026-11-08 09:00:00')->and((int) $attempt->amount)->toBe(20000)
+        ->and($attempt->instruction_expires_at)->toBe('2026-11-08 08:15:00')->and((int) $attempt->amount)->toBe(20000)
         ->and($intent->provider)->toBe('midtrans')->and($intent->environment)->toBe('sandbox')->and($intent->status)->toBe('processing')
         ->and($attempt->instruction_ciphertext)->not->toContain('81234500001');
     Http::assertSentCount(1);
-    Http::assertSent(fn (ClientRequest $request) => $request['custom_expiry'] === ['order_time' => '2026-11-08 15:00:00 +0700', 'expiry_duration' => 60, 'unit' => 'minute']
+    Http::assertSent(fn (ClientRequest $request) => $request['custom_expiry'] === ['order_time' => '2026-11-08 15:00:00 +0700', 'expiry_duration' => 15, 'unit' => 'minute']
         && $request['transaction_details']['gross_amount'] === 20000);
 });
 
@@ -237,6 +237,17 @@ it('records a definitive provider rejection as failed and keeps the booking paya
     expect(DB::table('payment_intents')->value('status'))->toBe('requires_payment')->and(DB::table('bookings')->value('status'))->toBe('awaiting_payment');
 });
 
+it('keeps an ambiguous HTTP answer to a Charge (408, 409, redirect) unknown instead of proving the order unpaid', function (int $httpStatus) {
+    [$owner, $booking] = midtransPayable();
+    Http::fake(['*' => Http::response(['status_message' => 'ambiguous'], $httpStatus)]);
+
+    $data = midtransStart($owner, $booking)->assertOk()->json('data');
+
+    expect($data['status'])->not->toBe('failed')
+        ->and(DB::table('payment_attempts')->value('status'))->toBeIn(['unknown', 'initiating'])
+        ->and(DB::table('bookings')->value('status'))->toBe('awaiting_payment');
+})->with([408, 409, 302]);
+
 it('never shows an instruction whose provider expiry exceeds the booking deadline', function () {
     [$owner, $booking] = midtransPayable();
     Http::fake(['*' => midtransEcho('trx-late', null, ['expiry_time' => '2026-11-08 16:30:00'])]);
@@ -250,10 +261,10 @@ it('never shows an instruction whose provider expiry exceeds the booking deadlin
 it('refuses to create inside the minimum window or after the deadline without calling the provider', function () {
     [$owner, $booking] = midtransPayable();
     Http::fake();
-    $this->travelTo(CarbonImmutable::parse('2026-11-08 08:59:45', 'UTC'));
+    $this->travelTo(CarbonImmutable::parse('2026-11-08 08:14:45', 'UTC'));
 
     midtransStart($owner, $booking)->assertConflict()->assertJsonPath('code', 'payment_window_closed');
-    $this->travelTo(CarbonImmutable::parse('2026-11-08 09:00:00', 'UTC'));
+    $this->travelTo(CarbonImmutable::parse('2026-11-08 08:15:00', 'UTC'));
     midtransStart($owner, $booking, 'late')->assertConflict()->assertJsonPath('code', 'payment_window_closed');
 
     Http::assertNothingSent();
@@ -321,7 +332,7 @@ it('exposes the Midtrans instruction in the payment snapshot only while it is pa
     $this->getJson('/api/v1/bookings/'.$booking->guid.'/payment-intent', bearer($owner))->assertOk()
         ->assertJsonPath('data.provider', 'midtrans')->assertJsonPath('data.instruction.va_number', '81234500001')
         ->assertJsonPath('data.last_attempt.channel', 'bca')->assertJsonPath('data.can_create', false);
-    $this->travelTo(CarbonImmutable::parse('2026-11-08 09:00:00', 'UTC'));
+    $this->travelTo(CarbonImmutable::parse('2026-11-08 08:15:00', 'UTC'));
     $this->getJson('/api/v1/bookings/'.$booking->guid.'/payment-intent', bearer($owner))->assertOk()
         ->assertJsonPath('data.instruction.presentation_type', 'unavailable')->assertJsonPath('data.can_create', false);
 });
@@ -335,4 +346,36 @@ it('does not touch DOKU transport or configuration while creating a Midtrans att
     Http::assertSent(fn (ClientRequest $request) => str_starts_with($request->url(), 'https://api.sandbox.midtrans.com/'));
     Http::assertNotSent(fn (ClientRequest $request) => str_contains($request->url(), 'doku'));
     expect(app(MidtransClient::class)->configured())->toBeTrue();
+});
+
+it('binds the configured merchant identity to the attempt at reservation', function () {
+    [$owner, $booking] = midtransPayable();
+    Http::fake(['*' => midtransEcho()]);
+
+    midtransStart($owner, $booking)->assertOk();
+
+    expect(DB::table('payment_attempts')->value('merchant_id'))->toBe('G000000001');
+});
+
+it('quarantines a Charge response that reuses another attempt transaction id instead of failing with a server error', function () {
+    [$firstOwner, $firstBooking] = midtransPayable();
+    [$owner, $booking] = midtransPayable();
+    Http::fake(['*' => midtransEcho('trx-duplicate')]);
+    midtransStart($firstOwner, $firstBooking, 'first')->assertOk()->assertJsonPath('data.status', 'pending');
+
+    $data = midtransStart($owner, $booking, 'second')->assertOk()->json('data');
+
+    expect($data)->toMatchArray(['status' => 'unknown', 'reason' => 'provider_reference_conflict'])->and($data['instruction'])->toBe(['presentation_type' => 'unavailable']);
+    $attempts = DB::table('payment_attempts')->orderBy('created_at')->orderBy('attempt_number')->get()->keyBy(fn ($row) => $row->payment_intent_guid === DB::table('payment_intents')->where('booking_guid', $firstBooking->guid)->value('guid') ? 'first' : 'second');
+    expect($attempts['first']->status)->toBe('pending')->and($attempts['first']->provider_reference)->toBe('trx-duplicate')
+        ->and($attempts['second']->status)->toBe('unknown')->and($attempts['second']->provider_reference)->toBeNull()
+        ->and($attempts['second']->instruction_ciphertext)->toBeNull()->and($attempts['second']->last_error_code)->toBe('provider_reference_conflict');
+    expect(DB::table('payment_intents')->where('booking_guid', $booking->guid)->value('status'))->toBe('needs_review')
+        ->and(DB::table('payment_intents')->where('booking_guid', $firstBooking->guid)->value('status'))->toBe('processing');
+    // No second order and no further Charge, whether the customer repeats the key or uses a new one.
+    $replay = midtransStart($owner, $booking, 'second')->assertOk()->json('data');
+    expect($replay['attempt_guid'])->toBe($data['attempt_guid']);
+    midtransStart($owner, $booking, 'third')->assertConflict()->assertJsonPath('code', 'payment_needs_review');
+    Http::assertSentCount(2);
+    $this->assertDatabaseCount('payment_attempts', 2);
 });
