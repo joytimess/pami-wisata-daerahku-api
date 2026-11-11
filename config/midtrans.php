@@ -25,4 +25,10 @@ return [
     'minimum_expiry_seconds' => (int) env('MIDTRANS_MINIMUM_EXPIRY_SECONDS', 30),
     // QRIS acquirer active on the merchant account.
     'qris_acquirer' => env('MIDTRANS_QRIS_ACQUIRER', 'gopay'),
+    'refund' => [
+        // QRIS refund API stays off until the merchant's refund permission and window are proven by Sandbox UAT. BCA and BNI
+        // virtual accounts have no provider refund API in this integration and are always refunded manually.
+        'qris_api_enabled' => (bool) env('MIDTRANS_QRIS_REFUND_ENABLED', false),
+        'qris_window_days' => (int) env('MIDTRANS_QRIS_REFUND_WINDOW_DAYS', 14),
+    ],
 ];

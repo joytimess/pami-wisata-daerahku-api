@@ -3,7 +3,9 @@
 namespace App\Services;
 
 use App\Exceptions\BookingException;
+use App\Jobs\ProcessMidtransRefund;
 use App\Models\User;
+use App\Services\Midtrans\MidtransClient;
 use Carbon\CarbonImmutable;
 use Illuminate\Auth\Access\AuthorizationException;
 use Illuminate\Database\Eloquent\ModelNotFoundException;
@@ -11,14 +13,21 @@ use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
+use Throwable;
 
 /**
- * Full-refund workflow (request -> scoped admin decision -> manual action -> verified provider adjustment).
+ * Full-refund workflow (request -> scoped admin decision -> manual transfer OR provider API -> verified outcome). Full amount only.
  *
  * Approval never moves money and never writes `refunded`: that status is set only by recordVerifiedAdjustment(), which the
- * payment engine calls after it has applied a verified provider refund/reversal event. No provider refund transport exists
- * until DOKU confirms the entitlement and contract, so every approved request stays `manual_action_required`.
- * Lock order matches payments and check-in: destination -> quota -> booking -> tickets.
+ * payment engine calls after it has applied a verified provider refund/reversal event, or `manual_refunded` after an admin
+ * verified an out-of-band transfer.
+ *
+ * Two routes follow an approval. DOKU, BCA/BNI virtual accounts and any Midtrans payment whose refund capability is not proven are
+ * `manual_action_required`. A Midtrans QRIS payment with the API capability enabled is CLAIMED first: the refund key and an admission
+ * hold are committed (status `refund_pending`) before any provider call; the worker then sends the SAME key however often it must,
+ * and the refund is final only after the Status API shows the full refund.
+ *
+ * Lock order matches payments and check-in: destination -> quota -> booking -> intent -> attempt -> refund request -> tickets.
  */
 class BookingRefundService
 {
@@ -30,6 +39,15 @@ class BookingRefundService
 
     /** Accepted manual settlement methods; the reference must identify the transfer/disbursement in that channel. */
     public const SETTLEMENT_METHODS = ['bank_transfer', 'ewallet_transfer', 'cash_disbursement'];
+
+    /** A worker's claim on one refund step; a crashed worker's lease simply expires. */
+    private const LEASE_SECONDS = 120;
+
+    /** Unverified passes before a provider refund is escalated to a human (the refund key and the hold are kept). */
+    private const RECONCILE_MAX = 20;
+
+    /** Sends of one refund key before a still-ambiguous dispatch is escalated. */
+    private const DISPATCH_MAX = 5;
 
     public function __construct(private PaymentEligibility $payments, private PaymentService $paymentService) {}
 
@@ -60,7 +78,7 @@ class BookingRefundService
             if ($active) {
                 throw new BookingException('A refund request is already open for this booking.', 'refund_already_requested', ['refund_guid' => $active->guid]);
             }
-            $intent = DB::table('payment_intents')->where('booking_guid', $guid)->where('provider', 'doku')->lockForUpdate()->first();
+            $intent = DB::table('payment_intents')->where('booking_guid', $guid)->whereIn('provider', ['doku', 'midtrans'])->lockForUpdate()->first();
             if (! $intent || $intent->applied_attempt_guid === null || $booking->status !== 'confirmed' || $this->payments->entitlement($booking) !== 'paid') {
                 throw new BookingException('This booking has no verified payment that can be refunded.', 'refund_not_available');
             }
@@ -97,6 +115,10 @@ class BookingRefundService
             app(AdminDestinationScopeService::class)->lockDestination($destination);
             $booking = $this->lockBooking($bookingGuid);
             $actor = app(AdminDestinationScopeService::class)->authorize($actor, $destination, true);
+            // Intent and attempt before the request row, exactly as settlement takes them, so the two can never wait on each other.
+            $peek = DB::table('booking_refund_requests')->where('guid', $refundGuid)->where('booking_guid', $bookingGuid)->first() ?? throw new ModelNotFoundException;
+            $intent = DB::table('payment_intents')->where('guid', $peek->payment_intent_guid)->lockForUpdate()->first();
+            $attempt = DB::table('payment_attempts')->where('guid', $peek->payment_attempt_guid)->lockForUpdate()->first();
             $request = DB::table('booking_refund_requests')->where('guid', $refundGuid)->where('booking_guid', $bookingGuid)->lockForUpdate()->first()
                 ?? throw new ModelNotFoundException;
             if ($request->status !== 'requested') {
@@ -106,12 +128,26 @@ class BookingRefundService
             if ($input['decision'] === 'reject') {
                 $this->move($request, 'rejected', $actor->guid, $note, ['active' => null, 'decided_by_user_guid' => $actor->guid, 'decided_at' => now(), 'decision_note' => $note]);
             } elseif ($this->usedAdmission($bookingGuid) || $this->payments->entitlement($booking) !== 'paid' || $booking->status !== 'confirmed'
+                || ! $this->paymentStillSettled($intent, $attempt)
                 || DB::table('booking_refund_requests')->where('booking_guid', $bookingGuid)->whereIn('status', self::SETTLED_STATUSES)->exists()) {
                 $this->move($request, 'needs_review', $actor->guid, $note, ['review_reason' => 'usage_or_payment_changed', 'decided_by_user_guid' => $actor->guid, 'decided_at' => now()]);
             } else {
                 $this->move($request, 'approved', $actor->guid, $note, ['decided_by_user_guid' => $actor->guid, 'decided_at' => now(), 'decision_note' => $note]);
-                // No verified provider refund capability: money movement is a human/provider action outside this system.
-                $this->move(DB::table('booking_refund_requests')->where('guid', $refundGuid)->first(), 'manual_action_required', null, 'provider_refund_unavailable', []);
+                $approved = DB::table('booking_refund_requests')->where('guid', $refundGuid)->first();
+                $unavailable = $this->providerRefundUnavailable($intent, $attempt);
+                if ($unavailable === null) {
+                    // The claim: key, route and admission hold are durable BEFORE any provider call, in the same transaction that
+                    // proved no ticket was used. A check-in can only win by committing first, and then this branch is never reached.
+                    $this->move($approved, 'refund_pending', null, 'provider_refund_claimed', [
+                        'refund_route' => 'provider_api', 'refund_key' => self::refundKey($refundGuid), 'admission_hold' => 1,
+                        'next_reconcile_at' => now()->addSeconds(30), 'reconcile_count' => 0,
+                    ]);
+                    DB::afterCommit(fn () => $this->queueProviderRefund($refundGuid));
+                } else {
+                    // Money movement is a human action; the reason stays in the audit trail.
+                    $this->move($approved, 'manual_action_required', null, $unavailable === 'provider_not_supported' ? 'provider_refund_unavailable' : 'provider_refund_unavailable:'.$unavailable,
+                        $intent?->provider === 'midtrans' ? ['refund_route' => 'manual'] : []);
+                }
             }
 
             return $this->summary(DB::table('booking_refund_requests')->where('guid', $refundGuid)->first());
@@ -232,7 +268,265 @@ class BookingRefundService
 
             return;
         }
-        $this->move($request, 'refunded', null, 'verified_provider_adjustment', ['active' => null, 'refunded_at' => now(), 'provider_correlation' => $eventGuid]);
+        // Only a verified full refund ends the temporary hold, and it does so by revoking the admission credential for good.
+        $this->move($request, 'refunded', null, 'verified_provider_adjustment', ['active' => null, 'refunded_at' => now(), 'provider_correlation' => $eventGuid, 'admission_hold' => null]);
+        DB::table('booking_tickets')->where('booking_guid', $bookingGuid)->whereNull('checked_in_at')->whereNotNull('qr_token_hash')
+            ->whereNull('qr_revoked_at')->update(['qr_revoked_at' => now(), 'updated_at' => now()]);
+    }
+
+    // -----------------------------------------------------------------------------------------------------------------
+    // Provider API refund (Midtrans QRIS): claim, dispatch with one persisted key, verification, recovery
+    // -----------------------------------------------------------------------------------------------------------------
+
+    public static function refundKey(string $refundGuid): string
+    {
+        return 'PAMI-RF-'.$refundGuid;
+    }
+
+    /** Why the provider API cannot take this refund (null when it can); the request then follows the manual workflow. */
+    private function providerRefundUnavailable(?object $intent, ?object $attempt): ?string
+    {
+        if (! $intent || ! $attempt || $intent->provider !== 'midtrans') {
+            return 'provider_not_supported';
+        }
+
+        return app(MidtransClient::class)->refundReason($attempt);
+    }
+
+    private function queueProviderRefund(string $refundGuid): void
+    {
+        try {
+            ProcessMidtransRefund::dispatch($refundGuid);
+        } catch (Throwable) {
+            // The claim is durable; the scheduler dispatches it.
+            Log::warning('Provider refund awaits scheduled dispatch.', ['refund_request_guid' => $refundGuid]);
+        }
+    }
+
+    /**
+     * One worker pass over a claimed provider refund. Returns skipped (not claimable now), released, review, pending, sent or failed.
+     *
+     * First pass: re-check the ticket and the capability under the domain locks, record that the provider may now have received the
+     * request, and send it. Later passes: the persisted key is only ever re-sent; an accepted refund is verified by the Status API
+     * and never sent again. A timeout, an ambiguous answer or a crash can therefore never produce a second key.
+     */
+    public function processProviderRefund(string $refundGuid): string
+    {
+        $claimed = DB::table('booking_refund_requests')->where('guid', $refundGuid)->where('refund_route', 'provider_api')->where('status', 'refund_pending')
+            ->where(fn ($lease) => $lease->whereNull('dispatch_claimed_until')->orWhere('dispatch_claimed_until', '<=', now()))
+            ->update(['dispatch_claimed_until' => now()->addSeconds(self::LEASE_SECONDS), 'updated_at' => now()]);
+        if ($claimed !== 1) {
+            return 'skipped';
+        }
+        try {
+            return $this->advanceProviderRefund($refundGuid);
+        } catch (Throwable $exception) {
+            Log::error('Provider refund step failed; it will be retried with the same key.', ['refund_request_guid' => $refundGuid, 'exception_class' => $exception::class]);
+            DB::table('booking_refund_requests')->where('guid', $refundGuid)->where('status', 'refund_pending')
+                ->update(['last_error_code' => 'internal_error', 'next_reconcile_at' => now()->addMinute()]);
+
+            return 'failed';
+        } finally {
+            DB::table('booking_refund_requests')->where('guid', $refundGuid)->update(['dispatch_claimed_until' => null]);
+        }
+    }
+
+    private function advanceProviderRefund(string $refundGuid): string
+    {
+        $plan = $this->inRefundDomain($refundGuid, function (object $booking, ?object $intent, ?object $attempt, object $request): string {
+            if ($request->status !== 'refund_pending' || $request->refund_route !== 'provider_api' || ! $intent || ! $attempt) {
+                return 'skip';
+            }
+            if ($this->usedAdmission($booking->guid)) {
+                $this->move($request, 'needs_review', null, 'provider_refund_blocked_used_admission', ['review_reason' => 'used_admission']);
+
+                return 'review';
+            }
+            $first = $request->dispatch_started_at === null;
+            if ($first && ! $this->paymentStillSettled($intent, $attempt)) {
+                // The locked payment rows no longer show one settled payment (a review or reversal intervened): never send money back
+                // on a payment that is under review. The admission hold stays.
+                $this->move($request, 'needs_review', null, 'provider_refund_blocked_payment_state', ['review_reason' => 'payment_state_changed',
+                    'escalated_at' => now(), 'next_reconcile_at' => null]);
+
+                return 'review';
+            }
+            $unavailable = app(MidtransClient::class)->refundReason($attempt);
+            if ($first && $unavailable !== null) {
+                // Nothing was sent yet, so the manual workflow is safe. After the first send this branch can never be taken.
+                $this->move($request, 'manual_action_required', null, 'provider_refund_unavailable:'.$unavailable,
+                    ['refund_route' => 'manual', 'admission_hold' => null, 'next_reconcile_at' => null, 'last_error_code' => substr($unavailable, 0, 64)]);
+
+                return 'released';
+            }
+            if ($first) {
+                DB::table('booking_refund_requests')->where('guid', $request->guid)->update(['dispatch_started_at' => now(), 'dispatch_attempts' => 1, 'updated_at' => now()]);
+
+                return 'send';
+            }
+            if ($request->provider_refund_reference !== null) {
+                return 'verify';
+            }
+
+            return $unavailable === null && (int) $request->dispatch_attempts < self::DISPATCH_MAX ? 'verify_then_send' : 'verify';
+        });
+        if ($plan === null || $plan === 'skip') {
+            return 'skipped';
+        }
+        if (in_array($plan, ['released', 'review'], true)) {
+            return $plan;
+        }
+        if (in_array($plan, ['verify', 'verify_then_send'], true)) {
+            $request = DB::table('booking_refund_requests')->where('guid', $refundGuid)->first();
+            app(MidtransPaymentService::class)->verifyRefund($request->payment_attempt_guid);
+            $request = DB::table('booking_refund_requests')->where('guid', $refundGuid)->first();
+            if ($request->status !== 'refund_pending') {
+                return 'verified';
+            }
+            if ($plan === 'verify' || $request->provider_refund_reference !== null) {
+                return $this->scheduleVerification($refundGuid);
+            }
+            DB::table('booking_refund_requests')->where('guid', $refundGuid)->update(['dispatch_attempts' => DB::raw('dispatch_attempts + 1'), 'updated_at' => now()]);
+        }
+
+        return $this->sendProviderRefund($refundGuid);
+    }
+
+    private function sendProviderRefund(string $refundGuid): string
+    {
+        $request = DB::table('booking_refund_requests')->where('guid', $refundGuid)->first();
+        $attempt = DB::table('payment_attempts')->where('guid', $request->payment_attempt_guid)->first();
+        try {
+            $result = app(MidtransClient::class)->refund($attempt, $request);
+        } catch (Throwable $exception) {
+            Log::warning('Midtrans refund raised an internal fault.', ['refund_request_guid' => $refundGuid, 'exception_class' => $exception::class]);
+            $result = ['status' => 'unknown', 'reason' => 'provider_unavailable'];
+        }
+        $outcome = $this->inRefundDomain($refundGuid, function (object $booking, ?object $intent, ?object $attempt, object $request) use ($result): string {
+            if ($request->status !== 'refund_pending') {
+                return 'settled_elsewhere';
+            }
+            switch ($result['status']) {
+                case 'accepted':
+                    DB::table('booking_refund_requests')->where('guid', $request->guid)->update(['provider_refund_reference' => $result['provider_refund_reference'],
+                        'last_error_code' => null, 'next_reconcile_at' => now()->addSeconds(30), 'updated_at' => now()]);
+                    $this->audit($request->guid, null, 'refund_pending', 'refund_pending', 'provider_refund_accepted');
+
+                    return 'sent';
+                case 'rejected':
+                    if ((int) $request->dispatch_attempts <= 1) {
+                        // The money path is only abandoned after the Status API confirms that nothing was refunded (see below).
+                        return 'verify_rejection';
+                    }
+                    $this->move($request, 'needs_review', null, 'provider_refund_rejected_after_retry', ['review_reason' => 'provider_refund_rejected',
+                        'last_error_code' => substr($result['reason'], 0, 64), 'escalated_at' => now(), 'next_reconcile_at' => null]);
+
+                    return 'review';
+                case 'review':
+                    // Not the full refund we asked for: the request is quarantined in the same step as the payment (never re-sent).
+                    $this->move($request, 'needs_review', null, 'provider_refund_partial_answer', ['review_reason' => 'partial_adjustment_review',
+                        'escalated_at' => now(), 'next_reconcile_at' => null]);
+
+                    return 'quarantine';
+                default:
+                    if ((int) $request->dispatch_attempts >= self::DISPATCH_MAX) {
+                        $this->move($request, 'needs_review', null, 'refund_dispatch_unresolved', ['review_reason' => 'refund_dispatch_unresolved',
+                            'last_error_code' => substr((string) ($result['reason'] ?? 'unknown'), 0, 64), 'escalated_at' => now(), 'next_reconcile_at' => null]);
+
+                        return 'review';
+                    }
+                    DB::table('booking_refund_requests')->where('guid', $request->guid)->update(['last_error_code' => substr((string) ($result['reason'] ?? 'unknown'), 0, 64),
+                        'next_reconcile_at' => now()->addSeconds($this->backoff((int) $request->dispatch_attempts)), 'updated_at' => now()]);
+
+                    return 'pending';
+            }
+        });
+        if ($outcome === 'verify_rejection') {
+            // A refusal is not proof that nothing moved (a dashboard refund or a lost earlier answer may exist), so the live provider
+            // state decides: only a verified, still-paid payment lets the request leave the provider route for the manual workflow.
+            $verified = app(MidtransPaymentService::class)->verifyRefund($request->payment_attempt_guid);
+
+            return $this->inRefundDomain($refundGuid, function (object $booking, ?object $intent, ?object $attempt, object $request) use ($result, $verified): string {
+                if ($request->status !== 'refund_pending') {
+                    return 'settled_elsewhere';
+                }
+                if ($verified === 'done' && $intent && $attempt && $intent->status === 'paid' && $attempt->status === 'paid') {
+                    $this->move($request, 'manual_action_required', null, 'provider_refund_rejected', ['refund_route' => 'manual', 'admission_hold' => null,
+                        'review_reason' => 'provider_refund_rejected', 'last_error_code' => substr($result['reason'], 0, 64), 'next_reconcile_at' => null]);
+
+                    return 'released';
+                }
+                // Unverified: keep the hold and the key; the next pass verifies first and, if still needed, re-sends the SAME key.
+                DB::table('booking_refund_requests')->where('guid', $request->guid)->update(['last_error_code' => 'provider_refund_rejected_unverified',
+                    'next_reconcile_at' => now()->addSeconds($this->backoff((int) $request->dispatch_attempts)), 'updated_at' => now()]);
+
+                return 'pending';
+            }) ?? 'skipped';
+        }
+        if ($outcome === 'quarantine') {
+            // The provider answered with something other than the full refund: nothing is final, the payment goes to review.
+            app(PaymentSettlementService::class)->flagAmbiguousProviderOutcome($request->payment_attempt_guid, 'partial_adjustment_review');
+            Log::error('Midtrans refund answer was not the full refund; payment quarantined.', ['refund_request_guid' => $refundGuid]);
+
+            return 'review';
+        }
+
+        return $outcome ?? 'skipped';
+    }
+
+    /** Verification pass that did not finish the refund: count it, back off, and escalate once the bound is reached. */
+    private function scheduleVerification(string $refundGuid): string
+    {
+        return $this->inRefundDomain($refundGuid, function (object $booking, ?object $intent, ?object $attempt, object $request): string {
+            if ($request->status !== 'refund_pending') {
+                return 'verified';
+            }
+            $count = (int) $request->reconcile_count + 1;
+            if ($count >= self::RECONCILE_MAX) {
+                $this->move($request, 'needs_review', null, 'refund_unverified', ['review_reason' => 'refund_unverified', 'reconcile_count' => $count,
+                    'last_reconciled_at' => now(), 'escalated_at' => now(), 'next_reconcile_at' => null]);
+                Log::error('Provider refund could not be verified; escalated to review.', ['refund_request_guid' => $request->guid, 'reconcile_count' => $count]);
+
+                return 'review';
+            }
+            DB::table('booking_refund_requests')->where('guid', $request->guid)->update(['reconcile_count' => $count, 'last_reconciled_at' => now(),
+                'next_reconcile_at' => now()->addSeconds($this->backoff($count)), 'updated_at' => now()]);
+
+            return 'pending';
+        }) ?? 'skipped';
+    }
+
+    private function backoff(int $round): int
+    {
+        return min(900, 30 * 2 ** min(max($round, 0), 5)) + random_int(0, 15);
+    }
+
+    /**
+     * Runs a callback under the domain locks in the plan's order: destination, quota, booking, intent, attempt, refund request.
+     *
+     * @template T
+     *
+     * @param  \Closure(object, ?object, ?object, object): T  $callback
+     * @return T|null
+     */
+    private function inRefundDomain(string $refundGuid, \Closure $callback): mixed
+    {
+        $reference = DB::table('booking_refund_requests as r')->join('bookings as b', 'b.guid', '=', 'r.booking_guid')
+            ->where('r.guid', $refundGuid)->first(['b.guid as booking_guid', 'b.destination_quota_guid', 'r.payment_attempt_guid']);
+        if (! $reference) {
+            return null;
+        }
+        $destination = DB::table('destination_quotas')->where('guid', $reference->destination_quota_guid)->value('destination_guid');
+
+        return DB::transaction(function () use ($reference, $destination, $refundGuid, $callback): mixed {
+            app(AdminDestinationScopeService::class)->lockDestination($destination);
+            $booking = $this->lockBooking($reference->booking_guid);
+            $intent = DB::table('payment_intents')->where('booking_guid', $booking->guid)->lockForUpdate()->first();
+            $attempt = DB::table('payment_attempts')->where('guid', $reference->payment_attempt_guid)->lockForUpdate()->first();
+            $request = DB::table('booking_refund_requests')->where('guid', $refundGuid)->lockForUpdate()->first();
+
+            return $request ? $callback($booking, $intent, $attempt, $request) : null;
+        }, 3);
     }
 
     /** A provider refund/reversal that could not be applied cleanly (amount, snapshot, ownership) must be reviewed by a human. */
@@ -282,6 +576,8 @@ class BookingRefundService
             'decision_note' => $row->status === 'rejected' || $staff ? $row->decision_note : null,
         ];
         if ($staff) {
+            $summary += ['refund_route' => $row->refund_route, 'refund_key' => $row->refund_key, 'provider_refund_reference' => $row->provider_refund_reference,
+                'admission_hold' => $row->admission_hold !== null, 'last_error_code' => $row->last_error_code, 'escalated_at' => $iso($row->escalated_at)];
             $summary += ['review_reason' => $row->review_reason, 'provider_correlation' => $row->provider_correlation, 'requested_by_user_guid' => $row->requested_by_user_guid,
                 'settlement_amount' => $row->settlement_amount === null ? null : (int) $row->settlement_amount, 'settled_by_user_guid' => $row->settled_by_user_guid,
                 'settlement_note' => $row->settlement_note];
@@ -313,6 +609,13 @@ class BookingRefundService
     private function lockBooking(string $guid): object
     {
         return app(TicketService::class)->booking($guid, true);
+    }
+
+    /** From the LOCKED rows: one paid attempt that the intent actually applied. Rows are absent only for legacy flows that never had them. */
+    private function paymentStillSettled(?object $intent, ?object $attempt): bool
+    {
+        return ! $intent || ! $attempt
+            || ($intent->status === 'paid' && $attempt->status === 'paid' && $intent->applied_attempt_guid === $attempt->guid);
     }
 
     private function usedAdmission(string $bookingGuid): bool

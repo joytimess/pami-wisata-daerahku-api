@@ -330,9 +330,9 @@ class MidtransClient
     }
 
     /** Diagnostics carry classified codes only: never the Server Key, the request, the provider message or the response body. */
-    private function log(object $attempt, string $diagnosticCode, ?int $httpStatus, ?string $providerStatusCode): void
+    private function log(object $attempt, string $diagnosticCode, ?int $httpStatus, ?string $providerStatusCode, string $message = 'Midtrans Charge did not produce a payable instruction.'): void
     {
-        Log::warning('Midtrans Charge did not produce a payable instruction.', ['attempt_guid' => $attempt->guid, 'environment' => $this->environment(),
+        Log::warning($message, ['attempt_guid' => $attempt->guid, 'environment' => $this->environment(),
             'channel' => $attempt->channel, 'diagnostic_code' => $diagnosticCode, 'http_status' => $httpStatus, 'provider_status_code' => $providerStatusCode]);
     }
 }

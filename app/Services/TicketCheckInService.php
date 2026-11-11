@@ -97,6 +97,15 @@ class TicketCheckInService
         if ($ticket->qr_revoked_at !== null || $this->tickets->state($booking) === 'revoked') {
             throw new TicketException('ticket_revoked', 'Tiket sudah dicabut atau booking dibatalkan.');
         }
+        // Refund versus admission: current (locking) reads, because this transaction's snapshot may predate a refund that committed
+        // while it waited for the destination and booking locks. A settled refund revokes admission for good; an automatic refund that
+        // is claimed or unresolved holds it. Both win over a check-in that did not commit first.
+        if (DB::table('booking_refund_requests')->where('booking_guid', $booking->guid)->whereIn('status', BookingRefundService::SETTLED_STATUSES)->sharedLock()->exists()) {
+            throw new TicketException('ticket_revoked', 'Tiket sudah dicabut atau booking dibatalkan.');
+        }
+        if (DB::table('booking_refund_requests')->where('booking_guid', $booking->guid)->where('admission_hold', 1)->sharedLock()->exists()) {
+            throw new TicketException('refund_in_progress', 'Pengembalian dana sedang diproses; tiket ditahan sementara.');
+        }
         if (! in_array($this->payments->entitlement($booking), ['paid', 'free'], true)) {
             throw new TicketException('payment_not_paid', 'Menunggu pembayaran terverifikasi.');
         }

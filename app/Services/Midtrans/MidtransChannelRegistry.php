@@ -114,6 +114,28 @@ class MidtransChannelRegistry
             ?? ($this->environment() === 'production' && ! in_array($code, (array) config('midtrans.verified_channels', []), true) ? 'channel_not_verified' : null);
     }
 
+    /**
+     * Whether the provider refund API may be used for a paid attempt of this channel. Only QRIS, only when explicitly enabled and
+     * only while credentials and host are valid. The new-charge kill switch deliberately does not apply: refunding an order the
+     * provider already holds must keep working.
+     */
+    public function refundReason(string $method, string $channel): ?string
+    {
+        if ($method !== 'qris' || $channel !== 'qris') {
+            return 'refund_api_unsupported_channel';
+        }
+        if (! config('midtrans.refund.qris_api_enabled', false)) {
+            return 'refund_api_not_enabled';
+        }
+
+        return $this->verificationReason();
+    }
+
+    public function refundWindowDays(): int
+    {
+        return max(0, (int) config('midtrans.refund.qris_window_days', 14));
+    }
+
     /** @return array<string, string|null> channel code => disabled reason (null when payable) */
     public function reasons(): array
     {
