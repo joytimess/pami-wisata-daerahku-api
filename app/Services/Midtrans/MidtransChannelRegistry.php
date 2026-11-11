@@ -121,6 +121,12 @@ class MidtransChannelRegistry
      */
     public function refundReason(string $method, string $channel): ?string
     {
+        return $this->capabilityReason($method, $channel) ?? $this->verificationReason();
+    }
+
+    /** Channel support and the capability switch only: what no credential or environment change can fix by itself. */
+    public function capabilityReason(string $method, string $channel): ?string
+    {
         if ($method !== 'qris' || $channel !== 'qris') {
             return 'refund_api_unsupported_channel';
         }
@@ -128,7 +134,7 @@ class MidtransChannelRegistry
             return 'refund_api_not_enabled';
         }
 
-        return $this->verificationReason();
+        return null;
     }
 
     public function refundWindowDays(): int

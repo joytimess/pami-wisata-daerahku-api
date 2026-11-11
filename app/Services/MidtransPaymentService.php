@@ -41,6 +41,9 @@ class MidtransPaymentService
 
     private const RECEIPT_MAX_ATTEMPTS = 10;
 
+    /** Operator re-verification collapses into one provider call per attempt within this many seconds. */
+    private const OPERATOR_MIN_INTERVAL_SECONDS = 10;
+
     private const REFRESH_MIN_INTERVAL_SECONDS = 10;
 
     private const NOTIFICATION_MIN_INTERVAL_SECONDS = 5;
@@ -49,12 +52,21 @@ class MidtransPaymentService
      * Provider evidence that is neither payable nor safely retryable: the payment is held for a human instead of being retried
      * or guessed. (`merchant_mismatch` here is the PROVIDER's merchant differing from the bound one.)
      */
-    private const REVIEW_REASONS = ['partial_adjustment_review', 'fraud_status_review', 'merchant_mismatch', 'transaction_mismatch'];
+    public const REVIEW_REASONS = ['partial_adjustment_review', 'fraud_status_review', 'merchant_mismatch', 'transaction_mismatch'];
 
     /** Evidence that does not match the stored attempt. Retried a bounded number of consecutive rounds, then reviewed. */
     private const INVALID_REASONS = ['provider_response_invalid', 'provider_expiry_invalid'];
 
     private const INVALID_ESCALATION_ROUNDS = 5;
+
+    /**
+     * How long after its instruction window an unresolved attempt is still polled on a schedule. The attempt then keeps its quota
+     * and stays open, scheduled lookups stop, and only a notification, an owner refresh or an operator re-verification can move it:
+     * a Charge outcome that stays unknown is never retried with a new order and never released on a timeout.
+     */
+    private const RECOVERY_WINDOW_SECONDS = 6 * 3600;
+
+    private ?string $lastOutcome = null;
 
     public function __construct(private MidtransClient $client, private MidtransChannelRegistry $registry, private TicketService $tickets) {}
 
@@ -229,7 +241,8 @@ class MidtransPaymentService
                         'finished_at' => null, 'next_reconcile_at' => $attempt->next_reconcile_at, 'updated_at' => now()]);
                 }
                 if ($status === 'failed') {
-                    DB::table('payment_intents')->where('guid', $intent->guid)->update(['status' => 'requires_payment', 'updated_at' => now()]);
+                    // Only a payment that is still processing: an intent in review is left for an operator.
+                    DB::table('payment_intents')->where('guid', $intent->guid)->where('status', 'processing')->update(['status' => 'requires_payment', 'updated_at' => now()]);
                 }
                 if ($conflict) {
                     Log::error('Midtrans returned a transaction id that belongs to another attempt; payment quarantined.', ['attempt_guid' => $attempt->guid]);
@@ -356,6 +369,23 @@ class MidtransPaymentService
         }
     }
 
+    /**
+     * Operator-requested authenticated Status lookup of one attempt of any non-reversed status. The answer is applied exactly like a
+     * scheduled one, through the claimed lookup, so it can confirm, expire or quarantine but never invents an outcome.
+     * Returns done|throttled|skipped|failed.
+     */
+    public function reverify(string $attemptGuid): string
+    {
+        $this->lastOutcome = null;
+        try {
+            return $this->lookup($attemptGuid, 'operator');
+        } catch (Throwable $exception) {
+            Log::warning('Midtrans operator re-verification failed.', ['attempt_guid' => $attemptGuid, 'exception_class' => $exception::class]);
+
+            return 'failed';
+        }
+    }
+
     /** Scheduler/worker entry: one claimed Status lookup of a due open attempt. */
     public function reconcile(string $attemptGuid): void
     {
@@ -390,7 +420,7 @@ class MidtransPaymentService
      * One claimed lookup. Returns done (an outcome was applied), skipped (not eligible), throttled (a recent lookup already ran)
      * or failed (no usable evidence; retry later).
      *
-     * @param  'scheduled'|'refresh'|'notification'|'refund'  $mode
+     * @param  'scheduled'|'refresh'|'notification'|'refund'|'operator'  $mode
      */
     private function lookup(string $attemptGuid, string $mode): string
     {
@@ -398,11 +428,11 @@ class MidtransPaymentService
             return $mode === 'notification' ? 'failed' : 'skipped';
         }
         $interval = match ($mode) {
-            'scheduled' => 0, 'refresh' => self::REFRESH_MIN_INTERVAL_SECONDS, default => self::NOTIFICATION_MIN_INTERVAL_SECONDS,
+            'scheduled' => 0, 'operator' => self::OPERATOR_MIN_INTERVAL_SECONDS, 'refresh' => self::REFRESH_MIN_INTERVAL_SECONDS, default => self::NOTIFICATION_MIN_INTERVAL_SECONDS,
         };
         $eligible = fn () => DB::table('payment_attempts')->where('guid', $attemptGuid)->where('provider', 'midtrans')
             ->where('environment', $this->client->environment())
-            ->when($mode === 'notification', fn ($query) => $query->where('status', '!=', 'reversed'),
+            ->when(in_array($mode, ['notification', 'operator'], true), fn ($query) => $query->where('status', '!=', 'reversed'),
                 fn ($query) => $mode === 'refund' ? $query->where('status', 'paid') : $query->whereIn('status', self::OPEN_ATTEMPT_STATUSES));
         $query = $eligible();
         if ($mode === 'scheduled') {
@@ -425,16 +455,50 @@ class MidtransPaymentService
             DB::table('payment_attempts')->where('guid', $attemptGuid)->whereIn('status', self::OPEN_ATTEMPT_STATUSES)->update(['last_error_code' => 'reconciliation_unavailable']);
             $result = 'failed';
         }
-        $count = (int) DB::table('payment_attempts')->where('guid', $attemptGuid)->value('reconcile_count');
-        DB::table('payment_attempts')->where('guid', $attemptGuid)->whereIn('status', self::OPEN_ATTEMPT_STATUSES)
-            ->update(['next_reconcile_at' => now()->addSeconds(min(300, 30 * 2 ** min($count, 4)) + random_int(0, 15))]);
+        $this->scheduleNextLookup($attemptGuid);
 
         return $result;
+    }
+
+    /** Backs off an open attempt, or ends its scheduled recovery once the bounded window after its instruction expiry has passed. */
+    private function scheduleNextLookup(string $attemptGuid): void
+    {
+        $row = DB::table('payment_attempts')->where('guid', $attemptGuid)->whereIn('status', self::OPEN_ATTEMPT_STATUSES)
+            ->first(['reconcile_count', 'instruction_expires_at', 'recovery_exhausted_at', 'escalated_at', 'last_error_code', 'payment_intent_guid', 'status']);
+        if (! $row) {
+            return;
+        }
+        $overdue = $row->instruction_expires_at !== null && CarbonImmutable::parse($row->instruction_expires_at, 'UTC')->lte(now());
+        $exhausted = $overdue && CarbonImmutable::parse($row->instruction_expires_at, 'UTC')->addSeconds(self::RECOVERY_WINDOW_SECONDS)->lte(now());
+        if ($exhausted) {
+            $newly = $row->recovery_exhausted_at === null;
+            DB::table('payment_attempts')->where('guid', $attemptGuid)->whereIn('status', self::OPEN_ATTEMPT_STATUSES)->update([
+                'next_reconcile_at' => null, 'recovery_exhausted_at' => $row->recovery_exhausted_at ?? now(), 'escalated_at' => $row->escalated_at ?? now(),
+                'escalation_reason' => DB::raw($row->escalated_at === null ? "'recovery_exhausted'" : 'escalation_reason'), 'updated_at' => now()]);
+            if ($newly) {
+                Log::error('Midtrans payment attempt recovery window ended without proof; the attempt stays open and holds its quota for an operator.', [
+                    'attempt_guid' => $attemptGuid, 'payment_intent_guid' => $row->payment_intent_guid, 'status' => $row->status, 'last_error_code' => $row->last_error_code]);
+            }
+
+            return;
+        }
+        // Past its window the schedule widens: the provider's own expiry has already decided the order, so frequent polling adds nothing.
+        $cap = $overdue ? 900 : 300;
+        DB::table('payment_attempts')->where('guid', $attemptGuid)->whereIn('status', self::OPEN_ATTEMPT_STATUSES)->whereNull('recovery_exhausted_at')
+            ->update(['next_reconcile_at' => now()->addSeconds(min($cap, 30 * 2 ** min((int) $row->reconcile_count, 4)) + random_int(0, 15))]);
+    }
+
+    /** The normalized provider answer of the lookup this process ran last (`paid`, `refunded`, `pending`, `unknown:<reason>`, ...). */
+    public function lastOutcome(): ?string
+    {
+        return $this->lastOutcome;
     }
 
     /** @param array<string, mixed> $outcome */
     private function record(object $attempt, array $outcome, string $mode = 'scheduled'): string
     {
+        $this->lastOutcome = $outcome['status'] === 'unknown' ? 'unknown:'.($outcome['reason'] ?? 'provider_response_invalid') : $outcome['status'];
+
         return match ($outcome['status']) {
             'pending' => $this->recordPending($attempt, $outcome),
             'paid', 'failed', 'expired', 'refunded' => $this->recordEvidence($attempt, $outcome),
@@ -507,6 +571,7 @@ class MidtransPaymentService
 
             return 'done';
         }
+        DB::table('payment_attempts')->where('guid', $attempt->guid)->whereIn('last_error_code', self::REVIEW_REASONS)->update(['last_error_code' => null]);
         $type = match ($outcome['status']) {
             'paid' => 'capture', 'refunded' => 'refund', default => 'status',
         };
@@ -547,6 +612,10 @@ class MidtransPaymentService
         DB::table('payment_attempts')->where('guid', $attempt->guid)->where('status', 'initiating')->update(['status' => 'unknown', 'updated_at' => now()]);
         DB::table('payment_attempts')->where('guid', $attempt->guid)->whereIn('status', self::OPEN_ATTEMPT_STATUSES)
             ->update(['last_error_code' => substr($reason, 0, 64), 'updated_at' => now()]);
+        // Ambiguity seen on an attempt that is already paid (chargeback, partial refund, identity drift) must stay visible to recovery.
+        if (in_array($reason, self::REVIEW_REASONS, true)) {
+            DB::table('payment_attempts')->where('guid', $attempt->guid)->where('status', 'paid')->update(['last_error_code' => substr($reason, 0, 64), 'updated_at' => now()]);
+        }
         // Invalid evidence is retried with backoff, but boundedly: the same invalid answer round after round puts the whole payment
         // under review (the attempt stays open and the quota stays held; nothing is ever paid or released from invalid evidence).
         // Only the scheduler's backed-off rounds count: bursts of owner refreshes or notifications (seconds apart) cannot escalate it.

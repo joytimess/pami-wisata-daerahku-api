@@ -66,20 +66,19 @@ class ReconcileMidtransPayments extends Command
             }
         }
 
-        if ($registry->verificationReason() === null) {
-            // Claimed provider refunds that are due: first dispatch, a re-send of the SAME key, or verification of an accepted refund.
-            $refunds = DB::table('booking_refund_requests as r')->join('payment_attempts as a', 'a.guid', '=', 'r.payment_attempt_guid')
-                ->where('a.provider', 'midtrans')->where('a.environment', $environment)
-                ->where('r.refund_route', 'provider_api')->where('r.status', 'refund_pending')->where('r.next_reconcile_at', '<=', now())
-                ->where(fn ($lease) => $lease->whereNull('r.dispatch_claimed_until')->orWhere('r.dispatch_claimed_until', '<=', now()))
-                ->orderBy('r.next_reconcile_at')->orderBy('r.guid')->limit($limit)->pluck('r.guid');
-            foreach ($refunds as $guid) {
-                try {
-                    ProcessMidtransRefund::dispatch($guid);
-                } catch (Throwable) {
-                    $failures++;
-                    Log::warning('Midtrans refund awaits queue recovery.', ['refund_request_guid' => $guid]);
-                }
+        // Claimed provider refunds that are due: first dispatch, a re-send of the SAME key, or verification of an accepted refund.
+        // Not gated on credentials: a refund that cannot be dispatched defers safely and reaches an operator at its bound.
+        $refunds = DB::table('booking_refund_requests as r')->join('payment_attempts as a', 'a.guid', '=', 'r.payment_attempt_guid')
+            ->where('a.provider', 'midtrans')->where('a.environment', $environment)
+            ->where('r.refund_route', 'provider_api')->where('r.status', 'refund_pending')->where('r.next_reconcile_at', '<=', now())
+            ->where(fn ($lease) => $lease->whereNull('r.dispatch_claimed_until')->orWhere('r.dispatch_claimed_until', '<=', now()))
+            ->orderBy('r.next_reconcile_at')->orderBy('r.guid')->limit($limit)->pluck('r.guid');
+        foreach ($refunds as $guid) {
+            try {
+                ProcessMidtransRefund::dispatch($guid);
+            } catch (Throwable) {
+                $failures++;
+                Log::warning('Midtrans refund awaits queue recovery.', ['refund_request_guid' => $guid]);
             }
         }
 

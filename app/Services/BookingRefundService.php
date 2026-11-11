@@ -49,6 +49,15 @@ class BookingRefundService
     /** Sends of one refund key before a still-ambiguous dispatch is escalated. */
     private const DISPATCH_MAX = 5;
 
+    /**
+     * Reasons a provider refund is unavailable that a configuration fix can undo (credentials, environment, merchant binding).
+     * Before the first send they defer the request instead of moving it to the manual route for good.
+     */
+    private const CONFIGURATION_REASONS = ['midtrans_not_configured', 'environment_mismatch', 'attempt_merchant_mismatch'];
+
+    /** Deferred passes (backed off) before a still unconfigured provider refund is handed to an operator, route and hold intact. */
+    private const CONFIGURATION_RETRY_MAX = 12;
+
     public function __construct(private PaymentEligibility $payments, private PaymentService $paymentService) {}
 
     /**
@@ -134,7 +143,7 @@ class BookingRefundService
             } else {
                 $this->move($request, 'approved', $actor->guid, $note, ['decided_by_user_guid' => $actor->guid, 'decided_at' => now(), 'decision_note' => $note]);
                 $approved = DB::table('booking_refund_requests')->where('guid', $refundGuid)->first();
-                $unavailable = $this->providerRefundUnavailable($intent, $attempt);
+                $unavailable = $this->providerRefundClaimBlocker($intent, $attempt);
                 if ($unavailable === null) {
                     // The claim: key, route and admission hold are durable BEFORE any provider call, in the same transaction that
                     // proved no ticket was used. A check-in can only win by committing first, and then this branch is never reached.
@@ -293,6 +302,20 @@ class BookingRefundService
         return app(MidtransClient::class)->refundReason($attempt);
     }
 
+    /**
+     * Why the provider API can never take this refund (null when it can, now or once a configuration blip heals). A configuration
+     * reason alone is not evidence that the refund is unsupported, so it only counts when the capability itself is also missing.
+     */
+    private function providerRefundClaimBlocker(?object $intent, ?object $attempt): ?string
+    {
+        $reason = $this->providerRefundUnavailable($intent, $attempt);
+        if ($reason === null || ! in_array($reason, self::CONFIGURATION_REASONS, true)) {
+            return $reason;
+        }
+
+        return app(MidtransClient::class)->refundCapabilityReason($attempt);
+    }
+
     private function queueProviderRefund(string $refundGuid): void
     {
         try {
@@ -312,29 +335,33 @@ class BookingRefundService
      */
     public function processProviderRefund(string $refundGuid): string
     {
+        // The lease is OWNED: only the worker holding this token may release it or record a step, so a slow worker whose lease expired
+        // can neither delete the claim of the worker that replaced it nor write a second set of counters.
+        $token = (string) Str::uuid();
         $claimed = DB::table('booking_refund_requests')->where('guid', $refundGuid)->where('refund_route', 'provider_api')->where('status', 'refund_pending')
             ->where(fn ($lease) => $lease->whereNull('dispatch_claimed_until')->orWhere('dispatch_claimed_until', '<=', now()))
-            ->update(['dispatch_claimed_until' => now()->addSeconds(self::LEASE_SECONDS), 'updated_at' => now()]);
+            ->update(['dispatch_claimed_until' => now()->addSeconds(self::LEASE_SECONDS), 'dispatch_claim_token' => $token, 'updated_at' => now()]);
         if ($claimed !== 1) {
             return 'skipped';
         }
         try {
-            return $this->advanceProviderRefund($refundGuid);
+            return $this->advanceProviderRefund($refundGuid, $token);
         } catch (Throwable $exception) {
             Log::error('Provider refund step failed; it will be retried with the same key.', ['refund_request_guid' => $refundGuid, 'exception_class' => $exception::class]);
-            DB::table('booking_refund_requests')->where('guid', $refundGuid)->where('status', 'refund_pending')
+            DB::table('booking_refund_requests')->where('guid', $refundGuid)->where('status', 'refund_pending')->where('dispatch_claim_token', $token)
                 ->update(['last_error_code' => 'internal_error', 'next_reconcile_at' => now()->addMinute()]);
 
             return 'failed';
         } finally {
-            DB::table('booking_refund_requests')->where('guid', $refundGuid)->update(['dispatch_claimed_until' => null]);
+            DB::table('booking_refund_requests')->where('guid', $refundGuid)->where('dispatch_claim_token', $token)
+                ->update(['dispatch_claimed_until' => null, 'dispatch_claim_token' => null]);
         }
     }
 
-    private function advanceProviderRefund(string $refundGuid): string
+    private function advanceProviderRefund(string $refundGuid, string $token): string
     {
-        $plan = $this->inRefundDomain($refundGuid, function (object $booking, ?object $intent, ?object $attempt, object $request): string {
-            if ($request->status !== 'refund_pending' || $request->refund_route !== 'provider_api' || ! $intent || ! $attempt) {
+        $plan = $this->inRefundDomain($refundGuid, function (object $booking, ?object $intent, ?object $attempt, object $request) use ($token): string {
+            if ($request->status !== 'refund_pending' || $request->refund_route !== 'provider_api' || ! $intent || ! $attempt || $request->dispatch_claim_token !== $token) {
                 return 'skip';
             }
             if ($this->usedAdmission($booking->guid)) {
@@ -353,9 +380,15 @@ class BookingRefundService
             }
             $unavailable = app(MidtransClient::class)->refundReason($attempt);
             if ($first && $unavailable !== null) {
-                // Nothing was sent yet, so the manual workflow is safe. After the first send this branch can never be taken.
-                $this->move($request, 'manual_action_required', null, 'provider_refund_unavailable:'.$unavailable,
-                    ['refund_route' => 'manual', 'admission_hold' => null, 'next_reconcile_at' => null, 'last_error_code' => substr($unavailable, 0, 64)]);
+                $permanent = in_array($unavailable, self::CONFIGURATION_REASONS, true) ? app(MidtransClient::class)->refundCapabilityReason($attempt) : $unavailable;
+                if ($permanent === null) {
+                    // A configuration blip is not evidence that the refund is unsupported: wait, bounded, with the key and hold intact.
+                    return $this->deferForConfiguration($request, $unavailable);
+                }
+                // Nothing was sent yet and the capability itself is missing, so the manual workflow is safe. After the first send this
+                // branch can never be taken.
+                $this->move($request, 'manual_action_required', null, 'provider_refund_unavailable:'.$permanent,
+                    ['refund_route' => 'manual', 'admission_hold' => null, 'next_reconcile_at' => null, 'last_error_code' => substr($permanent, 0, 64)]);
 
                 return 'released';
             }
@@ -373,7 +406,7 @@ class BookingRefundService
         if ($plan === null || $plan === 'skip') {
             return 'skipped';
         }
-        if (in_array($plan, ['released', 'review'], true)) {
+        if (in_array($plan, ['released', 'review', 'deferred'], true)) {
             return $plan;
         }
         if (in_array($plan, ['verify', 'verify_then_send'], true)) {
@@ -384,15 +417,33 @@ class BookingRefundService
                 return 'verified';
             }
             if ($plan === 'verify' || $request->provider_refund_reference !== null) {
-                return $this->scheduleVerification($refundGuid);
+                return $this->scheduleVerification($refundGuid, $token);
             }
-            DB::table('booking_refund_requests')->where('guid', $refundGuid)->update(['dispatch_attempts' => DB::raw('dispatch_attempts + 1'), 'updated_at' => now()]);
+            DB::table('booking_refund_requests')->where('guid', $refundGuid)->where('dispatch_claim_token', $token)
+                ->update(['dispatch_attempts' => DB::raw('dispatch_attempts + 1'), 'updated_at' => now()]);
         }
 
-        return $this->sendProviderRefund($refundGuid);
+        return $this->sendProviderRefund($refundGuid, $token);
     }
 
-    private function sendProviderRefund(string $refundGuid): string
+    /** First-send pass that found the provider configuration unusable: count it, back off, and hand over to an operator at the bound. */
+    private function deferForConfiguration(object $request, string $reason): string
+    {
+        $count = (int) $request->reconcile_count + 1;
+        if ($count >= self::CONFIGURATION_RETRY_MAX) {
+            $this->move($request, 'needs_review', null, 'provider_refund_configuration_unavailable', ['review_reason' => 'refund_configuration_unavailable',
+                'last_error_code' => substr($reason, 0, 64), 'reconcile_count' => $count, 'last_reconciled_at' => now(), 'escalated_at' => now(), 'next_reconcile_at' => null]);
+            Log::error('Provider refund could not be dispatched because the configuration stayed unusable; escalated to review.', ['refund_request_guid' => $request->guid, 'reason' => $reason]);
+
+            return 'review';
+        }
+        DB::table('booking_refund_requests')->where('guid', $request->guid)->update(['reconcile_count' => $count, 'last_reconciled_at' => now(),
+            'last_error_code' => substr($reason, 0, 64), 'next_reconcile_at' => now()->addSeconds($this->backoff($count)), 'updated_at' => now()]);
+
+        return 'deferred';
+    }
+
+    private function sendProviderRefund(string $refundGuid, string $token): string
     {
         $request = DB::table('booking_refund_requests')->where('guid', $refundGuid)->first();
         $attempt = DB::table('payment_attempts')->where('guid', $request->payment_attempt_guid)->first();
@@ -402,9 +453,14 @@ class BookingRefundService
             Log::warning('Midtrans refund raised an internal fault.', ['refund_request_guid' => $refundGuid, 'exception_class' => $exception::class]);
             $result = ['status' => 'unknown', 'reason' => 'provider_unavailable'];
         }
-        $outcome = $this->inRefundDomain($refundGuid, function (object $booking, ?object $intent, ?object $attempt, object $request) use ($result): string {
+        $outcome = $this->inRefundDomain($refundGuid, function (object $booking, ?object $intent, ?object $attempt, object $request) use ($result, $token): string {
             if ($request->status !== 'refund_pending') {
                 return 'settled_elsewhere';
+            }
+            if ($request->dispatch_claim_token !== $token) {
+                // This worker's lease was replaced while the request was in flight. The key is idempotent at the provider and the
+                // current owner verifies before it ever sends again, so the answer is dropped rather than recorded twice.
+                return 'lost_claim';
             }
             switch ($result['status']) {
                 case 'accepted':
@@ -446,9 +502,12 @@ class BookingRefundService
             // state decides: only a verified, still-paid payment lets the request leave the provider route for the manual workflow.
             $verified = app(MidtransPaymentService::class)->verifyRefund($request->payment_attempt_guid);
 
-            return $this->inRefundDomain($refundGuid, function (object $booking, ?object $intent, ?object $attempt, object $request) use ($result, $verified): string {
+            return $this->inRefundDomain($refundGuid, function (object $booking, ?object $intent, ?object $attempt, object $request) use ($result, $verified, $token): string {
                 if ($request->status !== 'refund_pending') {
                     return 'settled_elsewhere';
+                }
+                if ($request->dispatch_claim_token !== $token) {
+                    return 'skipped';
                 }
                 if ($verified === 'done' && $intent && $attempt && $intent->status === 'paid' && $attempt->status === 'paid') {
                     $this->move($request, 'manual_action_required', null, 'provider_refund_rejected', ['refund_route' => 'manual', 'admission_hold' => null,
@@ -471,15 +530,18 @@ class BookingRefundService
             return 'review';
         }
 
-        return $outcome ?? 'skipped';
+        return $outcome === null || $outcome === 'lost_claim' ? 'skipped' : $outcome;
     }
 
     /** Verification pass that did not finish the refund: count it, back off, and escalate once the bound is reached. */
-    private function scheduleVerification(string $refundGuid): string
+    private function scheduleVerification(string $refundGuid, string $token): string
     {
-        return $this->inRefundDomain($refundGuid, function (object $booking, ?object $intent, ?object $attempt, object $request): string {
+        return $this->inRefundDomain($refundGuid, function (object $booking, ?object $intent, ?object $attempt, object $request) use ($token): string {
             if ($request->status !== 'refund_pending') {
                 return 'verified';
+            }
+            if ($request->dispatch_claim_token !== $token) {
+                return 'skipped';
             }
             $count = (int) $request->reconcile_count + 1;
             if ($count >= self::RECONCILE_MAX) {
@@ -509,7 +571,7 @@ class BookingRefundService
      * @param  \Closure(object, ?object, ?object, object): T  $callback
      * @return T|null
      */
-    private function inRefundDomain(string $refundGuid, \Closure $callback): mixed
+    public function inRefundDomain(string $refundGuid, \Closure $callback): mixed
     {
         $reference = DB::table('booking_refund_requests as r')->join('bookings as b', 'b.guid', '=', 'r.booking_guid')
             ->where('r.guid', $refundGuid)->first(['b.guid as booking_guid', 'b.destination_quota_guid', 'r.payment_attempt_guid']);
@@ -569,6 +631,8 @@ class BookingRefundService
             'guid' => $row->guid, 'booking_guid' => $row->booking_guid, 'status' => $row->status, 'message' => $this->message($row->status),
             'amount' => (int) $row->amount, 'currency' => $row->currency, 'requested_at' => $iso($row->requested_at), 'decided_at' => $iso($row->decided_at),
             'refunded_at' => $iso($row->refunded_at), 'reason' => $row->reason,
+            // An automatic refund that is claimed or unresolved holds entry; the ticket snapshot reports the same fact.
+            'admission_blocked' => $row->admission_hold !== null,
             'refund_channel' => $row->status === 'manual_refunded' ? 'manual' : ($row->status === 'refunded' ? 'provider' : null),
             'settled_at' => $iso($row->settled_at),
             'settlement_method' => $row->settlement_method, 'settlement_reference' => $this->maskReference($row->settlement_reference),
@@ -612,20 +676,20 @@ class BookingRefundService
     }
 
     /** From the LOCKED rows: one paid attempt that the intent actually applied. Rows are absent only for legacy flows that never had them. */
-    private function paymentStillSettled(?object $intent, ?object $attempt): bool
+    public function paymentStillSettled(?object $intent, ?object $attempt): bool
     {
         return ! $intent || ! $attempt
             || ($intent->status === 'paid' && $attempt->status === 'paid' && $intent->applied_attempt_guid === $attempt->guid);
     }
 
-    private function usedAdmission(string $bookingGuid): bool
+    public function usedAdmission(string $bookingGuid): bool
     {
         return DB::table('booking_tickets')->where('booking_guid', $bookingGuid)->whereNotNull('checked_in_at')->lockForUpdate()->exists()
             || DB::table('check_ins')->where('booking_guid', $bookingGuid)->exists();
     }
 
     /** @param array<string, mixed> $changes */
-    private function move(object $request, string $to, ?string $actorGuid, ?string $note, array $changes): void
+    public function move(object $request, string $to, ?string $actorGuid, ?string $note, array $changes): void
     {
         DB::table('booking_refund_requests')->where('guid', $request->guid)->update($changes + ['status' => $to, 'updated_at' => now()]);
         $this->audit($request->guid, $actorGuid, $request->status, $to, $note);

@@ -20,6 +20,7 @@ use App\Http\Controllers\Api\V1\MidtransWebhookController;
 use App\Http\Controllers\Api\V1\OperationalDashboardController;
 use App\Http\Controllers\Api\V1\PaymentController;
 use App\Http\Controllers\Api\V1\PaymentPreviewController;
+use App\Http\Controllers\Api\V1\PaymentRecoveryController;
 use App\Http\Controllers\Api\V1\QuotaController;
 use App\Http\Controllers\Api\V1\TicketCheckInController;
 use App\Http\Controllers\Api\V1\TicketController;
@@ -320,6 +321,15 @@ Route::prefix('v1')->group(function () {
             Route::get('{booking}', 'adminShow')->name('admin.bookings.show');
             Route::post('{booking}/approve', 'approve');
             Route::post('{booking}/reject', 'reject');
+        });
+
+        // Authorized recovery of payments, unknown Charge outcomes and refunds the engine can no longer move. Scope and role are
+        // enforced in the service; evidence is verified by the server, never taken from the payload.
+        Route::controller(PaymentRecoveryController::class)->group(function () {
+            Route::get('payment-recovery', 'queue')->name('admin.recovery.queue');
+            Route::get('bookings/{booking}/payment-recovery', 'show')->name('admin.recovery.show');
+            Route::post('bookings/{booking}/payment-recovery', 'payment')->middleware('throttle:30,1')->name('admin.recovery.payment');
+            Route::post('bookings/{booking}/refund-requests/{refund}/recovery', 'refund')->whereUuid('refund')->middleware('throttle:30,1')->name('admin.recovery.refund');
         });
 
         Route::controller(BookingRefundController::class)->prefix('bookings/{booking}/refund-requests')->group(function () {

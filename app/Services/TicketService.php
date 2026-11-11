@@ -190,20 +190,49 @@ class TicketService
         $state = $this->state($booking);
         $tickets = DB::table('booking_tickets')->where('booking_guid', $booking->guid)->orderBy('sequence')->sharedLock()->get();
         $checked = $tickets->whereNotNull('checked_in_at')->count();
+        [$admission, $reason, $refundPending] = $this->admission($booking, $state, $checked);
+        $blocked = $admission === 'temporarily_blocked';
 
         return [
             'booking_guid' => $booking->guid, 'visit_date' => $booking->visit_date, 'timezone' => $booking->destination_timezone,
             'qr_available_from' => CarbonImmutable::parse($booking->visit_date, $booking->destination_timezone)->subDays(5)->toDateString(),
             'quantity' => (int) $booking->quantity, 'checked_in_count' => $checked, 'payment_status' => $this->payments->status($booking), 'entitlement' => $this->entitlement($booking),
             'ticket_state' => $checked === (int) $booking->quantity ? 'fully_checked_in' : ($checked > 0 && $state === 'available' ? 'partially_checked_in' : $state),
+            // Additive contract: active | temporarily_blocked | revoked | used | unavailable. A temporary block can lift (a refund still
+            // unverified, a payment under review); `revoked` never does. The scanner stays fail-closed in every non-active state.
+            'admission_state' => $admission, 'admission_reason' => $reason, 'refund_pending' => $refundPending,
             'tickets' => $tickets->map(fn ($ticket) => [
                 'guid' => $ticket->guid, 'sequence' => (int) $ticket->sequence,
                 'status' => $ticket->checked_in_at ? 'checked_in' : ($ticket->qr_revoked_at ? 'revoked' : 'not_checked_in'),
-                'qr_available' => $state === 'available' && $ticket->qr_issued_at !== null && $ticket->qr_token_hash !== null
+                'qr_available' => ! $blocked && $state === 'available' && $ticket->qr_issued_at !== null && $ticket->qr_token_hash !== null
                     && $ticket->qr_token_encrypted !== null && $ticket->qr_revoked_at === null && $ticket->checked_in_at === null,
+                'admission_state' => $ticket->checked_in_at ? 'used' : $admission,
                 'checked_in_at' => $ticket->checked_in_at ? CarbonImmutable::parse($ticket->checked_in_at, 'UTC')->toIso8601String() : null,
             ])->all(),
         ] + $this->payments->provenance($booking);
+    }
+
+    /**
+     * Display-only reading of why entry is or is not possible (plain reads: the scanner decides under locks).
+     *
+     * @return array{0: string, 1: ?string, 2: bool} admission state, reason, whether an automatic refund holds admission
+     */
+    private function admission(object $booking, string $state, int $checked): array
+    {
+        $hold = DB::table('booking_refund_requests')->where('booking_guid', $booking->guid)->where('admission_hold', 1)->exists();
+        $review = DB::table('payment_intents')->where('booking_guid', $booking->guid)->where('status', 'needs_review')->exists();
+        $entitlement = $this->entitlement($booking);
+
+        return match (true) {
+            $checked > 0 && $checked === (int) $booking->quantity => ['used', null, $hold],
+            $state === 'revoked' => ['revoked', match (true) {
+                $entitlement === 'refunded' => 'refunded', $entitlement === 'reversed' || $entitlement === 'chargeback' => 'payment_reversed', default => 'booking_closed',
+            }, false],
+            $hold => ['temporarily_blocked', 'refund_in_progress', true],
+            $review => ['temporarily_blocked', 'payment_under_review', false],
+            $state === 'available' => ['active', null, false],
+            default => ['unavailable', $state, false],
+        };
     }
 
     public function backfill(): int

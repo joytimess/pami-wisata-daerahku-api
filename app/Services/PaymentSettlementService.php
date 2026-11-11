@@ -14,6 +14,9 @@ use Throwable;
 
 class PaymentSettlementService
 {
+    /** Review reasons an operator may clear after a clean authenticated lookup; anything else needs provider-side resolution. */
+    public const RESOLVABLE_REVIEW_REASONS = ['payment_not_applicable', 'fraud_status_review', 'provider_response_invalid', 'provider_expiry_invalid'];
+
     public function __construct(private TicketService $tickets, private BookingNotificationService $notifications) {}
 
     private function lockedBooking(string $guid, string $quota): object
@@ -224,11 +227,20 @@ class PaymentSettlementService
 
             return;
         }
+        $this->applyVerifiedCapture($booking, $intent, $attempt, $event);
+    }
+
+    /**
+     * The one place a verified capture becomes a confirmed booking. Used by the engine and, with an actor, by an operator recovery
+     * that has re-checked every eligibility rule itself. The caller holds the domain locks and has proven eligibility.
+     */
+    public function applyVerifiedCapture(object $booking, object $intent, object $attempt, object $event, ?string $actorGuid = null, string $reasonSuffix = ''): void
+    {
         DB::table('payment_intents')->where('guid', $intent->guid)->update(['status' => 'paid', 'applied_attempt_guid' => $attempt->guid,
-            'verified_paid_at' => $event->provider_occurred_at, 'updated_at' => now()]);
+            'verified_paid_at' => $event->provider_occurred_at, 'review_reason' => null, 'updated_at' => now()]);
         DB::table('bookings')->where('guid', $booking->guid)->update(['status' => 'confirmed', 'updated_at' => now()]);
-        DB::table('booking_status_histories')->insert(['guid' => (string) Str::uuid(), 'booking_guid' => $booking->guid, 'actor_guid' => null,
-            'old_status' => $booking->status, 'new_status' => 'confirmed', 'reason' => 'Verified '.strtoupper($intent->provider).' '.$intent->environment.' payment.', 'created_at' => now()]);
+        DB::table('booking_status_histories')->insert(['guid' => (string) Str::uuid(), 'booking_guid' => $booking->guid, 'actor_guid' => $actorGuid,
+            'old_status' => $booking->status, 'new_status' => 'confirmed', 'reason' => 'Verified '.strtoupper($intent->provider).' '.$intent->environment.' payment.'.$reasonSuffix, 'created_at' => now()]);
         DB::table('payment_events')->where('guid', $event->guid)->update(['disposition' => 'applied']);
         $this->notifications->recordPaymentReceipt($booking->guid, $booking->user_guid, $attempt->guid);
         if (app(TicketService::class)->qrWindowOpen($booking)) {
@@ -258,7 +270,14 @@ class PaymentSettlementService
     /** Admission and further payment stop until a human resolves the case; nothing is confirmed, refunded or released. */
     private function holdForReview(object $booking, object $intent, string $reason, ?string $eventGuid = null): void
     {
-        DB::table('payment_intents')->where('guid', $intent->guid)->update(['status' => 'needs_review', 'updated_at' => now()]);
+        // The FIRST reason stays: later signals on an intent already in review must not hide why it entered it. The one exception is a
+        // serious signal (chargeback, partial refund, identity drift) arriving on top of a reason an operator could clear on a clean
+        // lookup: it must replace that reason, or the operator path would treat the case as resolvable.
+        $existing = $intent->review_reason ?? null;
+        $first = $intent->status !== 'needs_review' || $existing === null
+            || (in_array($existing, self::RESOLVABLE_REVIEW_REASONS, true) && ! in_array($reason, self::RESOLVABLE_REVIEW_REASONS, true));
+        DB::table('payment_intents')->where('guid', $intent->guid)->update(['status' => 'needs_review', 'updated_at' => now()]
+            + ($first ? ['review_reason' => substr($reason, 0, 64), 'review_flagged_at' => now()] : []));
         DB::table('booking_tickets')->where('booking_guid', $booking->guid)->whereNull('checked_in_at')->whereNotNull('qr_token_hash')
             ->whereNull('qr_revoked_at')->update(['qr_revoked_at' => now(), 'updated_at' => now()]);
         $this->notifications->record($booking->guid, $booking->user_guid, 'payment_review');
@@ -281,7 +300,14 @@ class PaymentSettlementService
             $booking = $this->lockedBooking($reference->guid, $reference->destination_quota_guid);
             $intent = DB::table('payment_intents')->where('booking_guid', $booking->guid)->lockForUpdate()->first();
             DB::table('payment_attempts')->where('guid', $attemptGuid)->lockForUpdate()->first(['guid']);
-            if (! $intent || $intent->status === 'needs_review') {
+            if (! $intent) {
+                return;
+            }
+            // Already under review: only a serious signal on top of a clearable reason is recorded (see holdForReview).
+            if ($intent->status === 'needs_review' && ! (
+                in_array($intent->review_reason ?? null, [null, ...self::RESOLVABLE_REVIEW_REASONS], true)
+                && ! in_array($reason, self::RESOLVABLE_REVIEW_REASONS, true)
+            )) {
                 return;
             }
             app(BookingRefundService::class)->flagForReview($booking->guid, $reason);

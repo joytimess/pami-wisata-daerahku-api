@@ -173,7 +173,17 @@ class MidtransClient
         if ($reason = $this->statusPrecondition($attempt)) {
             return $reason;
         }
-        if ($reason = $this->registry->refundReason((string) $attempt->method, (string) $attempt->channel)) {
+
+        return $this->refundCapabilityReason($attempt);
+    }
+
+    /**
+     * The part of refundReason() that does not depend on credentials or environment: channel support, the capability switch, the
+     * evidence of a verified payment and the refund window. These cannot heal by themselves, unlike a configuration blip.
+     */
+    public function refundCapabilityReason(object $attempt): ?string
+    {
+        if ($reason = $this->registry->capabilityReason((string) $attempt->method, (string) $attempt->channel)) {
             return $reason;
         }
         if (($attempt->verified_paid_at ?? null) === null || ! is_string($attempt->provider_reference ?? null) || $attempt->provider_reference === '') {

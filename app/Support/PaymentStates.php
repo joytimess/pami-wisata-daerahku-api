@@ -25,9 +25,24 @@ class PaymentStates
         'reversed' => [],
     ];
 
+    /**
+     * Exits from `needs_review`. The payment engine can never take them (it only ever enters review); only an authorized operator
+     * recovery whose evidence the server verified itself may.
+     */
+    public const OPERATOR_INTENT_TRANSITIONS = [
+        'needs_review' => ['paid', 'requires_payment'],
+    ];
+
     public static function assertIntentTransition(string $from, string $to): void
     {
         self::assertTransition(self::INTENT_TRANSITIONS, $from, $to);
+    }
+
+    public static function assertOperatorIntentTransition(string $from, string $to): void
+    {
+        if (! in_array($to, self::OPERATOR_INTENT_TRANSITIONS[$from] ?? [], true)) {
+            throw new DomainException('Invalid operator payment state transition.');
+        }
     }
 
     public static function assertAttemptTransition(string $from, string $to): void
