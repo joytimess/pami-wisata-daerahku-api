@@ -160,6 +160,7 @@ class PaymentService
             ->where('payment_intent_guid', $intent->guid)->whereIn('status', ['failed', 'expired'])->exists();
 
         return [
+            'server_time' => now()->toIso8601String(),
             'invoice_number' => DB::table('invoices')->where('booking_guid', $booking->guid)->value('invoice_number'),
             'booking_number' => $booking->booking_number, 'quantity' => (int) $booking->quantity,
             'unit_price' => (int) $booking->unit_price, 'subtotal' => (int) $booking->total_amount,

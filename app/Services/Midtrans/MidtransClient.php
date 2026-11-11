@@ -119,6 +119,37 @@ class MidtransClient
         return is_array($instruction) ? $instruction : ['presentation_type' => 'unavailable'];
     }
 
+    /** Fetch only the encrypted, transaction-bound provider action; never forward merchant credentials. */
+    public function qrisPng(object $attempt): string
+    {
+        abort_unless($this->statusPrecondition($attempt) === null && is_string($attempt->provider_reference)
+            && preg_match('/^[A-Za-z0-9-]{1,128}$/D', $attempt->provider_reference), 404);
+        try {
+            $instruction = json_decode(Crypt::decryptString($attempt->instruction_ciphertext), true, 512, JSON_THROW_ON_ERROR);
+        } catch (Throwable) {
+            abort(404);
+        }
+        $host = $attempt->environment === 'production' ? 'api.midtrans.com' : 'api.sandbox.midtrans.com';
+        $url = 'https://'.$host.'/v2/qris/'.$attempt->provider_reference.'/qr-code';
+        abort_unless(($instruction['presentation_type'] ?? null) === 'qr_image' && ($instruction['_provider']['image_url'] ?? null) === $url, 404);
+        try {
+            $response = Http::accept('image/png')->connectTimeout(3)->timeout((int) config('midtrans.http_timeout_seconds', 10))
+                ->withOptions(['allow_redirects' => false, 'progress' => static function (int $total, int $downloaded): void {
+                    if ($total > 1048576 || $downloaded > 1048576) {
+                        throw new \RuntimeException('QR image exceeds size limit.');
+                    }
+                }])->get($url);
+        } catch (Throwable) {
+            abort(502, 'Payment QR unavailable.');
+        }
+        $png = $response->body();
+        $size = strlen($png) <= 1048576 && str_starts_with($png, "\x89PNG\r\n\x1a\n") ? @getimagesizefromstring($png) : false;
+        abort_unless($response->status() === 200 && strtolower(trim(explode(';', $response->header('Content-Type'))[0])) === 'image/png'
+            && $size !== false && ($size[2] ?? null) === IMAGETYPE_PNG && $size[0] <= 2048 && $size[1] <= 2048, 502, 'Payment QR unavailable.');
+
+        return $png;
+    }
+
     /**
      * Authenticated lookup of a stored order: GET /v2/{order_id}/status.
      *
