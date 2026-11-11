@@ -20,6 +20,12 @@ final class BookingRules
 
     public const IDEMPOTENCY_DAYS = 7;
 
+    /** The one absolute payment deadline, counted from the authoritative approval time; no retry or refresh ever extends it. */
+    public const PAYMENT_WINDOW_SECONDS = 15 * 60;
+
+    /** Extra time after the deadline in which an unresolved payment stays under verification before it is escalated to review. */
+    public const PAYMENT_GRACE_SECONDS = 15 * 60;
+
     public static function visitStart(string $visitDate, string $timezone): CarbonImmutable
     {
         return CarbonImmutable::parse(substr($visitDate, 0, 10), $timezone)->startOfDay()->utc();

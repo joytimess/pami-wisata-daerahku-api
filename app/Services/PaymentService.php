@@ -152,6 +152,12 @@ class PaymentService
             && DB::table('booking_status_histories')->where('booking_guid', $booking->guid)->where('new_status', 'awaiting_payment')->exists();
         $provider = $this->gateway->activeProvider();
         $environment = $this->gateway->activeEnvironment();
+        $canCreate = $eligible && ! $unresolved && $this->gateway->capabilities($this->instructionExpiresAt($booking, CarbonImmutable::now()))['can_pay']
+            && (! $intent || ($intent->provider === $provider && $intent->environment === $environment
+                && in_array($intent->status, ['requires_payment', 'processing'], true)));
+        // A new method may be chosen only on the same booking and deadline, and only once every earlier attempt is proven terminal.
+        $canSwitch = $canCreate && $provider === 'midtrans' && $intent !== null && DB::table('payment_attempts')
+            ->where('payment_intent_guid', $intent->guid)->whereIn('status', ['failed', 'expired'])->exists();
 
         return [
             'invoice_number' => DB::table('invoices')->where('booking_guid', $booking->guid)->value('invoice_number'),
@@ -161,11 +167,9 @@ class PaymentService
             'paid_at' => $this->timestamp($intent?->verified_paid_at ?? null),
             'refund_request' => app(BookingRefundService::class)->latestSummary($booking->guid),
             'applied_attempt_guid' => $intent?->applied_attempt_guid ?? null, 'receipt_available' => app(PaymentReceiptService::class)->data($booking->guid) !== null,
-            'can_create' => $eligible && ! $unresolved && $this->gateway->capabilities($this->instructionExpiresAt($booking, CarbonImmutable::now()))['can_pay']
-                && (! $intent || ($intent->provider === $provider && $intent->environment === $environment
-                    && in_array($intent->status, ['requires_payment', 'processing'], true))),
-            'can_switch' => false,
-            'switch_reason' => $unresolved ? 'payment_attempt_unresolved' : 'payment_switch_contract_unverified',
+            'can_create' => $canCreate,
+            'can_switch' => $canSwitch,
+            'switch_reason' => $unresolved ? 'payment_attempt_unresolved' : ($canSwitch ? null : 'payment_switch_contract_unverified'),
         ];
     }
 

@@ -85,8 +85,10 @@ class PaymentSettlementService
                 && $attempt->currency === 'IDR' && ($outcome['currency'] ?? null) === $event->currency
                 && $event->currency === $attempt->currency && $intent->currency === $attempt->currency && $booking->currency === $intent->currency
                 && $intent->expires_at === $booking->payment_expires_at;
+            // Only money-moving evidence must postdate the reservation. A status event (expiry, denial, cancellation) carries the
+            // provider's transaction time, which can legitimately precede it, and it never confirms or refunds anything.
             if (! $matches || ! $event->provider_occurred_at || CarbonImmutable::parse($event->provider_occurred_at)->gt(now())
-                || CarbonImmutable::parse($event->provider_occurred_at)->lt($attempt->started_at)) {
+                || ($event->event_type !== 'status' && CarbonImmutable::parse($event->provider_occurred_at)->lt($attempt->started_at))) {
                 $this->review($booking, $intent, $event, 'snapshot_mismatch');
 
                 return;
@@ -113,7 +115,10 @@ class PaymentSettlementService
                     app(BookingRefundService::class)->recordVerifiedAdjustment($booking->guid, $attempt->guid, $event->guid, $event->event_type);
                 }
             } elseif (! in_array($attempt->status, ['paid', 'reversed'], true) && in_array($outcome['status'], ['pending', 'failed', 'expired', 'unknown'], true)) {
-                if ($attempt->status !== $outcome['status'] && ! in_array($outcome['status'], PaymentStates::ATTEMPT_TRANSITIONS[$attempt->status], true)) {
+                // A Midtrans Charge response can be lost; the first successful Status lookup may then already report expiry, which is
+                // verified provider truth and must close the attempt rather than leave it initiating (DOKU's state machine is unchanged).
+                $lostChargeExpiry = $event->provider === 'midtrans' && $attempt->status === 'initiating' && $outcome['status'] === 'expired';
+                if (! $lostChargeExpiry && $attempt->status !== $outcome['status'] && ! in_array($outcome['status'], PaymentStates::ATTEMPT_TRANSITIONS[$attempt->status], true)) {
                     DB::table('payment_events')->where('guid', $event->guid)->update(['disposition' => 'ignored']);
 
                     return;
@@ -130,12 +135,74 @@ class PaymentSettlementService
                 DB::table('payment_events')->where('guid', $event->guid)->update(['disposition' => 'ignored']);
             }
         }, 3);
+        $this->closeAfterOutcome($reference->guid);
+    }
+
+    /**
+     * Closes a booking whose payment window ended once NOTHING can still be paid: the Midtrans attempts are all proven terminal
+     * unpaid (failed/expired by verified provider evidence) or there never was one. The status moves to `expired` and the quota is
+     * released in that one transaction, under the same lock order as settlement (quota -> booking -> intent -> attempts), so a
+     * settlement and an expiry can never both win. Anything pending, unknown, paid, reversed or under review keeps the quota held.
+     * Legacy DOKU and DEMO intents are never closed here: they keep their existing verification path.
+     *
+     * @return bool true when this call expired the booking
+     */
+    public function expireIfTerminalUnpaid(string $bookingGuid): bool
+    {
+        $quota = DB::table('bookings')->where('guid', $bookingGuid)->value('destination_quota_guid');
+        if ($quota === null) {
+            return false;
+        }
+
+        return DB::transaction(function () use ($bookingGuid, $quota): bool {
+            $booking = $this->lockedBooking($bookingGuid, $quota);
+            if (! in_array($booking->status, ['awaiting_payment', 'payment_verification', 'payment_review'], true)
+                || $booking->payment_expires_at === null || now()->lt($booking->payment_expires_at)) {
+                return false;
+            }
+            $intent = DB::table('payment_intents')->where('booking_guid', $booking->guid)->lockForUpdate()->first();
+            if ($intent) {
+                if ($intent->provider !== 'midtrans' || $intent->applied_attempt_guid !== null
+                    || ! in_array($intent->status, ['requires_payment', 'processing'], true)) {
+                    return false;
+                }
+                $statuses = DB::table('payment_attempts')->where('payment_intent_guid', $intent->guid)->lockForUpdate()->pluck('status');
+                if ($statuses->contains(fn (string $status): bool => ! in_array($status, ['failed', 'expired'], true))) {
+                    return false;
+                }
+                PaymentStates::assertIntentTransition($intent->status, 'expired');
+                DB::table('payment_intents')->where('guid', $intent->guid)->update(['status' => 'expired', 'updated_at' => now()]);
+            }
+            DB::table('bookings')->where('guid', $booking->guid)->update(['status' => 'expired', 'updated_at' => now()]);
+            DB::table('booking_status_histories')->insert(['guid' => (string) Str::uuid(), 'booking_guid' => $booking->guid, 'actor_guid' => null,
+                'old_status' => $booking->status, 'new_status' => 'expired', 'reason' => 'payment_timeout', 'created_at' => now()]);
+            $this->notifications->record($booking->guid, $booking->user_guid, 'expired');
+
+            return true;
+        }, 3);
+    }
+
+    /** A verified terminal outcome may be the last thing keeping a held booking open; closing is best effort and re-run by the scheduler. */
+    public function closeAfterOutcome(string $bookingGuid): void
+    {
+        try {
+            $this->expireIfTerminalUnpaid($bookingGuid);
+        } catch (Throwable $exception) {
+            Log::warning('Terminal-unpaid expiry could not be evaluated.', ['booking_guid' => $bookingGuid, 'exception_class' => $exception::class]);
+        }
     }
 
     private function capture(object $booking, object $intent, object $attempt, object $event, array $outcome): void
     {
         if ($attempt->verified_paid_at !== null || $attempt->reversed_at !== null) {
             DB::table('payment_events')->where('guid', $event->guid)->update(['disposition' => 'duplicate_capture']);
+
+            return;
+        }
+        // Binding a transaction id another attempt already holds would break the unique index: quarantine instead of failing.
+        if ($attempt->provider_reference === null && DB::table('payment_attempts')->where('provider', $attempt->provider)->where('environment', $attempt->environment)
+            ->where('provider_reference', $outcome['provider_reference'])->where('guid', '!=', $attempt->guid)->exists()) {
+            $this->review($booking, $intent, $event, 'provider_reference_conflict');
 
             return;
         }
@@ -180,15 +247,45 @@ class PaymentSettlementService
 
     private function review(object $booking, object $intent, object $event, string $reason, string $disposition = 'quarantined'): void
     {
-        DB::table('payment_intents')->where('guid', $intent->guid)->update(['status' => 'needs_review', 'updated_at' => now()]);
         if ($disposition !== 'applied' && in_array($event->event_type, ['refund', 'reversal'], true)) {
             app(BookingRefundService::class)->flagForReview($booking->guid, $reason);
         }
         $metadata = json_decode($event->metadata, true, 512, JSON_THROW_ON_ERROR);
         DB::table('payment_events')->where('guid', $event->guid)->update(['disposition' => $disposition, 'metadata' => json_encode($metadata + ['reason' => $reason], JSON_THROW_ON_ERROR)]);
+        $this->holdForReview($booking, $intent, $reason, $event->guid);
+    }
+
+    /** Admission and further payment stop until a human resolves the case; nothing is confirmed, refunded or released. */
+    private function holdForReview(object $booking, object $intent, string $reason, ?string $eventGuid = null): void
+    {
+        DB::table('payment_intents')->where('guid', $intent->guid)->update(['status' => 'needs_review', 'updated_at' => now()]);
         DB::table('booking_tickets')->where('booking_guid', $booking->guid)->whereNull('checked_in_at')->whereNotNull('qr_token_hash')
             ->whereNull('qr_revoked_at')->update(['qr_revoked_at' => now(), 'updated_at' => now()]);
         $this->notifications->record($booking->guid, $booking->user_guid, 'payment_review');
-        Log::warning('Payment needs review.', ['intent_guid' => $intent->guid, 'event_guid' => $event->guid, 'reason' => $reason]);
+        Log::warning('Payment needs review.', ['intent_guid' => $intent->guid, 'event_guid' => $eventGuid, 'reason' => $reason]);
+    }
+
+    /**
+     * Verified-provider evidence that cannot be classified (challenged fraud status, partial refund, chargeback, identity drift)
+     * holds the whole payment for review. No evidence event exists for it, so nothing is confirmed, reversed or released.
+     * Idempotent: an intent already under review is left alone.
+     */
+    public function flagAmbiguousProviderOutcome(string $attemptGuid, string $reason): void
+    {
+        $reference = DB::table('payment_attempts as a')->join('payment_intents as i', 'i.guid', '=', 'a.payment_intent_guid')
+            ->join('bookings as b', 'b.guid', '=', 'i.booking_guid')->where('a.guid', $attemptGuid)->first(['b.guid', 'b.destination_quota_guid']);
+        if (! $reference) {
+            return;
+        }
+        DB::transaction(function () use ($reference, $attemptGuid, $reason): void {
+            $booking = $this->lockedBooking($reference->guid, $reference->destination_quota_guid);
+            $intent = DB::table('payment_intents')->where('booking_guid', $booking->guid)->lockForUpdate()->first();
+            DB::table('payment_attempts')->where('guid', $attemptGuid)->lockForUpdate()->first(['guid']);
+            if (! $intent || $intent->status === 'needs_review') {
+                return;
+            }
+            app(BookingRefundService::class)->flagForReview($booking->guid, $reason);
+            $this->holdForReview($booking, $intent, $reason);
+        }, 3);
     }
 }

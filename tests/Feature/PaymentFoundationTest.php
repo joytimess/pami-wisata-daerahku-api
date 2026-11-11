@@ -114,28 +114,44 @@ it('disables nested channels with their parent booking and exposes only persiste
     $this->assertDatabaseCount('invoices', 0);
 });
 
-it('preserves the one hour cutoff grace and held quota across payment status reads', function () {
+it('applies the fifteen minute cutoff and expires an untouched booking while releasing its quota', function () {
     [$owner, $guid, $destination, $date] = foundationBooking();
     $service = app(BookingService::class);
     $service->decide(makeUser(2), $guid, true);
     $headers = bearer($owner);
     $before = DB::table('bookings')->where('guid', $guid)->first();
-    expect($before->payment_expires_at)->toBe(now()->addHour()->format('Y-m-d H:i:s'));
-    expect($before->notification_grace_expires_at)->toBe(now()->addMinutes(75)->format('Y-m-d H:i:s'));
+    expect($before->payment_expires_at)->toBe(now()->addMinutes(15)->format('Y-m-d H:i:s'));
+    expect($before->notification_grace_expires_at)->toBe(now()->addMinutes(30)->format('Y-m-d H:i:s'));
 
-    $this->travel(59)->minutes();
+    $this->travel(14)->minutes();
     $service->expireDue();
     $this->getJson('/api/v1/bookings/'.$guid.'/payment-intent', $headers)->assertOk()
         ->assertJsonPath('data.booking_status', 'awaiting_payment')->assertJsonPath('data.reason', 'doku_not_configured');
     $this->travel(1)->minutes();
     $this->getJson('/api/v1/bookings/'.$guid.'/payment-intent', $headers)->assertOk()->assertJsonPath('data.reason', 'payment_window_closed');
     $service->expireDue();
-    $this->getJson('/api/v1/bookings/'.$guid.'/payment-intent', $headers)->assertOk()->assertJsonPath('data.booking_status', 'payment_verification');
+    $this->getJson('/api/v1/bookings/'.$guid.'/payment-intent', $headers)->assertOk()->assertJsonPath('data.booking_status', 'expired');
+    expect($service->create(makeUser(), bookingPayload($destination, $date) + ['idempotency_key' => 'released-capacity'])->status)->toBe('pending_approval');
+    $after = DB::table('bookings')->where('guid', $guid)->first();
+    expect($after->payment_expires_at)->toBe($before->payment_expires_at);
+    expect(DB::table('booking_tickets')->whereNotNull('qr_token_hash')->count())->toBe(0);
+});
+
+it('holds the quota of a booking with an unresolved legacy attempt through verification and review', function () {
+    [$owner, $guid, $destination, $date] = foundationBooking();
+    $service = app(BookingService::class);
+    $service->decide(makeUser(2), $guid, true);
+    foundationLedger($guid);
+    $before = DB::table('bookings')->where('guid', $guid)->first();
+
+    $this->travel(15)->minutes();
+    $service->expireDue();
+    $this->getJson('/api/v1/bookings/'.$guid.'/payment-intent', bearer($owner))->assertOk()->assertJsonPath('data.booking_status', 'payment_verification');
     expect(fn () => $service->create(makeUser(), bookingPayload($destination, $date) + ['idempotency_key' => 'verification-capacity']))
         ->toThrow(BookingException::class, 'Insufficient capacity.');
     $this->travel(15)->minutes();
     $service->expireDue();
-    $this->getJson('/api/v1/bookings/'.$guid.'/payment-intent', $headers)->assertOk()
+    $this->getJson('/api/v1/bookings/'.$guid.'/payment-intent', bearer($owner))->assertOk()
         ->assertJsonPath('data.booking_status', 'payment_review')->assertJsonPath('data.payment_status', 'unverified');
     expect(fn () => $service->create(makeUser(), bookingPayload($destination, $date) + ['idempotency_key' => 'review-capacity']))
         ->toThrow(BookingException::class, 'Insufficient capacity.');

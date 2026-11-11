@@ -39,6 +39,8 @@ function dokuBooking(): array
     $owner = makeUser();
     $booking = app(BookingService::class)->create($owner, bookingPayload($destination, $date, 2) + ['idempotency_key' => (string) Str::uuid()]);
     $booking = app(BookingService::class)->decide(makeUser(2), $booking->guid, true);
+    // The legacy DOKU assertions below were written for the former one hour approval window; the 15 minute window is Midtrans policy.
+    DB::table('bookings')->where('guid', $booking->guid)->update(['payment_expires_at' => now()->addHour(), 'notification_grace_expires_at' => now()->addMinutes(75)]);
 
     return [$owner, app(TicketService::class)->booking($booking->guid)];
 }

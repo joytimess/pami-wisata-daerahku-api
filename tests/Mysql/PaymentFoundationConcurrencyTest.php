@@ -221,16 +221,19 @@ it('keeps disabled payment reads side effect free while expiry advances verifica
         ], $connection, $database));
 
         expect($results->where('ok', true))->toHaveCount(3);
-        $this->assertDatabaseHas('bookings', ['guid' => $booking->guid, 'status' => 'payment_verification',
+        // Phase 4: a booking that never opened a payment is released at the 15 minute deadline (exactly once, however the reads race).
+        $this->assertDatabaseHas('bookings', ['guid' => $booking->guid, 'status' => 'expired',
             'payment_expires_at' => $cutoff, 'notification_grace_expires_at' => $grace]);
         expect((int) DB::table('bookings')->where('destination_quota_guid', $booking->destination_quota_guid)
-            ->whereIn('status', BookingRules::HELD)->sum('quantity'))->toBe(1);
+            ->whereIn('status', BookingRules::HELD)->sum('quantity'))->toBe(0);
         expect(DB::table('booking_status_histories')->where('booking_guid', $booking->guid)
-            ->where('new_status', 'payment_verification')->count())->toBe(1);
+            ->where('new_status', 'expired')->count())->toBe(1);
+        expect(DB::table('booking_status_histories')->where('booking_guid', $booking->guid)
+            ->where('new_status', 'payment_verification')->count())->toBe(0);
         $this->assertDatabaseCount('payment_intents', 0);
         $this->assertDatabaseCount('payment_attempts', 0);
         $this->assertDatabaseCount('payment_events', 0);
-        $this->assertDatabaseCount('notifications', $notifications);
+        $this->assertDatabaseCount('notifications', $notifications + 1);
         expect(DB::table('booking_tickets')->whereNotNull('qr_token_hash')->count())->toBe(0);
     });
 });

@@ -92,6 +92,8 @@ it('reserves one DOKU attempt and performs one provider call under concurrent re
         $owner = makeUser();
         $booking = app(BookingService::class)->create($owner, bookingPayload($destination, $date, 2) + ['idempotency_key' => 'doku-race']);
         app(BookingService::class)->decide(makeUser(2), $booking->guid, true);
+        // This legacy DOKU proof was written for the former one hour approval window; the 15 minute window is Midtrans policy.
+        DB::table('bookings')->where('guid', $booking->guid)->update(['payment_expires_at' => now()->addHour(), 'notification_grace_expires_at' => now()->addMinutes(75)]);
         $job = ['action' => 'initiate', 'user_guid' => $owner->guid, 'booking_guid' => $booking->guid,
             'input' => ['idempotency_key' => 'same-key', 'method_code' => 'virtual_account', 'channel' => 'bni']];
         $run = runDokuWorkers([$job, $job, $job], $connection, $database);
