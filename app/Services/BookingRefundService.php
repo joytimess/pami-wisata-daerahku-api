@@ -103,6 +103,8 @@ class BookingRefundService
                 'created_at' => $now, 'updated_at' => $now,
             ]);
             $this->audit($refundGuid, $owner->guid, null, 'requested', null);
+            app(BookingNotificationService::class)->record($guid, $owner->guid, 'refund_requested',
+                ['booking_number' => $booking->booking_number, 'suffix' => ':refund:'.$refundGuid]);
 
             return $this->summary(DB::table('booking_refund_requests')->where('guid', $refundGuid)->first());
         }, 3);
@@ -693,6 +695,32 @@ class BookingRefundService
     {
         DB::table('booking_refund_requests')->where('guid', $request->guid)->update($changes + ['status' => $to, 'updated_at' => now()]);
         $this->audit($request->guid, $actorGuid, $request->status, $to, $note);
+        if ($request->status !== $to) {
+            $this->notify($request, $to, $note);
+        }
+    }
+
+    /**
+     * One notification per refund transition, written in the transaction that moved the request (a rollback leaves none) and keyed by
+     * refund and event so a retry never duplicates it. Customer events go to the requester; operational ones to the destination admins.
+     */
+    private function notify(object $request, string $to, ?string $note): void
+    {
+        $event = match ($to) {
+            'approved' => 'refund_approved', 'rejected' => 'refund_rejected', 'refunded', 'manual_refunded' => 'refunded',
+            'manual_action_required' => 'refund_manual_action', default => null,
+        };
+        if ($event === null) {
+            return;
+        }
+        $booking = DB::table('bookings')->where('guid', $request->booking_guid)->first(['booking_number', 'user_guid']);
+        if (! $booking) {
+            return;
+        }
+        app(BookingNotificationService::class)->record($request->booking_guid, $request->requested_by_user_guid ?? $booking->user_guid, $event, [
+            'booking_number' => $booking->booking_number, 'amount' => (int) $request->amount, 'reason' => trim((string) $note),
+            'suffix' => ':refund:'.$request->guid,
+        ]);
     }
 
     private function audit(string $requestGuid, ?string $actorGuid, ?string $from, string $to, ?string $note): void
