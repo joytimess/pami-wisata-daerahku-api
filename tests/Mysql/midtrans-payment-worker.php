@@ -52,6 +52,16 @@ Http::fake(['https://api.sandbox.midtrans.com/v2/*/status' => function (Request 
 
     return Http::response(mtxStatusBody($attempt, $job['provider_state'] ?? 'settlement', $override), 200);
 },
+    // Phase 6: the provider's cancel answer (counted); the Status stub above decides what the lookup then proves.
+    'https://api.sandbox.midtrans.com/v2/*/cancel' => function (Request $request) use ($calls) {
+        file_put_contents($calls, (DB::transactionLevel() === 0 ? "cancel
+" : "cancel-in-transaction
+"), FILE_APPEND | LOCK_EX);
+        usleep(100000);
+        preg_match('#/v2/([^/]+)/cancel$#', $request->url(), $match);
+
+        return Http::response(['status_code' => '200', 'order_id' => rawurldecode((string) ($match[1] ?? '')), 'transaction_status' => 'cancel'], 200);
+    },
     // Phase 4: a faked Charge (counted) and a faked full Refund echoing the request (counted). Neither reaches a real host.
     'https://api.sandbox.midtrans.com/v2/charge' => function (Request $request) use ($calls) {
         file_put_contents($calls, (DB::transactionLevel() === 0 ? "charge\n" : "charge-in-transaction\n"), FILE_APPEND | LOCK_EX);
@@ -130,6 +140,8 @@ try {
 
             return (string) ($response['status'] ?? $response['data']['status'] ?? 'ok');
         })(),
+        // Phase 6: the owner cancels the booking (the provider order is cancelled and proven closed first).
+        'cancel_booking' => app(BookingService::class)->cancel(User::findOrFail($job['user_guid']), $job['booking_guid'])->status,
         // Phase 4: an admin approves the owner's refund request.
         'refund_decide' => app(BookingRefundService::class)->decide(User::findOrFail($job['admin_guid']), $job['booking_guid'], $job['refund_guid'],
             ['decision' => 'approve', 'note' => 'Disetujui pengelola'])['status'],

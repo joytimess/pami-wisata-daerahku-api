@@ -269,6 +269,8 @@ it('returns 409 for ineligible unapproved free or terminal bookings', function (
 
 it('rejects simulated success at the real cutoff and preserves expiry grace and quota', function () {
     [$owner, $booking] = demoBooking();
+    startPaymentCountdown($booking->guid);
+    $booking = DB::table('bookings')->where('guid', $booking->guid)->first();
     $pending = demoStart($owner, $booking);
     $this->travelTo(CarbonImmutable::parse($booking->payment_expires_at, 'UTC'));
 

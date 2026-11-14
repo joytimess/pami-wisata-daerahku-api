@@ -208,7 +208,7 @@ it('never treats an unapproved, forged or paid-but-unverified booking as a free 
     $tickets = app(TicketService::class);
 
     expect($tickets->entitlement(DB::table('bookings')->where('guid', $pending->guid)->first()))->not->toBe('free');
-    $this->getJson("/api/v1/bookings/{$pending->guid}/tickets", bearer($owner))->assertJsonPath('data.ticket_state', 'awaiting_payment');
+    $this->getJson("/api/v1/bookings/{$pending->guid}/tickets", bearer($owner))->assertJsonPath('data.ticket_state', 'awaiting_approval');
 
     // Confirmed without a human approval record is not an entitlement.
     DB::table('bookings')->where('guid', $pending->guid)->update(['status' => 'confirmed']);

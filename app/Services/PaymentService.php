@@ -117,7 +117,9 @@ class PaymentService
             $booking->status !== 'awaiting_payment' => 'booking_not_awaiting_payment',
             (int) $booking->total_amount <= 0 => 'booking_not_payable',
             $booking->currency !== 'IDR' => 'unsupported_currency',
-            ! $booking->payment_expires_at || now()->gte($booking->payment_expires_at) => 'payment_window_closed',
+            // Before a method is chosen only the selection deadline applies; the 15 minute countdown exists once it has started.
+            ! $booking->payment_expires_at && (! $booking->payment_selection_expires_at || now()->gte($booking->payment_selection_expires_at)) => 'payment_selection_closed',
+            $booking->payment_expires_at && now()->gte($booking->payment_expires_at) => 'payment_window_closed',
             now()->gte(BookingRules::visitStart($booking->visit_date, $booking->destination_timezone_snapshot ?? $booking->destination_timezone)) => 'visit_window_closed',
             $this->gateway->demoEnabled() && DB::table('payment_intents')->where('booking_guid', $booking->guid)
                 ->where(fn ($intent) => $intent->where('provider', '!=', 'demo')->orWhere('environment', '!=', 'demo'))->exists() => 'payment_provider_conflict',
@@ -134,7 +136,10 @@ class PaymentService
             'can_pay' => $reason === null,
             'amount' => (int) $booking->total_amount, 'currency' => $booking->currency,
             'payment_status' => $this->eligibility->status($booking),
+            // Null until the customer picks a method, so the app shows no countdown before then.
             'expires_at' => $this->timestamp($booking->payment_expires_at),
+            'selection_expires_at' => $this->timestamp($booking->payment_selection_expires_at ?? null),
+            'timezone' => $booking->destination_timezone_snapshot ?? $booking->destination_timezone ?? null,
         ];
     }
 
@@ -145,7 +150,8 @@ class PaymentService
         $unresolved = $intent && DB::table('payment_attempts')->where('payment_intent_guid', $intent->guid)
             ->whereIn('status', ['initiating', 'pending', 'unknown'])->exists();
         $eligible = $booking->status === 'awaiting_payment' && (int) $booking->total_amount > 0 && $booking->currency === 'IDR'
-            && $booking->payment_expires_at && now()->lt($booking->payment_expires_at)
+            && ($booking->payment_expires_at ? now()->lt($booking->payment_expires_at)
+                : ($booking->payment_selection_expires_at && now()->lt($booking->payment_selection_expires_at)))
             && now()->lt(BookingRules::visitStart($booking->visit_date, $booking->destination_timezone_snapshot ?? $booking->destination_timezone))
             && DB::table('booking_status_histories')->where('booking_guid', $booking->guid)->where('new_status', 'awaiting_payment')->exists();
         $provider = $this->gateway->activeProvider();
@@ -174,11 +180,42 @@ class PaymentService
 
     public function instructionExpiresAt(object $booking, CarbonImmutable $startedAt): CarbonImmutable
     {
-        $deadline = $booking->payment_expires_at ?? $startedAt;
-        // Midtrans attempts share the booking's one absolute deadline; DEMO keeps its legacy 30 minute per-attempt window.
-        $window = $this->gateway->activeProvider() === 'midtrans' ? CarbonImmutable::parse($deadline, 'UTC') : $startedAt->addMinutes(30)->min($deadline);
+        $visitStart = BookingRules::visitStart($booking->visit_date, $booking->destination_timezone_snapshot ?? $booking->destination_timezone);
+        // No countdown yet: the deadline an attempt started now would get (also used to preview capabilities).
+        $deadline = $booking->payment_expires_at !== null
+            ? CarbonImmutable::parse($booking->payment_expires_at, 'UTC')
+            : BookingRules::paymentDeadlineFrom($startedAt, $visitStart, $this->gateway->activeProvider());
+        // Midtrans attempts share the cycle's one absolute deadline; DEMO keeps its legacy 30 minute per-attempt window.
+        $window = $this->gateway->activeProvider() === 'midtrans' ? $deadline : $startedAt->addMinutes(30)->min($deadline);
 
-        return $window->min(BookingRules::visitStart($booking->visit_date, $booking->destination_timezone_snapshot ?? $booking->destination_timezone));
+        return $window->min($visitStart);
+    }
+
+    /**
+     * Starts the payment countdown on the first method choice of a cycle. The caller holds the booking lock, so exactly one
+     * request sets the deadline; later attempts and retries inherit it unchanged. Updates and returns the same booking object.
+     */
+    public function startPaymentWindow(object $booking, CarbonImmutable $startedAt): object
+    {
+        if ($booking->payment_started_at !== null && $booking->payment_expires_at !== null) {
+            return $booking;
+        }
+        $visitStart = BookingRules::visitStart($booking->visit_date, $booking->destination_timezone_snapshot ?? $booking->destination_timezone);
+        $deadline = BookingRules::paymentDeadlineFrom($startedAt, $visitStart, $this->gateway->activeProvider());
+        $grace = $deadline->addSeconds(BookingRules::PAYMENT_GRACE_SECONDS);
+        $cycle = max(1, (int) ($booking->payment_cycle ?? 0) + 1);
+        DB::table('bookings')->where('guid', $booking->guid)->update([
+            'payment_started_at' => $startedAt, 'payment_expires_at' => $deadline, 'notification_grace_expires_at' => $grace,
+            'payment_cycle' => $cycle, 'updated_at' => now(),
+        ]);
+        // The intent carries the deadline of the cycle that is running now.
+        DB::table('payment_intents')->where('booking_guid', $booking->guid)->update(['expires_at' => $deadline, 'updated_at' => now()]);
+        $fresh = DB::table('bookings')->where('guid', $booking->guid)->first(['payment_started_at', 'payment_expires_at', 'notification_grace_expires_at', 'payment_cycle']);
+        foreach ($fresh as $column => $value) {
+            $booking->$column = $value;
+        }
+
+        return $booking;
     }
 
     /** @param list<array<string, mixed>> $methods

@@ -93,7 +93,10 @@ function paymentFoundationBooking(): object
     [$destination, $date] = seedDestination(price: 100000);
     $booking = app(BookingService::class)->create(makeUser(), bookingPayload($destination, $date) + ['idempotency_key' => 'payment-foundation']);
 
-    return app(BookingService::class)->decide(makeUser(2), $booking->guid, true);
+    $approved = app(BookingService::class)->decide(makeUser(2), $booking->guid, true);
+    startPaymentCountdown($approved->guid);
+
+    return $approved;
 }
 
 function paymentFoundationIntent(object $booking): array

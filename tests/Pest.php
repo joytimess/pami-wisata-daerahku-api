@@ -88,3 +88,20 @@ function assignTestDestination(User $admin, Destination $destination): void
         'user_guid' => $admin->guid, 'assigned_by_user_guid' => $admin->guid, 'created_at' => now(),
     ]);
 }
+
+/**
+ * Emulates a customer who chose a payment method at this very instant: the countdown (deadline and grace) starts now.
+ * Approval alone no longer starts it, so deadline-mechanics tests call this right after approving.
+ */
+function startPaymentCountdown(string $bookingGuid): void
+{
+    $booking = DB::table('bookings')->where('guid', $bookingGuid)->first();
+    $quota = DB::table('destination_quotas')->where('guid', $booking->destination_quota_guid)->first();
+    $timezone = $booking->destination_timezone_snapshot ?? DB::table('destinations')->where('guid', $quota->destination_guid)->value('timezone');
+    $visitStart = \App\Support\BookingRules::visitStart($quota->visit_date, $timezone);
+    $deadline = \App\Support\BookingRules::paymentDeadlineFrom(now(), $visitStart, app(\App\Services\PaymentGateway::class)->activeProvider());
+    DB::table('bookings')->where('guid', $bookingGuid)->update([
+        'payment_started_at' => now(), 'payment_expires_at' => $deadline,
+        'notification_grace_expires_at' => $deadline->addSeconds(\App\Support\BookingRules::PAYMENT_GRACE_SECONDS), 'payment_cycle' => 1,
+    ]);
+}

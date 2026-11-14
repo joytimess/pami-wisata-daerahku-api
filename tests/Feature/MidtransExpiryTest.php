@@ -76,8 +76,9 @@ it('keeps the booking deadline for a retry made at minute 8', function () {
 
     $approvedAt = mtxApprovedAt($booking);
     $payload = $charge->payloads[0];
-    expect($payload['custom_expiry']['order_time'])->toBe($approvedAt->setTimezone('Asia/Jakarta')->format('Y-m-d H:i:s O'))
-        ->and($payload['custom_expiry']['expiry_duration'])->toBe(15)
+    // order_time is this attempt's own start; the duration shrinks so the provider still expires at the cycle deadline.
+    expect($payload['custom_expiry']['order_time'])->toBe(now()->setTimezone('Asia/Jakarta')->format('Y-m-d H:i:s O'))
+        ->and($payload['custom_expiry']['expiry_duration'])->toBe(7)
         ->and($response->json('data.expires_at'))->toBe($approvedAt->addSeconds(900)->toIso8601String())
         ->and(DB::table('payment_attempts')->value('instruction_expires_at'))->toBe($booking->payment_expires_at);
 });
@@ -132,38 +133,72 @@ it('keeps the quota of a booking whose attempt is still open at the deadline', f
 
     app(BookingService::class)->expireDue();
 
-    expect(mtxStatusOf($booking))->toBe('payment_verification')->and(mtxHeld())->toBe(2);
+    // An unresolved Midtrans attempt keeps the quota and never moves to verification or review on a clock.
+    expect(mtxStatusOf($booking))->toBe('awaiting_payment')->and(mtxHeld())->toBe(2);
     $this->travelTo(CarbonImmutable::parse($booking->notification_grace_expires_at, 'UTC')->addSecond());
     app(BookingService::class)->expireDue();
-    expect(mtxStatusOf($booking))->toBe('payment_review')->and(mtxHeld())->toBe(2);
+    expect(mtxStatusOf($booking))->toBe('awaiting_payment')->and(mtxHeld())->toBe(2)
+        ->and(DB::table('notifications')->where('booking_guid', $booking->guid)->where('type', 'booking.payment_review')->count())->toBe(0);
 })->with(['initiating', 'pending', 'unknown']);
 
-it('releases the quota in the same step once every attempt is proven terminal unpaid', function (string $state) {
+it('releases the quota in the same step once every attempt is proven terminal unpaid and no method can be chosen any more', function () {
     [, $booking] = mtxPayable();
-    $attempt = mtxAttempt($booking, 'failed', 'virtual_account', 'bca', ['finished_at' => now()]);
+    mtxAttempt($booking, 'failed', 'virtual_account', 'bca', ['finished_at' => now()]);
     DB::table('payment_intents')->where('booking_guid', $booking->guid)->update(['status' => 'requires_payment']);
+    DB::table('bookings')->where('guid', $booking->guid)->update(['payment_selection_expires_at' => now()->addMinutes(5)]);
     mtxPastDeadline($booking);
 
     app(BookingService::class)->expireDue();
 
     expect(mtxStatusOf($booking))->toBe('expired')->and(mtxHeld())->toBe(0)
         ->and(DB::table('payment_intents')->value('status'))->toBe('expired');
-})->with(['failed']);
+});
+
+it('starts the payment cycle over instead of reviewing once every attempt is proven terminal unpaid', function () {
+    [$owner, $booking] = mtxPayable();
+    mtxAttempt($booking, 'failed', 'virtual_account', 'bca', ['finished_at' => now()]);
+    DB::table('payment_intents')->where('booking_guid', $booking->guid)->update(['status' => 'requires_payment']);
+    mtxPastDeadline($booking);
+
+    app(BookingService::class)->expireDue();
+
+    $row = DB::table('bookings')->where('guid', $booking->guid)->first();
+    expect($row->status)->toBe('awaiting_payment')->and(mtxHeld())->toBe(2)
+        ->and($row->payment_expires_at)->toBeNull()->and($row->payment_started_at)->toBeNull()->and($row->notification_grace_expires_at)->toBeNull()
+        ->and(DB::table('payment_intents')->value('status'))->toBe('requires_payment')
+        ->and(DB::table('booking_status_histories')->where('booking_guid', $booking->guid)->where('reason', 'payment_cycle_reset')->count())->toBe(1)
+        ->and(DB::table('notifications')->where('booking_guid', $booking->guid)->where('type', 'booking.payment_cycle_expired')->count())->toBe(1)
+        ->and(DB::table('notifications')->where('booking_guid', $booking->guid)->where('type', 'booking.payment_review')->count())->toBe(0);
+    $this->getJson('/api/v1/bookings/'.$booking->guid.'/payment-intent', bearer($owner))->assertOk()
+        ->assertJsonPath('data.expires_at', null)->assertJsonPath('data.can_create', true);
+
+    // A second cycle: a new method choice gets a fresh 15 minutes and a higher cycle number.
+    $charge = mtxFakeCharge();
+    mtxStart($owner, DB::table('bookings')->where('guid', $booking->guid)->first(), 'cycle-2', 'qris', 'qris')->assertOk();
+    $again = DB::table('bookings')->where('guid', $booking->guid)->first();
+    expect((int) $again->payment_cycle)->toBe(2)
+        ->and(CarbonImmutable::parse($again->payment_expires_at, 'UTC')->equalTo(now()->addMinutes(15)))->toBeTrue()
+        ->and(DB::table('payment_intents')->value('expires_at'))->toBe($again->payment_expires_at)
+        ->and((int) DB::table('payment_attempts')->where('attempt_number', 2)->value('payment_cycle'))->toBe(2)
+        ->and($charge->calls)->toBe(1);
+});
 
 it('expires the booking when the Status API proves a pending attempt terminal after the deadline', function () {
     [, $booking] = mtxPayable();
     $attempt = mtxAttempt($booking, 'pending');
     mtxPastDeadline($booking);
     app(BookingService::class)->expireDue();
-    expect(mtxStatusOf($booking))->toBe('payment_verification');
+    expect(mtxStatusOf($booking))->toBe('awaiting_payment');
     DB::table('payment_attempts')->where('guid', $attempt->guid)->update(['next_reconcile_at' => now()->subSecond()]);
     $calls = mtxFakeStatus(mtxStatusBody($attempt, 'expire'));
 
     app(MidtransPaymentService::class)->reconcile($attempt->guid);
 
-    expect($calls->calls)->toBe(1)->and(mtxStatusOf($booking))->toBe('expired')->and(mtxHeld())->toBe(0)
+    // The provider proved the attempt unpaid: the cycle starts over and the quota stays with the customer's open selection window.
+    expect($calls->calls)->toBe(1)->and(mtxStatusOf($booking))->toBe('awaiting_payment')->and(mtxHeld())->toBe(2)
         ->and(DB::table('payment_attempts')->where('guid', $attempt->guid)->value('status'))->toBe('expired')
-        ->and(DB::table('payment_intents')->value('status'))->toBe('expired');
+        ->and(DB::table('payment_intents')->value('status'))->toBe('requires_payment')
+        ->and(DB::table('bookings')->where('guid', $booking->guid)->value('payment_expires_at'))->toBeNull();
     Queue::assertNotPushed(IssueBookingTicketQr::class);
 });
 
@@ -182,7 +217,7 @@ it('never treats a 404, a timeout or an ambiguous Status answer as proof of non-
     app(MidtransPaymentService::class)->reconcile($attempt->guid);
     app(BookingService::class)->expireDue();
 
-    expect(mtxStatusOf($booking))->toBe('payment_verification')->and(mtxHeld())->toBe(2)
+    expect(mtxStatusOf($booking))->toBe('awaiting_payment')->and(mtxHeld())->toBe(2)
         ->and(DB::table('payment_attempts')->where('guid', $attempt->guid)->value('status'))->toBeIn(['pending', 'unknown']);
 })->with(['order not found', 'timeout', 'garbled']);
 
@@ -191,7 +226,7 @@ it('confirms a settlement that happened before the deadline even though it is le
     $attempt = mtxAttempt($booking, 'pending');
     mtxPastDeadline($booking, 120);
     app(BookingService::class)->expireDue();
-    expect(mtxStatusOf($booking))->toBe('payment_verification');
+    expect(mtxStatusOf($booking))->toBe('awaiting_payment');
     DB::table('payment_attempts')->where('guid', $attempt->guid)->update(['next_reconcile_at' => now()->subSecond()]);
     mtxFakeStatus(mtxStatusBody($attempt, 'settlement', ['settlement_time' => mtxWib(CarbonImmutable::parse($booking->payment_expires_at, 'UTC')->subMinutes(2))]));
 
@@ -211,7 +246,7 @@ it('sends a settlement at or after the deadline to review without confirming or 
 
     app(MidtransPaymentService::class)->reconcile($attempt->guid);
 
-    expect(mtxStatusOf($booking))->toBeIn(['payment_verification', 'payment_review'])->and(mtxHeld())->toBe(2)
+    expect(mtxStatusOf($booking))->toBe('awaiting_payment')->and(mtxHeld())->toBe(2)
         ->and(DB::table('payment_intents')->value('status'))->toBe('needs_review')
         ->and(DB::table('payment_events')->where('event_type', 'capture')->value('disposition'))->toBe('unapplied');
     Queue::assertNotPushed(IssueBookingTicketQr::class);
@@ -229,7 +264,7 @@ it('does not trust a settlement without a provable timestamp', function () {
 
     app(MidtransPaymentService::class)->reconcile($attempt->guid);
 
-    expect(mtxStatusOf($booking))->toBe('payment_verification')->and(DB::table('payment_events')->where('event_type', 'capture')->count())->toBe(0);
+    expect(mtxStatusOf($booking))->toBe('awaiting_payment')->and(DB::table('payment_events')->where('event_type', 'capture')->count())->toBe(0);
     Queue::assertNotPushed(IssueBookingTicketQr::class);
 });
 
@@ -241,16 +276,17 @@ it('reviews a late settlement of an already released booking instead of resurrec
     DB::table('payment_attempts')->where('guid', $attempt->guid)->update(['next_reconcile_at' => now()->subSecond()]);
     mtxFakeStatus(mtxStatusBody($attempt, 'expire'));
     app(MidtransPaymentService::class)->reconcile($attempt->guid);
-    expect(mtxStatusOf($booking))->toBe('expired')->and(mtxHeld())->toBe(0);
+    expect(mtxStatusOf($booking))->toBe('awaiting_payment')->and(mtxHeld())->toBe(2);
 
     $this->travelTo(now()->addMinute());
     mtxFakeStatus(mtxStatusBody($attempt, 'settlement', ['settlement_time' => mtxWib(CarbonImmutable::parse($booking->payment_expires_at, 'UTC')->subMinute())]));
     $this->postJson('/api/v1/webhooks/midtrans', mtxNotification($attempt, 'settlement'))->assertOk();
     mtxDrain();
 
-    expect(mtxStatusOf($booking))->toBe('expired')->and(mtxHeld())->toBe(0)
+    // Evidence of an abandoned cycle is a real anomaly: it is reviewed, never confirmed.
+    expect(mtxStatusOf($booking))->toBe('awaiting_payment')
         ->and(DB::table('payment_intents')->value('status'))->toBe('needs_review')
-        ->and(DB::table('payment_events')->where('event_type', 'capture')->value('disposition'))->toBe('unapplied');
+        ->and(DB::table('payment_events')->where('event_type', 'capture')->value('disposition'))->toBeIn(['unapplied', 'quarantined']);
     Queue::assertNotPushed(IssueBookingTicketQr::class);
 });
 
@@ -272,12 +308,12 @@ it('decides settlement versus expiry the same way in either order', function () 
     DB::table('payment_intents')->where('booking_guid', $closed->guid)->update(['status' => 'requires_payment']);
     mtxPastDeadline($closed);
     app(BookingService::class)->expireDue();
-    expect(mtxStatusOf($closed))->toBe('expired');
+    expect(mtxStatusOf($closed))->toBe('awaiting_payment');
     mtxFakeStatus(mtxStatusBody($failed, 'settlement', ['settlement_time' => mtxWib(CarbonImmutable::parse($closed->payment_expires_at, 'UTC')->subMinute())]));
     $this->travelTo(now()->addMinute());
     $this->postJson('/api/v1/webhooks/midtrans', mtxNotification($failed, 'settlement'))->assertOk();
     mtxDrain();
-    expect(mtxStatusOf($closed))->toBe('expired')->and(DB::table('payment_intents')->where('booking_guid', $closed->guid)->value('status'))->toBe('needs_review');
+    expect(mtxStatusOf($closed))->toBe('awaiting_payment')->and(DB::table('payment_intents')->where('booking_guid', $closed->guid)->value('status'))->toBe('needs_review');
 });
 
 it('does not close a Midtrans booking while the intent is under review or an attempt is paid', function () {
@@ -288,7 +324,7 @@ it('does not close a Midtrans booking while the intent is under review or an att
 
     app(BookingService::class)->expireDue();
 
-    expect(mtxStatusOf($booking))->toBe('payment_verification')->and(mtxHeld())->toBe(2);
+    expect(mtxStatusOf($booking))->toBe('awaiting_payment')->and(mtxHeld())->toBe(2);
 });
 
 it('replays the same attempt for the same key and refuses the same key with a different request', function () {
@@ -338,7 +374,9 @@ it('allows a retry only after the previous attempt is proven terminal, with the 
         ->and($rows[1]->merchant_reference)->not->toBe($rows[0]->merchant_reference)
         ->and($second->json('data.expires_at'))->toBe(mtxApprovedAt($booking)->addSeconds(900)->toIso8601String())
         ->and($charge->calls)->toBe(2)
-        ->and($charge->payloads[1]['custom_expiry']['order_time'])->toBe($charge->payloads[0]['custom_expiry']['order_time']);
+        // Each attempt sends its own start as order_time and expires at the same absolute cycle deadline.
+        ->and($charge->payloads[1]['custom_expiry']['order_time'])->not->toBeEmpty()
+        ->and($charge->payloads[1]['custom_expiry']['expiry_duration'])->toBeLessThanOrEqual($charge->payloads[0]['custom_expiry']['expiry_duration']);
 });
 
 it('does not let a settlement of the abandoned earlier attempt confirm the booking after a retry', function () {

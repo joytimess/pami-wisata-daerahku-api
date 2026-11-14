@@ -52,6 +52,15 @@ class PaymentController extends Controller
             ->response()->header('Cache-Control', 'private, no-store');
     }
 
+    /** Owner cancels a pending attempt to pick another method on the same cycle; the deadline never moves. */
+    public function cancelAttempt(Request $request, string $booking, string $attempt, MidtransPaymentService $midtrans, PaymentService $payments): JsonResponse
+    {
+        $midtrans->cancelAttempt($request->user(), $booking, $attempt);
+
+        return (new OperationalResource($payments->show($request->user(), $booking)))
+            ->response()->header('Cache-Control', 'private, no-store');
+    }
+
     /** Authenticated QRIS PNG of a live Midtrans attempt. Anything else, including a historical DOKU attempt, is not found. */
     public function qrisImage(Request $request, string $booking, string $attempt): Response
     {

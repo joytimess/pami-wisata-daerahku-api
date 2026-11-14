@@ -165,11 +165,12 @@ class TicketService
         if ($today > $booking->visit_date) {
             return 'expired';
         }
-        if (! in_array($payment, ['paid', 'free'], true)) {
-            return 'awaiting_payment';
-        }
-        if ($booking->status !== 'confirmed') {
+        // Flow order is approval first, then payment: a booking still waiting for a decision is never "awaiting payment".
+        if ($booking->status === 'pending_approval') {
             return 'awaiting_approval';
+        }
+        if (! in_array($payment, ['paid', 'free'], true) || $booking->status !== 'confirmed') {
+            return 'awaiting_payment';
         }
         if (! $this->qrWindowOpen($booking)) {
             return 'scheduled';

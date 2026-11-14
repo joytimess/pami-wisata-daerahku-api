@@ -36,6 +36,7 @@ function midtransAttempt(string $method = 'virtual_account', string $channel = '
         'guid' => '11111111-1111-4111-8111-111111111111', 'provider' => 'midtrans', 'environment' => 'sandbox', 'method' => $method, 'channel' => $channel,
         'merchant_reference' => 'PAMI-11111111-1111-4111-8111-111111111111', 'provider_request_id' => 'req-1', 'amount' => 20000, 'currency' => 'IDR',
         'instruction_expires_at' => CarbonImmutable::parse('2026-11-08 09:00:00', 'UTC')->toDateTimeString(),
+        'started_at' => CarbonImmutable::parse('2026-11-08 08:00:00', 'UTC')->toDateTimeString(),
     ], $override);
 }
 

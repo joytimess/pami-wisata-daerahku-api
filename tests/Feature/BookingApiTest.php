@@ -154,15 +154,18 @@ it('cancels only the owner pending booking and releases capacity exactly once', 
     $this->postJson("/api/v1/admin/bookings/{$guid}/approve", [], bearer($admin))->assertStatus(409)->assertJsonPath('code', 'booking_not_pending');
 });
 
-it('refuses to cancel processed bookings because no payment contract exists', function () {
+it('refuses to cancel bookings that are under payment verification or confirmed', function () {
     [$destination, $date] = seedDestination(capacity: 5, price: 1000);
     $user = makeUser();
     $admin = makeUser(1);
     assignTestDestination($admin, $destination);
     $guid = postBooking($this, $user, bookingPayload($destination, $date))->assertOk()->json('data.guid');
     $this->postJson("/api/v1/admin/bookings/{$guid}/approve", [], bearer($admin))->assertOk()->assertJsonPath('data.status', 'awaiting_payment');
-    $this->postJson("/api/v1/bookings/{$guid}/cancel", [], bearer($user))->assertStatus(409)->assertJsonPath('code', 'booking_not_cancellable');
-    expect(DB::table('bookings')->where('guid', $guid)->value('status'))->toBe('awaiting_payment');
+    foreach (['payment_verification', 'payment_review', 'confirmed'] as $status) {
+        DB::table('bookings')->where('guid', $guid)->update(['status' => $status]);
+        $this->postJson("/api/v1/bookings/{$guid}/cancel", [], bearer($user))->assertStatus(409)->assertJsonPath('code', 'booking_not_cancellable');
+        expect(DB::table('bookings')->where('guid', $guid)->value('status'))->toBe($status);
+    }
 });
 
 it('isolates booking data between users and filters history by status', function () {

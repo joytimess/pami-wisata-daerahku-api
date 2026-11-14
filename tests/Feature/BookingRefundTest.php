@@ -28,6 +28,7 @@ function refundPaidBooking(bool $pay = true): array
     $owner = makeUser();
     $booking = app(BookingService::class)->create($owner, bookingPayload($destination, $date, 2) + ['idempotency_key' => (string) Str::uuid()]);
     app(BookingService::class)->decide(makeUser(2), $booking->guid, true);
+    startPaymentCountdown($booking->guid);
     $booking = app(TicketService::class)->booking($booking->guid);
     // A persisted historical DOKU Sandbox VA attempt: the ledger stays readable and refundable without any DOKU transport.
     $intent = (string) Str::uuid();
@@ -362,4 +363,56 @@ it('replays an identical manual settlement, rejects an offset-less time and norm
     manualSettlement($admin, $booking, $refund, ['settlement_reference' => 'TRX-20261108-0099'])->assertConflict()->assertJsonPath('code', 'refund_not_settleable');
     expect(DB::table('booking_refund_request_events')->where('refund_request_guid', $refund)->where('to_status', 'manual_refunded')->count())->toBe(1)
         ->and(DB::table('booking_refund_requests')->where('guid', $refund)->value('settlement_reference'))->toBe('TRX-20261108-0001');
+});
+
+it('notifies the customer and the admin about each refund step without duplicates', function () {
+    [$owner, $booking, $attempt, $destination] = refundPaidBooking();
+    $admin = refundAdmin($destination);
+    $refund = refundRequest($owner, $booking)->assertOk()->json('data.guid');
+    refundDecision($admin, $booking, $refund, ['decision' => 'approve'])->assertOk();
+
+    $types = fn (string $user) => DB::table('notifications')->where('user_guid', $user)->where('booking_guid', $booking->guid)->pluck('type')->all();
+    expect($types($owner->guid))->toContain('booking.refund_approved')
+        ->and($types($admin->guid))->toContain('booking.refund_requested');
+
+    $this->travel(2)->minutes();
+    refundEvent($attempt, 'refunded', ['occurred_at' => now()->toIso8601String()]);
+    refundEvent($attempt, 'refunded', ['occurred_at' => now()->toIso8601String()]);
+    expect(DB::table('notifications')->where('user_guid', $owner->guid)->where('type', 'booking.refunded')->count())->toBe(1);
+});
+
+it('notifies the customer when a refund is rejected', function () {
+    [$owner, $booking, , $destination] = refundPaidBooking();
+    $refund = refundRequest($owner, $booking)->json('data.guid');
+    refundDecision(refundAdmin($destination), $booking, $refund, ['decision' => 'reject', 'note' => 'Di luar kebijakan'])->assertOk();
+
+    expect(DB::table('notifications')->where('user_guid', $owner->guid)->where('type', 'booking.refund_rejected')->count())->toBe(1);
+});
+
+it('reports how many active bookings keep the old timezone and lists the drift for the superadmin only', function () {
+    [$owner, $booking, , $destination] = refundPaidBooking(false);
+    $service = app(\App\Services\BookingTimezoneService::class);
+    $old = DB::table('destinations')->where('guid', $destination->guid)->value('timezone');
+    $new = $old === 'Asia/Makassar' ? 'Asia/Jayapura' : 'Asia/Makassar';
+    DB::table('bookings')->where('guid', $booking->guid)->update(['destination_timezone_snapshot' => $old]);
+    DB::table('destinations')->where('guid', $destination->guid)->update(['timezone' => $new]);
+
+    expect($service->impactOfChange($destination->guid, $old))->toBe(['previous_timezone' => $old, 'timezone' => $new, 'active_bookings' => 1])
+        ->and($service->impactOfChange($destination->guid, $new))->toBeNull();
+
+    $this->getJson('/api/v1/superadmin/bookings/timezone-drift', bearer(makeUser(1)))->assertForbidden();
+    $this->getJson('/api/v1/superadmin/bookings/timezone-drift', bearer(makeUser(2)))->assertOk()
+        ->assertJsonPath('data.bookings.0.guid', $booking->guid)->assertJsonPath('data.bookings.0.booking_timezone', $old)->assertJsonPath('data.bookings.0.destination_timezone', $new);
+});
+
+it('backfills missing timezone snapshots only outside dry-run', function () {
+    [, $booking, , $destination] = refundPaidBooking(false);
+    DB::table('bookings')->where('guid', $booking->guid)->update(['destination_timezone_snapshot' => null]);
+
+    $this->artisan('bookings:backfill-timezone-snapshot', ['--dry-run' => true])->assertSuccessful();
+    expect(DB::table('bookings')->where('guid', $booking->guid)->value('destination_timezone_snapshot'))->toBeNull();
+
+    $this->artisan('bookings:backfill-timezone-snapshot')->assertSuccessful();
+    expect(DB::table('bookings')->where('guid', $booking->guid)->value('destination_timezone_snapshot'))
+        ->toBe(DB::table('destinations')->where('guid', $destination->guid)->value('timezone'));
 });

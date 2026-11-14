@@ -42,6 +42,10 @@ class BookingResource extends JsonResource
             'review' => isset($this->review) ? new ReviewResource($this->review) : null,
             'approval_expires_at' => $this->approval_expires_at,
             'payment_expires_at' => $this->payment_expires_at,
+            'payment_started_at' => $this->payment_started_at ?? null,
+            'payment_selection_expires_at' => $this->payment_selection_expires_at ?? null,
+            // The zone this booking's deadlines run on (its own snapshot), so the app can label times WIB/WITA/WIT.
+            'destination_timezone' => $this->destination_timezone ?? $this->destination_timezone_snapshot ?? null,
             'notification_grace_expires_at' => $this->notification_grace_expires_at,
             'created_at' => $this->created_at,
         ];

@@ -84,7 +84,8 @@ class DemoPaymentService
     private function assertPayable(object $booking, CarbonImmutable $instant): void
     {
         if ($booking->status !== 'awaiting_payment' || (int) $booking->total_amount <= 0 || $booking->currency !== 'IDR'
-            || ! $booking->payment_expires_at || $instant->gte($booking->payment_expires_at)
+            || ($booking->payment_expires_at === null && (! $booking->payment_selection_expires_at || $instant->gte($booking->payment_selection_expires_at)))
+            || ($booking->payment_expires_at !== null && $instant->gte($booking->payment_expires_at))
             || $instant->gte(BookingRules::visitStart($booking->visit_date, $booking->destination_timezone))
             || ! DB::table('booking_status_histories')->where('booking_guid', $booking->guid)->where('new_status', 'awaiting_payment')->exists()) {
             throw new BookingException('The booking is not eligible for a DEMO payment.', 'demo_payment_ineligible');
@@ -103,6 +104,7 @@ class DemoPaymentService
     {
         $now = CarbonImmutable::now('UTC');
         $this->assertPayable($booking, $now);
+        app(PaymentService::class)->startPaymentWindow($booking, $now);
         if (! $intent) {
             $intent = (object) [
                 'guid' => (string) Str::uuid(), 'booking_guid' => $booking->guid, 'provider' => 'demo', 'environment' => 'demo',
@@ -222,7 +224,7 @@ class DemoPaymentService
             'provider' => 'demo', 'environment' => 'demo', 'test_only' => true, 'label' => 'DEMO',
             'status' => $attempt->status, 'booking_status' => $booking->status, 'payment_status' => $this->eligibility->status($booking),
             'amount' => (int) $booking->total_amount, 'currency' => $booking->currency,
-            'expires_at' => CarbonImmutable::parse($booking->payment_expires_at, 'UTC')->toIso8601String(),
+            'expires_at' => $booking->payment_expires_at === null ? null : CarbonImmutable::parse($booking->payment_expires_at, 'UTC')->toIso8601String(),
             'instruction' => ['presentation_type' => 'demo_simulator', 'label' => 'DEMO', 'test_only' => true],
         ];
     }

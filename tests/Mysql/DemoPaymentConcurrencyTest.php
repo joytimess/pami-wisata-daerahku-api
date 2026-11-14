@@ -46,6 +46,8 @@ function concurrentDemoBooking(): array
     $owner = makeUser();
     $booking = app(BookingService::class)->create($owner, bookingPayload($destination, $date, 2) + ['idempotency_key' => 'demo-concurrency']);
     $booking = app(BookingService::class)->decide(makeUser(2), $booking->guid, true);
+    startPaymentCountdown($booking->guid);
+    $booking = app(\App\Services\TicketService::class)->booking($booking->guid);
 
     return [$owner, $booking];
 }
@@ -197,7 +199,8 @@ it('preserves approved booking cancellation rules when demo success races cancel
         ], $connection, $database));
 
         expect($results->where('ok', true))->toHaveCount(1);
-        expect($results->where('ok', false)->pluck('code')->all())->toBe(['booking_not_cancellable']);
+        // Cancel either sees the pending DEMO attempt (still verifying) or the already confirmed booking: both are refusals.
+        expect($results->where('ok', false)->pluck('code')->first())->toBeIn(['booking_not_cancellable', 'payment_verification_pending']);
         $this->assertDatabaseHas('bookings', ['guid' => $booking->guid, 'status' => 'confirmed']);
         $this->assertDatabaseCount('payment_events', 1);
         expect((int) DB::table('bookings')->where('destination_quota_guid', $booking->destination_quota_guid)->whereIn('status', BookingRules::HELD)->sum('quantity'))->toBe(2);

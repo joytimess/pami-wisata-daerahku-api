@@ -32,6 +32,7 @@ if (! function_exists('snsProbe')) {
             'history_payment_verification' => (int) ($histories['payment_verification'] ?? 0),
             'history_confirmed' => (int) ($histories['confirmed'] ?? 0),
             'history_expired' => (int) ($histories['expired'] ?? 0),
+            'history_cycle_reset' => DB::table('booking_status_histories')->where('booking_guid', $bookingGuid)->where('reason', 'payment_cycle_reset')->count(),
         ];
     }
 }

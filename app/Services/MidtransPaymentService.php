@@ -66,6 +66,9 @@ class MidtransPaymentService
      */
     private const RECOVERY_WINDOW_SECONDS = 6 * 3600;
 
+    /** An open attempt is escalated to operators only this long after its instruction expired. */
+    private const ESCALATION_GRACE_SECONDS = 30 * 60;
+
     private ?string $lastOutcome = null;
 
     public function __construct(private MidtransClient $client, private MidtransChannelRegistry $registry, private TicketService $tickets) {}
@@ -127,6 +130,8 @@ class MidtransPaymentService
             }
             $this->assertPayable($booking);
             $startedAt = CarbonImmutable::now()->startOfSecond();
+            // First method choice of the cycle starts the countdown; the booking row is locked so only one request can set it.
+            app(PaymentService::class)->startPaymentWindow($booking, $startedAt);
             $expiresAt = app(PaymentService::class)->instructionExpiresAt($booking, $startedAt);
             $definition = $this->registry->find($input['method_code'], $input['channel']);
             if ($reason = $definition ? $this->registry->reason($definition['code']) : 'channel_unavailable') {
@@ -156,6 +161,7 @@ class MidtransPaymentService
                 'merchant_reference' => 'PAMI-'.$attemptGuid, 'provider_request_id' => (string) Str::uuid(),
                 // Immutable merchant binding: later lookups verify against this, not against whatever is configured at that time.
                 'merchant_id' => trim((string) config('midtrans.merchant_id')) ?: null,
+                'payment_cycle' => (int) $booking->payment_cycle,
                 'request_hash' => $hash, 'amount' => $intent->amount, 'currency' => $intent->currency,
                 'status' => 'initiating', 'presentation_type' => 'unavailable', 'instruction_expires_at' => $expiresAt,
                 'started_at' => $startedAt, 'next_reconcile_at' => now()->addMinutes(2), 'created_at' => now(), 'updated_at' => now(),
@@ -163,7 +169,6 @@ class MidtransPaymentService
             DB::table('payment_attempts')->insert((array) $attempt);
             DB::table('payment_intents')->where('guid', $intent->guid)->update(['status' => 'processing', 'updated_at' => now()]);
             DB::table('idempotency_records')->where('guid', $record->guid)->update(['response_reference' => $attempt->guid, 'updated_at' => now()]);
-            $booking->payment_approved_at = $this->approvedAt($booking);
 
             return ['attempt' => $attempt, 'booking' => $booking];
         }, 3);
@@ -417,6 +422,83 @@ class MidtransPaymentService
     }
 
     /**
+     * Owner cancels one pending attempt (wrong method chosen). The provider is asked to cancel the order, but only the verified
+     * Status lookup that follows may close the attempt: a payment made in the same instant wins and the cancel is refused. Nothing
+     * new can be started until the old order is proven closed, so the customer can never end up paying twice.
+     */
+    public function cancelAttempt(User $owner, string $guid, string $attemptGuid): void
+    {
+        app(PaymentService::class)->ownerBooking($owner, $guid);
+        $attempt = DB::table('payment_attempts as a')->join('payment_intents as i', 'i.guid', '=', 'a.payment_intent_guid')
+            ->where('i.booking_guid', $guid)->where('a.guid', $attemptGuid)->where('a.provider', 'midtrans')->first(['a.*']);
+        abort_unless($attempt, 404);
+        $this->cancelOrder($attempt, $owner->guid);
+    }
+
+    /**
+     * Cancels every open attempt of a booking before the booking itself is cancelled. Returns normally only when no attempt can
+     * still be paid; otherwise it throws and nothing is cancelled.
+     */
+    public function cancelOpenAttemptsOf(string $bookingGuid, string $actorGuid): void
+    {
+        $attempts = DB::table('payment_attempts as a')->join('payment_intents as i', 'i.guid', '=', 'a.payment_intent_guid')
+            ->where('i.booking_guid', $bookingGuid)->whereIn('a.status', self::OPEN_ATTEMPT_STATUSES)->get(['a.*', 'i.provider as intent_provider']);
+        foreach ($attempts as $attempt) {
+            if ($attempt->intent_provider !== 'midtrans') {
+                throw new BookingException('The payment is still being verified.', 'payment_verification_pending');
+            }
+            $this->cancelOrder($attempt, $actorGuid);
+        }
+    }
+
+    private function cancelOrder(object $attempt, string $actorGuid): void
+    {
+        if (in_array($attempt->status, ['failed', 'expired'], true)) {
+            return;
+        }
+        if (in_array($attempt->status, ['paid', 'reversed'], true)) {
+            throw new BookingException('The payment has already been received.', 'payment_already_received');
+        }
+        $intent = DB::table('payment_intents')->where('guid', $attempt->payment_intent_guid)->first();
+        $booking = DB::table('bookings')->where('guid', $intent->booking_guid)->first(['status']);
+        if ($booking->status !== 'awaiting_payment') {
+            throw new BookingException('Booking is not awaiting payment.', 'booking_not_awaiting_payment');
+        }
+        if ($intent->status === 'needs_review') {
+            throw new BookingException('Payment requires investigation.', 'payment_needs_review');
+        }
+        // An attempt without a proven provider order (still initiating, or an unknown Charge) cannot be cancelled: it may yet be paid.
+        if ($attempt->status !== 'pending') {
+            throw new BookingException('The payment is still being verified.', 'payment_verification_pending');
+        }
+        $answer = $this->client->cancel($attempt);
+        DB::table('payment_events')->insert([
+            'guid' => (string) Str::uuid(), 'payment_intent_guid' => $intent->guid, 'payment_attempt_guid' => $attempt->guid, 'provider' => 'midtrans',
+            'environment' => $attempt->environment, 'provider_event_key' => 'cancel:'.Str::uuid(), 'payload_hash' => hash('sha256', $attempt->guid.':cancel'),
+            'verification' => 'unverified', 'event_type' => 'status', 'disposition' => 'cancel_requested', 'amount' => (int) $attempt->amount,
+            'currency' => $attempt->currency, 'received_at' => now(),
+            'metadata' => json_encode(['source' => 'owner_cancel', 'actor_guid' => $actorGuid, 'provider_answer' => $answer['status']], JSON_THROW_ON_ERROR),
+        ]);
+        // The lookup, not the cancel answer, is the evidence.
+        $this->lookup($attempt->guid, 'cancel');
+        foreach (DB::table('payment_events')->where('payment_attempt_guid', $attempt->guid)->where('verification', 'verified')->where('disposition', 'recorded')->pluck('guid') as $eventGuid) {
+            $this->applyEvidence($eventGuid);
+        }
+        $status = DB::table('payment_attempts')->where('guid', $attempt->guid)->value('status');
+        if (in_array($status, ['failed', 'expired'], true)) {
+            if ($answer['status'] === 'accepted') {
+                DB::table('payment_attempts')->where('guid', $attempt->guid)->whereNull('last_error_code')->update(['last_error_code' => 'provider_cancel']);
+            }
+
+            return;
+        }
+        if (in_array($status, ['paid', 'reversed'], true)) {
+            throw new BookingException('The payment has already been received.', 'payment_already_received');
+        }
+        throw new BookingException('The payment is still being verified.', 'payment_verification_pending');
+    }
+
+    /**
      * One claimed lookup. Returns done (an outcome was applied), skipped (not eligible), throttled (a recent lookup already ran)
      * or failed (no usable evidence; retry later).
      *
@@ -428,7 +510,7 @@ class MidtransPaymentService
             return $mode === 'notification' ? 'failed' : 'skipped';
         }
         $interval = match ($mode) {
-            'scheduled' => 0, 'operator' => self::OPERATOR_MIN_INTERVAL_SECONDS, 'refresh' => self::REFRESH_MIN_INTERVAL_SECONDS, default => self::NOTIFICATION_MIN_INTERVAL_SECONDS,
+            'scheduled' => 0, 'cancel' => 0, 'operator' => self::OPERATOR_MIN_INTERVAL_SECONDS, 'refresh' => self::REFRESH_MIN_INTERVAL_SECONDS, default => self::NOTIFICATION_MIN_INTERVAL_SECONDS,
         };
         $eligible = fn () => DB::table('payment_attempts')->where('guid', $attemptGuid)->where('provider', 'midtrans')
             ->where('environment', $this->client->environment())
@@ -483,7 +565,8 @@ class MidtransPaymentService
             return;
         }
         // Past its window the schedule widens: the provider's own expiry has already decided the order, so frequent polling adds nothing.
-        $cap = $overdue ? 900 : 300;
+        // Just after the deadline the booking's next step depends on this answer, so poll about every minute for ten minutes first.
+        $cap = $overdue ? (CarbonImmutable::parse($row->instruction_expires_at, 'UTC')->addSeconds(600)->gt(now()) ? 60 : 900) : 300;
         DB::table('payment_attempts')->where('guid', $attemptGuid)->whereIn('status', self::OPEN_ATTEMPT_STATUSES)->whereNull('recovery_exhausted_at')
             ->update(['next_reconcile_at' => now()->addSeconds(min($cap, 30 * 2 ** min((int) $row->reconcile_count, 4)) + random_int(0, 15))]);
     }
@@ -598,7 +681,12 @@ class MidtransPaymentService
 
             return 'done';
         }
-        Log::info('Midtrans verified event recorded.', ['event_guid' => $event->guid, 'attempt_guid' => $attempt->guid, 'status' => $outcome['status'], 'duplicate' => $event->guid !== $eventGuid]);
+        Log::info('Midtrans verified event recorded.', [
+            'event_guid' => $event->guid, 
+            'attempt_guid' => $attempt->guid, 
+            'status' => $outcome['status'], 
+            'duplicate' => $event->guid !== $eventGuid
+        ]);
         $this->applyEvidence($event->guid);
 
         return 'done';
@@ -653,7 +741,9 @@ class MidtransPaymentService
     {
         $escalated = 0;
         $overdue = DB::table('payment_attempts')->where('provider', 'midtrans')->where('environment', $this->client->environment())
-            ->whereIn('status', self::OPEN_ATTEMPT_STATUSES)->whereNull('escalated_at')->where('instruction_expires_at', '<=', now())
+            ->whereIn('status', self::OPEN_ATTEMPT_STATUSES)->whereNull('escalated_at')
+            // A few minutes of notification or expiry lag is normal and resolves on its own; only a longer silence is escalated.
+            ->where('instruction_expires_at', '<=', now()->subSeconds(self::ESCALATION_GRACE_SECONDS))
             ->orderBy('instruction_expires_at')->orderBy('guid')->limit($limit)->get();
         foreach ($overdue as $attempt) {
             $marked = DB::table('payment_attempts')->where('guid', $attempt->guid)->whereIn('status', self::OPEN_ATTEMPT_STATUSES)->whereNull('escalated_at')
@@ -736,7 +826,8 @@ class MidtransPaymentService
             $booking->status !== 'awaiting_payment' => 'booking_not_awaiting_payment',
             (int) $booking->total_amount <= 0 => 'booking_not_payable',
             $booking->currency !== 'IDR' => 'unsupported_currency',
-            ! $booking->payment_expires_at || now()->gte($booking->payment_expires_at)
+            $booking->payment_expires_at === null && (! $booking->payment_selection_expires_at || now()->gte($booking->payment_selection_expires_at)) => 'payment_selection_closed',
+            ($booking->payment_expires_at !== null && now()->gte($booking->payment_expires_at))
                 || now()->gte(BookingRules::visitStart($booking->visit_date, $booking->destination_timezone)) => 'payment_window_closed',
             $this->approvedAt($booking) === null => 'booking_not_awaiting_payment',
             default => null,
@@ -754,7 +845,9 @@ class MidtransPaymentService
         if ($intent->environment !== $this->client->environment()) {
             throw new BookingException('Payment belongs to another environment.', 'payment_environment_mismatch');
         }
-        if ((int) $intent->amount !== (int) $booking->total_amount || $intent->currency !== $booking->currency || $intent->expires_at !== $booking->payment_expires_at) {
+        if ((int) $intent->amount !== (int) $booking->total_amount || $intent->currency !== $booking->currency
+            // Between cycles the booking has no deadline; the intent keeps the previous one until the next method choice.
+            || ($booking->payment_expires_at !== null && $intent->expires_at !== $booking->payment_expires_at)) {
             throw new BookingException('Payment snapshot requires investigation.', 'payment_needs_review');
         }
     }
@@ -765,7 +858,7 @@ class MidtransPaymentService
         $instruction = ['presentation_type' => 'unavailable'];
         if ($booking->status === 'awaiting_payment' && $intent->status === 'processing' && $attempt->status === 'pending'
             && in_array($attempt->presentation_type, ['virtual_account', 'qr_image'], true) && $intent->environment === $this->client->environment()
-            && now()->lt($attempt->instruction_expires_at) && now()->lt($booking->payment_expires_at)) {
+            && now()->lt($attempt->instruction_expires_at) && $booking->payment_expires_at !== null && now()->lt($booking->payment_expires_at)) {
             $instruction = $this->client->instruction($attempt);
         }
 
@@ -780,7 +873,7 @@ class MidtransPaymentService
             },
             'amount' => (int) $intent->amount, 'currency' => $intent->currency, 'method_code' => $attempt->method, 'channel' => $attempt->channel,
             // One absolute deadline for every attempt; a retry never extends it.
-            'expires_at' => CarbonImmutable::parse($booking->payment_expires_at, 'UTC')->toIso8601String(),
+            'expires_at' => $booking->payment_expires_at === null ? null : CarbonImmutable::parse($booking->payment_expires_at, 'UTC')->toIso8601String(),
             'server_time' => CarbonImmutable::now()->utc()->toIso8601String(),
             'verification_pending' => app(PaymentService::class)->verificationPending($attempt),
             'escalated' => app(PaymentService::class)->verificationPending($attempt) && $attempt->escalated_at !== null,

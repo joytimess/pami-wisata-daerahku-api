@@ -29,6 +29,7 @@ function historicalPayment(string $provider = 'doku', string $environment = 'san
     $owner = makeUser();
     $booking = app(BookingService::class)->create($owner, bookingPayload($destination, $date, 2) + ['idempotency_key' => (string) Str::uuid()]);
     app(BookingService::class)->decide(makeUser(2), $booking->guid, true);
+    startPaymentCountdown($booking->guid); // a historical ledger always had a deadline bound to its intent
     $booking = app(TicketService::class)->booking($booking->guid);
     $intent = ['guid' => (string) Str::uuid(), 'booking_guid' => $booking->guid, 'provider' => $provider, 'environment' => $environment,
         'currency' => 'IDR', 'amount' => 20000, 'status' => 'paid', 'merchant_reference' => (string) Str::uuid(),

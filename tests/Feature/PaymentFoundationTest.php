@@ -113,6 +113,7 @@ it('keeps the 15 minute cutoff without falling back to DOKU and expires an untou
     [$owner, $guid, $destination, $date] = foundationBooking();
     $service = app(BookingService::class);
     $service->decide(makeUser(2), $guid, true);
+    startPaymentCountdown($guid);
     $headers = bearer($owner);
     $before = DB::table('bookings')->where('guid', $guid)->first();
     expect($before->payment_expires_at)->toBe(now()->addMinutes(15)->format('Y-m-d H:i:s'));
@@ -136,6 +137,7 @@ it('holds the quota of a booking with an unresolved legacy attempt through verif
     [$owner, $guid, $destination, $date] = foundationBooking();
     $service = app(BookingService::class);
     $service->decide(makeUser(2), $guid, true);
+    startPaymentCountdown($guid);
     foundationLedger($guid);
     $before = DB::table('bookings')->where('guid', $guid)->first();
 

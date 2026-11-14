@@ -277,7 +277,8 @@ it('routes ambiguous provider evidence to review without confirming anything', f
 it('escalates an attempt still unresolved after its window exactly once and keeps holding the booking', function () {
     [, $booking] = mtxPayable();
     $attempt = mtxAttempt($booking);
-    $this->travelTo(CarbonImmutable::parse($booking->payment_expires_at, 'UTC')->addMinute());
+    // A few minutes of lag is not escalated; a long silence is.
+    $this->travelTo(CarbonImmutable::parse($booking->payment_expires_at, 'UTC')->addMinutes(31));
     Http::fake();
     Log::spy();
 

@@ -51,9 +51,9 @@ class MidtransClient
     /**
      * Sends POST /v2/charge for a reserved attempt.
      *
-     * `$booking->payment_approved_at` is the authoritative approval time (the start of the one absolute deadline) and is sent as
-     * the GMT+7 `order_time` of `custom_expiry`; the duration is truncated to whole minutes so the provider can never expire later
-     * than the booking deadline.
+     * The attempt's own start time is sent as the GMT+7 `order_time` of `custom_expiry` (the cycle deadline is counted from the
+     * first method choice, and a later attempt must not send an `order_time` far in the past); the duration is truncated to whole
+     * minutes so the provider can never expire later than the cycle deadline.
      *
      * @return array<string, mixed> normalized outcome: status pending|failed|unknown plus reason, instruction and expiry
      */
@@ -64,17 +64,18 @@ class MidtransClient
             return ['status' => 'failed', 'reason' => $reason];
         }
         $expiresAt = CarbonImmutable::parse($attempt->instruction_expires_at, 'UTC');
-        $approvedAt = $booking->payment_approved_at ?? null;
-        if (! $approvedAt instanceof CarbonImmutable) {
+        $startedAt = $attempt->started_at ?? null;
+        $orderTime = $startedAt === null ? null : CarbonImmutable::parse($startedAt, 'UTC');
+        if ($orderTime === null) {
             return ['status' => 'failed', 'reason' => 'payment_window_unavailable'];
         }
-        $minutes = intdiv($expiresAt->getTimestamp() - $approvedAt->getTimestamp(), 60);
+        $minutes = intdiv($expiresAt->getTimestamp() - $orderTime->getTimestamp(), 60);
         if ($reason = $this->expiryWindowReason($expiresAt) ?? ($minutes < 1 ? 'payment_window_closed' : null)) {
             return ['status' => 'failed', 'reason' => $reason];
         }
         $payload = [
             'transaction_details' => ['order_id' => $attempt->merchant_reference, 'gross_amount' => (int) $attempt->amount],
-            'custom_expiry' => ['order_time' => $approvedAt->setTimezone(MidtransStatusMapper::PROVIDER_TIMEZONE)->format('Y-m-d H:i:s O'),
+            'custom_expiry' => ['order_time' => $orderTime->setTimezone(MidtransStatusMapper::PROVIDER_TIMEZONE)->format('Y-m-d H:i:s O'),
                 'expiry_duration' => $minutes, 'unit' => 'minute'],
         ] + ($attempt->method === 'qris'
             ? ['payment_type' => 'qris', 'qris' => ['acquirer' => (string) config('midtrans.qris_acquirer')]]
@@ -193,6 +194,37 @@ class MidtransClient
         }
 
         return $outcome + ['payload_hash' => hash('sha256', (string) $response->body())];
+    }
+
+    /**
+     * Sends POST /v2/{order_id}/cancel for a pending attempt the owner no longer wants. The answer is NEVER trusted on its own:
+     * the caller always follows it with an authenticated Status lookup, which alone decides whether the attempt is closed.
+     *
+     * @return array{status: 'accepted'|'rejected'|'unknown', reason?: string}
+     */
+    public function cancel(object $attempt): array
+    {
+        if ($reason = $this->statusPrecondition($attempt)) {
+            return ['status' => 'unknown', 'reason' => $reason];
+        }
+        try {
+            $body = $this->decode($this->send('cancel', 'POST', '/v2/'.rawurlencode($attempt->merchant_reference).'/cancel'), 'cancel');
+        } catch (MidtransRequestException $exception) {
+            $this->log($attempt, $exception->diagnosticCode, $exception->httpStatus, $exception->providerStatusCode, 'Midtrans cancel did not produce a cancelled order.');
+
+            return ['status' => $exception->diagnosticCode === 'midtrans_provider_rejected' ? 'rejected' : 'unknown', 'reason' => 'provider_unavailable'];
+        } catch (Throwable) {
+            $this->log($attempt, 'midtrans_internal_exception', null, null, 'Midtrans cancel did not produce a cancelled order.');
+
+            return ['status' => 'unknown', 'reason' => 'provider_unavailable'];
+        }
+        $code = (string) ($body['status_code'] ?? '');
+        if ($code === '200' && ($body['order_id'] ?? null) === $attempt->merchant_reference) {
+            return ['status' => 'accepted'];
+        }
+        $this->log($attempt, 'midtrans_cancel_not_accepted', null, $code, 'Midtrans cancel did not produce a cancelled order.');
+
+        return ['status' => in_array($code, ['400', '402', '404', '412'], true) ? 'rejected' : 'unknown', 'reason' => 'provider_rejected'];
     }
 
     /**

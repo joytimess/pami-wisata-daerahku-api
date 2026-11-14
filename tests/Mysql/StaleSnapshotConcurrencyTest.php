@@ -298,8 +298,10 @@ function snsExpectSingleOutcome(string $outcome, object $booking, object $attemp
 
         return;
     }
-    expect($row->status)->toBe('expired')->and($intent->status)->toBe('expired')->and($intent->applied_attempt_guid)->toBeNull()
-        ->and($paidAttempts)->toBe(0)->and(snsHeldQuantity($booking))->toBe(0)->and($expiredRows)->toBe(1)->and($confirmedRows)->toBe(0);
+    // An unpaid cycle is not an anomaly: the booking starts a fresh payment cycle exactly once and keeps its quota.
+    $resets = DB::table('booking_status_histories')->where('booking_guid', $booking->guid)->where('reason', 'payment_cycle_reset')->count();
+    expect($row->status)->toBe('awaiting_payment')->and($row->payment_expires_at)->toBeNull()->and($intent->status)->toBe('requires_payment')->and($intent->applied_attempt_guid)->toBeNull()
+        ->and($paidAttempts)->toBe(0)->and(snsHeldQuantity($booking))->toBe((int) $booking->quantity)->and($expiredRows)->toBe(0)->and($confirmedRows)->toBe(0)->and($resets)->toBe(1);
     expect(DB::table('payment_attempts')->where('guid', $attempt->guid)->value('status'))->toBe('expired');
 }
 
@@ -311,10 +313,10 @@ it('confirms the booking when a stale settlement resumes after the expiry pass c
         $run = snsRace($connection, $database, $job, 'destination_quotas', $booking->destination_quota_guid, fn () => app(BookingService::class)->expireDue());
 
         $this->assertTrue($run['result']['ok'], snsResultMessage($run));
-        // The pass only parked the booking for verification (a pending attempt can still be paid); the settlement then wins.
-        expect(DB::table('booking_status_histories')->where('booking_guid', $booking->guid)->where('new_status', 'payment_verification')->count())->toBe(1);
+        // The pass leaves a pending attempt alone (it can still be paid); the settlement then wins.
+        expect(DB::table('booking_status_histories')->where('booking_guid', $booking->guid)->where('new_status', 'payment_verification')->count())->toBe(0);
+        // The expiry pass no longer commits anything the settlement could be stale about; the single outcome is what matters.
         snsExpectSingleOutcome('confirmed', $booking, $attempt);
-        snsExpectStaleView($run['result'], ['history_payment_verification'], $booking->guid);
     });
 });
 
@@ -333,7 +335,7 @@ it('leaves a confirmed booking untouched when a stale expiry pass resumes after 
     });
 });
 
-it('expires the booking once when a stale proven-unpaid settlement resumes after the expiry pass committed first on MySQL', function () {
+it('resets the payment cycle once when a stale proven-unpaid settlement resumes after the expiry pass committed first on MySQL', function () {
     withSnsMysql(function (array $connection, string $database): void {
         ['booking' => $booking, 'attempt' => $attempt, 'event' => $event] = snsDeadlineFixture('status', 'expired', now()->subMinutes(2));
         $job = ['action' => 'apply_event', 'snapshot' => 'explicit', 'booking_guid' => $booking->guid, 'event_guid' => $event];
@@ -341,14 +343,13 @@ it('expires the booking once when a stale proven-unpaid settlement resumes after
         $run = snsRace($connection, $database, $job, 'destination_quotas', $booking->destination_quota_guid, fn () => app(BookingService::class)->expireDue());
 
         $this->assertTrue($run['result']['ok'], snsResultMessage($run));
-        // The pass could not expire it (the attempt was still pending), the proof then closed it exactly once.
-        expect(DB::table('booking_status_histories')->where('booking_guid', $booking->guid)->where('new_status', 'payment_verification')->count())->toBe(1);
-        snsExpectSingleOutcome('expired', $booking, $attempt);
-        snsExpectStaleView($run['result'], ['history_payment_verification'], $booking->guid);
+        // The pass could not end the cycle (the attempt was still pending), the proof then reset it exactly once.
+        expect(DB::table('booking_status_histories')->where('booking_guid', $booking->guid)->where('new_status', 'payment_verification')->count())->toBe(0);
+        snsExpectSingleOutcome('reset', $booking, $attempt);
     });
 });
 
-it('expires the booking once when a stale expiry pass resumes after the proven-unpaid settlement committed first on MySQL', function () {
+it('resets the payment cycle once when a stale expiry pass resumes after the proven-unpaid settlement committed first on MySQL', function () {
     withSnsMysql(function (array $connection, string $database): void {
         ['booking' => $booking, 'attempt' => $attempt, 'event' => $event] = snsDeadlineFixture('status', 'expired', now()->subMinutes(2));
         $job = ['action' => 'expire_due', 'snapshot' => 'explicit', 'booking_guid' => $booking->guid];
@@ -357,8 +358,8 @@ it('expires the booking once when a stale expiry pass resumes after the proven-u
 
         $this->assertTrue($run['result']['ok'], snsResultMessage($run));
         expect(DB::table('booking_status_histories')->where('booking_guid', $booking->guid)->where('new_status', 'payment_verification')->count())->toBe(0);
-        snsExpectSingleOutcome('expired', $booking, $attempt);
-        snsExpectStaleView($run['result'], ['history_expired', 'booking_status'], $booking->guid);
+        snsExpectSingleOutcome('reset', $booking, $attempt);
+        snsExpectStaleView($run['result'], ['history_cycle_reset', 'intent_status'], $booking->guid);
     });
 });
 

@@ -84,7 +84,8 @@ class OperatorRecoveryService
         }
         if ($action === 'close_unpaid') {
             // The attempts are now proven terminal: closing the booking and releasing its quota is the engine's own atomic step.
-            $this->settlement->closeAfterOutcome($bookingGuid);
+            // An operator's decision to close ends the booking; it is never turned into a fresh payment cycle.
+            $this->settlement->closeAfterOutcome($bookingGuid, false);
         }
 
         return $this->summary($bookingGuid, DB::table('payment_recovery_actions')->where('guid', $result['audit'])->first());

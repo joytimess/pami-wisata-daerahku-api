@@ -35,6 +35,7 @@ function midtransPayable(): array
     $owner = makeUser();
     $booking = app(BookingService::class)->create($owner, bookingPayload($destination, $date, 2) + ['idempotency_key' => (string) Str::uuid()]);
     $booking = app(BookingService::class)->decide(makeUser(2), $booking->guid, true);
+    startPaymentCountdown($booking->guid);
 
     return [$owner, app(TicketService::class)->booking($booking->guid)];
 }

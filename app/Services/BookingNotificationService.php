@@ -7,9 +7,19 @@ use Illuminate\Support\Str;
 
 class BookingNotificationService
 {
-    public function record(string $bookingGuid, string $ownerGuid, string $event): void
+    private const ZONE_LABELS = ['Asia/Jakarta' => 'WIB', 'Asia/Makassar' => 'WITA', 'Asia/Jayapura' => 'WIT'];
+
+    /** @param array{deadline?: string, timezone?: string} $context deadline (UTC) and destination timezone for time-bound texts */
+    public function record(string $bookingGuid, string $ownerGuid, string $event, array $context = []): void
     {
         [$title, $body, $admin] = match ($event) {
+            'approved_awaiting_payment' => ['Booking disetujui', 'Booking disetujui. Silakan pilih metode pembayaran sebelum '.$this->localTime($context).'.', false],
+            'payment_cycle_expired' => ['Waktu pembayaran habis', 'Waktu pembayaran habis. Silakan pilih metode pembayaran lagi sebelum '.$this->localTime($context).'.', false],
+            'refund_requested' => ['Permintaan refund baru', 'Permintaan refund baru untuk booking '.($context['booking_number'] ?? '').'.', true],
+            'refund_approved' => ['Refund disetujui', 'Permintaan refund Anda disetujui dan sedang diproses.', false],
+            'refund_rejected' => ['Refund ditolak', 'Permintaan refund Anda ditolak.'.(($context['reason'] ?? '') !== '' ? ' Alasan: '.$context['reason'].'.' : ''), false],
+            'refunded' => ['Refund selesai', 'Dana refund sebesar Rp'.number_format((int) ($context['amount'] ?? 0), 0, ',', '.').' telah dikembalikan.', false],
+            'refund_manual_action' => ['Refund perlu diproses manual', 'Refund booking '.($context['booking_number'] ?? '').' perlu diproses manual.', true],
             'created' => ['Booking baru', 'Ada booking baru yang menunggu keputusan.', true],
             'approved' => ['Booking disetujui', 'Booking Anda telah disetujui.', false],
             'rejected' => ['Booking ditolak', 'Booking Anda telah ditolak.', false],
@@ -27,7 +37,7 @@ class BookingNotificationService
                     ->where('bookings.guid', $bookingGuid)->whereColumn('destination_admin_assignments.user_guid', 'users.guid'))))->pluck('guid')
             : collect([$ownerGuid]);
         foreach ($users as $userGuid) {
-            $this->insert((string) $userGuid, $bookingGuid, 'booking:'.$bookingGuid.':'.$event, $event, $title, $body,
+            $this->insert((string) $userGuid, $bookingGuid, 'booking:'.$bookingGuid.':'.$event.($context['suffix'] ?? ''), $event, $title, $body,
                 ! in_array($event, ['demo_paid', 'sandbox_paid'], true));
         }
     }
@@ -81,6 +91,14 @@ class BookingNotificationService
         ]));
         $this->insert($ownerGuid, $bookingGuid, 'booking:'.$bookingGuid.':ticket_issued', 'ticket_issued', ($sandbox ? '[SANDBOX] ' : '').'QR tiket tersedia', $body,
             ! DB::table('payment_intents')->where('booking_guid', $bookingGuid)->where('provider', 'demo')->exists());
+    }
+
+    /** Deadline in the booking's own destination zone with its WIB/WITA/WIT label, never the phone's zone. */
+    private function localTime(array $context): string
+    {
+        $zone = $context['timezone'] ?? 'Asia/Jakarta';
+
+        return \Carbon\CarbonImmutable::parse($context['deadline'], 'UTC')->setTimezone($zone)->locale('id')->translatedFormat('j F Y H:i').' '.(self::ZONE_LABELS[$zone] ?? $zone);
     }
 
     private function insert(string $userGuid, string $bookingGuid, string $eventKey, string $event, string $title, string $body, bool $deliver): void

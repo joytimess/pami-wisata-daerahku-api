@@ -208,6 +208,8 @@ class BookingService
     /** Owner-only cancellation; only a booking still awaiting a decision may be released. */
     public function cancel(User $user, string $guid): object
     {
+        $this->settleBeforeCancel($user, $guid);
+
         return DB::transaction(function () use ($user, $guid) {
             $ref = DB::table('bookings')->where('guid', $guid)->where('user_guid', $user->guid)->first(['destination_quota_guid']);
             if (! $ref) {
@@ -220,8 +222,13 @@ class BookingService
             if ($booking->status === 'cancelled') {
                 throw new BookingException('Booking is already cancelled.', 'booking_already_cancelled');
             }
+            if ($booking->status === 'awaiting_payment') {
+                $this->cancelAwaitingPayment($booking, $user, $now);
+
+                return $this->find($guid);
+            }
             if ($booking->status !== 'pending_approval' || $now->gte($booking->approval_expires_at)) {
-                throw new BookingException('Only a booking awaiting approval can be cancelled. Processed bookings follow the payment policy, which is not available yet.', 'booking_not_cancellable');
+                throw new BookingException('Only a booking awaiting approval or payment can be cancelled. Confirmed bookings follow the refund policy.', 'booking_not_cancellable');
             }
             DB::table('bookings')->where('guid', $guid)->update(['status' => 'cancelled', 'updated_at' => $now]);
             $this->history($guid, $user->guid, 'pending_approval', 'cancelled');
@@ -230,6 +237,44 @@ class BookingService
 
             return $this->find($guid);
         }, 3);
+    }
+
+    /**
+     * A booking awaiting payment may hold a pending Midtrans order. That order is cancelled and proven closed by a verified lookup
+     * BEFORE the booking transaction, because the provider call must never run inside it. A payment that arrives meanwhile wins.
+     */
+    private function settleBeforeCancel(User $user, string $guid): void
+    {
+        $status = DB::table('bookings')->where('guid', $guid)->where('user_guid', $user->guid)->value('status');
+        if ($status === 'awaiting_payment') {
+            try {
+                app(MidtransPaymentService::class)->cancelOpenAttemptsOf($guid, $user->guid);
+            } catch (BookingException $exception) {
+                // A payment that arrived first wins: the booking is paid and follows the refund policy instead.
+                throw $exception->errorCode === 'payment_already_received'
+                    ? new BookingException('The booking is already paid.', 'booking_already_paid') : $exception;
+            }
+        }
+    }
+
+    /** Runs under the quota and booking locks: only a booking with no payable attempt left is cancelled, and its intent with it. */
+    private function cancelAwaitingPayment(object $booking, User $user, mixed $now): void
+    {
+        $intent = DB::table('payment_intents')->where('booking_guid', $booking->guid)->lockForUpdate()->first();
+        if ($intent) {
+            $open = DB::table('payment_attempts')->where('payment_intent_guid', $intent->guid)->lockForUpdate()
+                ->whereNotIn('status', ['failed', 'expired'])->exists();
+            if ($intent->status === 'paid' || $intent->applied_attempt_guid !== null) {
+                throw new BookingException('The booking is already paid.', 'booking_already_paid');
+            }
+            if ($open || ! in_array($intent->status, ['requires_payment', 'processing'], true)) {
+                throw new BookingException('The payment is still being verified.', 'payment_verification_pending');
+            }
+            DB::table('payment_intents')->where('guid', $intent->guid)->update(['status' => 'cancelled', 'updated_at' => $now]);
+        }
+        DB::table('bookings')->where('guid', $booking->guid)->update(['status' => 'cancelled', 'updated_at' => $now]);
+        $this->history($booking->guid, $user->guid, 'awaiting_payment', 'cancelled', 'cancelled_by_owner');
+        $this->notifications->record($booking->guid, $booking->user_guid, 'cancelled');
     }
 
     public function decide(User $actor, string $guid, bool $approve, ?string $reason = null): object
@@ -255,7 +300,8 @@ class BookingService
             if ($now->gte($booking->approval_expires_at)) {
                 throw new BookingException('The approval deadline for this booking has passed.', 'approval_deadline_passed', ['status' => $booking->status]);
             }
-            $timezone = DB::table('destinations')->where('guid', $quota->destination_guid)->value('timezone');
+            // The booking snapshot is the only timezone source; the live destination value only backfills rows without one.
+            $timezone = $booking->destination_timezone_snapshot ?? DB::table('destinations')->where('guid', $quota->destination_guid)->value('timezone');
             $visitStart = BookingRules::visitStart($quota->visit_date, $timezone);
             if ($approve && $now->copy()->addMinutes(BookingRules::APPROVE_LEAD_MINUTES)->gte($visitStart)) {
                 throw new BookingException('The visit date is too close for approval.', 'visit_date_too_close');
@@ -264,11 +310,12 @@ class BookingService
             $status = ! $approve ? 'rejected' : ($booking->total_amount == 0 ? 'confirmed' : 'awaiting_payment');
             $updates = ['status' => $status, 'updated_at' => $now];
             if ($status === 'awaiting_payment') {
-                // One absolute deadline from the very instant recorded in the status history below; every attempt inherits it. Midtrans
-                // approvals get 15 minutes; DEMO keeps its historical one hour window.
-                $window = BookingRules::paymentWindowSeconds(app(PaymentGateway::class)->activeProvider());
-                $updates['payment_expires_at'] = $now->copy()->addSeconds($window);
-                $updates['notification_grace_expires_at'] = $now->copy()->addSeconds($window + BookingRules::PAYMENT_GRACE_SECONDS);
+                // Approval only opens payment. The countdown (payment_expires_at) starts when the customer picks a method; until then
+                // the booking is bounded by the selection deadline so its quota is not held forever.
+                $updates['payment_expires_at'] = null;
+                $updates['notification_grace_expires_at'] = null;
+                $updates['payment_started_at'] = null;
+                $updates['payment_selection_expires_at'] = BookingRules::paymentSelectionDeadline($now, $visitStart);
             }
             DB::table('bookings')->where('guid', $guid)->update($updates);
             if ($approve) {
@@ -276,7 +323,11 @@ class BookingService
             }
             $this->history($guid, $actor->guid, 'pending_approval', $status, $reason, $now);
             $this->claims->close($guid, $actor->guid, 'completed');
-            $this->notifications->record($guid, $booking->user_guid, $approve ? 'approved' : 'rejected');
+            if ($status === 'awaiting_payment') {
+                $this->notifications->record($guid, $booking->user_guid, 'approved_awaiting_payment', ['deadline' => (string) $updates['payment_selection_expires_at'], 'timezone' => $timezone]);
+            } else {
+                $this->notifications->record($guid, $booking->user_guid, $approve ? 'approved' : 'rejected');
+            }
 
             return $this->find($guid);
         }, 3);
@@ -287,6 +338,8 @@ class BookingService
         DB::table('bookings')->where(function ($q) {
             $q->where(fn ($q) => $q->where('status', 'pending_approval')->where('approval_expires_at', '<=', now()))
                 ->orWhere(fn ($q) => $q->where('status', 'awaiting_payment')->where('payment_expires_at', '<=', now()))
+                ->orWhere(fn ($q) => $q->where('status', 'awaiting_payment')->whereNull('payment_started_at')->whereNull('payment_expires_at')
+                    ->where('payment_selection_expires_at', '<=', now()))
                 // Held payment states are re-examined every pass. Legacy (DOKU/DEMO) intents are never auto-closed, so they keep their
                 // historical timing: payment_verification waits for the grace, and payment_review (their last state) is not re-locked.
                 ->orWhere(fn ($q) => $q->where('status', 'payment_verification')->where('payment_expires_at', '<=', now())
@@ -316,15 +369,25 @@ class BookingService
                 && $now->gte($booking->payment_expires_at) && app(PaymentSettlementService::class)->expireIfTerminalUnpaid($guid)) {
                 return;
             }
+            $reason = null;
+            // A Midtrans cycle never moves to verification or review on a clock: an unpaid cycle is reset or expired from proven
+            // provider evidence. Only the legacy DOKU/DEMO intents and intent-less bookings keep the timed path.
+            $midtrans = DB::table('payment_intents')->where('booking_guid', $guid)->where('provider', 'midtrans')->exists();
+            if ($midtrans && $booking->payment_expires_at !== null && $now->gte($booking->payment_expires_at)) {
+                $this->requestLookup($guid);
+            }
             $next = match (true) {
                 $booking->status === 'pending_approval' && $now->gte($booking->approval_expires_at) => 'expired',
-                $booking->status === 'awaiting_payment' && $now->gte($booking->payment_expires_at) => 'payment_verification',
-                $booking->status === 'payment_verification' && $now->gte($booking->notification_grace_expires_at) => 'payment_review',
+                // No method was ever chosen: the selection deadline ends the booking and releases the quota.
+                $booking->status === 'awaiting_payment' && $booking->payment_started_at === null && $booking->payment_expires_at === null
+                    && $booking->payment_selection_expires_at !== null && $now->gte($booking->payment_selection_expires_at) => $this->selectionExpired($reason),
+                $booking->status === 'awaiting_payment' && $booking->payment_expires_at !== null && $now->gte($booking->payment_expires_at) => $midtrans ? null : 'payment_verification',
+                $booking->status === 'payment_verification' && $booking->notification_grace_expires_at !== null && $now->gte($booking->notification_grace_expires_at) => $midtrans ? null : 'payment_review',
                 default => null,
             };
             if ($next) {
                 DB::table('bookings')->where('guid', $guid)->update(['status' => $next, 'updated_at' => $now]);
-                $this->history($guid, null, $booking->status, $next);
+                $this->history($guid, null, $booking->status, $next, $reason);
                 if ($next === 'expired') {
                     $this->claims->close($guid, null, 'expired', 'booking_expired');
                 }
@@ -333,6 +396,22 @@ class BookingService
                 }
             }
         }, 3);
+    }
+
+    /** Past the deadline the provider's status decides: bring the next lookup of every still-open attempt forward. */
+    private function requestLookup(string $bookingGuid): void
+    {
+        DB::table('payment_attempts')->whereIn('payment_intent_guid', DB::table('payment_intents')->where('booking_guid', $bookingGuid)->select('guid'))
+            ->whereIn('status', ['initiating', 'pending', 'unknown'])->whereNull('recovery_exhausted_at')->where('instruction_expires_at', '<=', now())
+            ->where(fn ($due) => $due->whereNull('next_reconcile_at')->orWhere('next_reconcile_at', '>', now()->addSeconds(60)))
+            ->update(['next_reconcile_at' => now()]);
+    }
+
+    private function selectionExpired(?string &$reason): string
+    {
+        $reason = 'payment_method_not_selected';
+
+        return 'expired';
     }
 
     private function claimKey(User $user, string $key, string $hash, string $status): void
@@ -383,12 +462,12 @@ class BookingService
 
     private function format(object $booking): object
     {
-        foreach (['approval_expires_at', 'payment_expires_at', 'notification_grace_expires_at', 'created_at'] as $field) {
+        foreach (['approval_expires_at', 'payment_expires_at', 'payment_started_at', 'payment_selection_expires_at', 'notification_grace_expires_at', 'created_at'] as $field) {
             $booking->$field = $booking->$field ? CarbonImmutable::parse($booking->$field, 'UTC')->toIso8601String() : null;
         }
         $booking->visit_date = substr((string) $booking->visit_date, 0, 10);
-        $booking->cancellable = $booking->status === 'pending_approval'
-            && CarbonImmutable::parse($booking->approval_expires_at)->isFuture();
+        $booking->cancellable = ($booking->status === 'pending_approval' && CarbonImmutable::parse($booking->approval_expires_at)->isFuture())
+            || $booking->status === 'awaiting_payment';
         $booking->destination_timezone = $booking->destination_timezone_snapshot ?? $booking->destination_timezone;
         $booking->ticket_count = (int) $booking->quantity;
         $booking->checked_in_count = $booking->ticket_rows ? (int) $booking->ticket_checked_in_count

@@ -150,14 +150,14 @@ class PaymentSettlementService
      *
      * @return bool true when this call expired the booking
      */
-    public function expireIfTerminalUnpaid(string $bookingGuid): bool
+    public function expireIfTerminalUnpaid(string $bookingGuid, bool $allowReset = true): bool
     {
         $quota = DB::table('bookings')->where('guid', $bookingGuid)->value('destination_quota_guid');
         if ($quota === null) {
             return false;
         }
 
-        return DB::transaction(function () use ($bookingGuid, $quota): bool {
+        return DB::transaction(function () use ($bookingGuid, $quota, $allowReset): bool {
             $booking = $this->lockedBooking($bookingGuid, $quota);
             if (! in_array($booking->status, ['awaiting_payment', 'payment_verification', 'payment_review'], true)
                 || $booking->payment_expires_at === null || now()->lt($booking->payment_expires_at)) {
@@ -173,6 +173,12 @@ class PaymentSettlementService
                 if ($statuses->contains(fn (string $status): bool => ! in_array($status, ['failed', 'expired'], true))) {
                     return false;
                 }
+                // "Did not pay" is not a payment anomaly: while the customer may still choose a method the cycle starts over.
+                if ($allowReset && $this->selectionStillOpen($booking)) {
+                    $this->resetCycle($booking, $intent);
+
+                    return true;
+                }
                 PaymentStates::assertIntentTransition($intent->status, 'expired');
                 DB::table('payment_intents')->where('guid', $intent->guid)->update(['status' => 'expired', 'updated_at' => now()]);
             }
@@ -185,11 +191,37 @@ class PaymentSettlementService
         }, 3);
     }
 
+    private function selectionStillOpen(object $booking): bool
+    {
+        return $booking->payment_selection_expires_at !== null && now()->lt($booking->payment_selection_expires_at)
+            && now()->lt(BookingRules::visitStart($booking->visit_date, $booking->destination_timezone));
+    }
+
+    /**
+     * Ends an unpaid payment cycle without a review: the booking returns to awaiting_payment with no countdown and the customer picks
+     * a method again for a fresh 15 minutes, until the selection deadline. The intent stays and returns to requires_payment; the old
+     * deadline stays on it, so late evidence of the old cycle no longer matches the snapshot and goes to review (a real anomaly).
+     * The caller holds the quota, booking and intent locks and has proven every attempt terminal unpaid.
+     */
+    private function resetCycle(object $booking, object $intent): void
+    {
+        if ($intent->status === 'processing') {
+            PaymentStates::assertIntentTransition('processing', 'requires_payment');
+            DB::table('payment_intents')->where('guid', $intent->guid)->update(['status' => 'requires_payment', 'updated_at' => now()]);
+        }
+        DB::table('bookings')->where('guid', $booking->guid)->update(['status' => 'awaiting_payment', 'payment_started_at' => null,
+            'payment_expires_at' => null, 'notification_grace_expires_at' => null, 'updated_at' => now()]);
+        DB::table('booking_status_histories')->insert(['guid' => (string) Str::uuid(), 'booking_guid' => $booking->guid, 'actor_guid' => null,
+            'old_status' => $booking->status, 'new_status' => 'awaiting_payment', 'reason' => 'payment_cycle_reset', 'created_at' => now()]);
+        $this->notifications->record($booking->guid, $booking->user_guid, 'payment_cycle_expired',
+            ['deadline' => (string) $booking->payment_selection_expires_at, 'timezone' => $booking->destination_timezone, 'suffix' => ':'.(int) $booking->payment_cycle]);
+    }
+
     /** A verified terminal outcome may be the last thing keeping a held booking open; closing is best effort and re-run by the scheduler. */
-    public function closeAfterOutcome(string $bookingGuid): void
+    public function closeAfterOutcome(string $bookingGuid, bool $allowReset = true): void
     {
         try {
-            $this->expireIfTerminalUnpaid($bookingGuid);
+            $this->expireIfTerminalUnpaid($bookingGuid, $allowReset);
         } catch (Throwable $exception) {
             Log::warning('Terminal-unpaid expiry could not be evaluated.', ['booking_guid' => $bookingGuid, 'exception_class' => $exception::class]);
         }

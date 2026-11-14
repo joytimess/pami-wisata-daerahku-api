@@ -77,10 +77,10 @@ it('never lets the internal grace extend can_pay, can_create, Charge or retry', 
     }
 
     Http::assertNotSent(fn (ClientRequest $request) => str_ends_with($request->url(), '/v2/charge'));
-    expect(DB::table('payment_attempts')->count())->toBe(1)->and(DB::table('bookings')->where('guid', $booking->guid)->value('status'))->toBe('payment_review');
+    expect(DB::table('payment_attempts')->count())->toBe(1)->and(DB::table('bookings')->where('guid', $booking->guid)->value('status'))->toBe('awaiting_payment');
 });
 
-it('moves a Midtrans booking to review only after the grace, never earlier and never by the customer deadline alone', function () {
+it('never moves a Midtrans booking to verification or review on a clock, only a proven outcome ends its cycle', function () {
     mtxConfig();
     [, $booking] = mtxPayable();
     mtxAttempt($booking, 'unknown', 'virtual_account', 'bca', ['provider_reference' => null]);
@@ -91,13 +91,14 @@ it('moves a Midtrans booking to review only after the grace, never earlier and n
     expect(DB::table('bookings')->where('guid', $booking->guid)->value('status'))->toBe('awaiting_payment');
     $this->travelTo($deadline);
     app(BookingService::class)->expireDue();
-    expect(DB::table('bookings')->where('guid', $booking->guid)->value('status'))->toBe('payment_verification');
+    expect(DB::table('bookings')->where('guid', $booking->guid)->value('status'))->toBe('awaiting_payment');
     $this->travelTo($grace->subSecond());
     app(BookingService::class)->expireDue();
-    expect(DB::table('bookings')->where('guid', $booking->guid)->value('status'))->toBe('payment_verification');
-    $this->travelTo($grace);
+    expect(DB::table('bookings')->where('guid', $booking->guid)->value('status'))->toBe('awaiting_payment');
+    $this->travelTo($grace->addMinutes(5));
     app(BookingService::class)->expireDue();
-    expect(DB::table('bookings')->where('guid', $booking->guid)->value('status'))->toBe('payment_review');
+    expect(DB::table('bookings')->where('guid', $booking->guid)->value('status'))->toBe('awaiting_payment')
+        ->and(DB::table('notifications')->where('booking_guid', $booking->guid)->where('type', 'booking.payment_review')->count())->toBe(0);
 });
 
 /** A QRIS booking paid and on its visit day with entry QR units issued: the starting point of the ticket state contract. */

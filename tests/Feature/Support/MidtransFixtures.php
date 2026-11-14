@@ -23,7 +23,7 @@ if (! function_exists('mtxConfig')) {
     function mtxConfig(array $override = []): void
     {
         config(['operations.demo_payments_enabled' => false, 'midtrans' => array_replace_recursive([
-            'enabled' => true, 'environment' => 'sandbox', 'server_key' => 'SB-Mid-server-FIXTURE0000000000', 'merchant_id' => 'G000000001',
+            'enabled' => true, 'environment' => 'sandbox', 'server_key' => 'SB-Mid-server-FIXTURE0000000000', 'signature_secret_key' => 'SB-Mid-server-FIXTURE0000000000', 'merchant_id' => 'G000000001',
             'channels' => ['va_bca', 'va_bni', 'qris'], 'verified_channels' => [], 'production_approved' => false,
             'base_urls' => ['sandbox' => 'https://api.sandbox.midtrans.com', 'production' => 'https://api.midtrans.com'],
             'http_timeout_seconds' => 10, 'minimum_expiry_seconds' => 30, 'qris_acquirer' => 'gopay',
@@ -33,12 +33,15 @@ if (! function_exists('mtxConfig')) {
 
 if (! function_exists('mtxPayable')) {
     /** @return array{0: object, 1: object} owner and an approved (awaiting_payment) Rp20.000 booking */
-    function mtxPayable(int $quantity = 2): array
+    function mtxPayable(int $quantity = 2, bool $startCountdown = true): array
     {
         [$destination, $date] = seedDestination(capacity: 10, price: 10000, days: 5);
         $owner = makeUser();
         $booking = app(BookingService::class)->create($owner, bookingPayload($destination, $date, $quantity) + ['idempotency_key' => (string) Str::uuid()]);
         $booking = app(BookingService::class)->decide(makeUser(2), $booking->guid, true);
+        if ($startCountdown) {
+            startPaymentCountdown($booking->guid);
+        }
 
         return [$owner, app(TicketService::class)->booking($booking->guid)];
     }

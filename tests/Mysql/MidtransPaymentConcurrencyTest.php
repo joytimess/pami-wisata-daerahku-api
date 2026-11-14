@@ -259,7 +259,7 @@ it('never expires a booking whose pending attempt settles while the expiry pass 
     });
 });
 
-it('expires a booking exactly once when the provider proves the only attempt unpaid while the expiry pass races on MySQL', function () {
+it('resets the payment cycle exactly once when the provider proves the only attempt unpaid while the expiry pass races on MySQL', function () {
     withMtxMysql(function (array $connection, string $database): void {
         [, $booking, $attempt] = mtxMysqlSeed('pending', ['next_reconcile_at' => now()->subMinute(), 'instruction_expires_at' => now()->subMinute()]);
         mtxMysqlPastDeadline($booking);
@@ -272,9 +272,66 @@ it('expires a booking exactly once when the provider proves the only attempt unp
         // A pass after the proof exists: an expiry pass that ran before the lookup only held the booking for verification.
         app(BookingService::class)->expireDue();
         expect(DB::table('payment_attempts')->where('guid', $attempt->guid)->value('status'))->toBe('expired');
-        expect(DB::table('bookings')->where('guid', $booking->guid)->value('status'))->toBe('expired');
-        expect(DB::table('booking_status_histories')->where('booking_guid', $booking->guid)->where('new_status', 'expired')->count())->toBe(1);
-        expect(DB::table('payment_intents')->where('guid', $attempt->payment_intent_guid)->value('status'))->toBe('expired');
+        // Unpaid is not an anomaly: the cycle is reset exactly once and the booking keeps its quota for a new method choice.
+        expect(DB::table('bookings')->where('guid', $booking->guid)->value('status'))->toBe('awaiting_payment');
+        expect(DB::table('booking_status_histories')->where('booking_guid', $booking->guid)->where('reason', 'payment_cycle_reset')->count())->toBe(1);
+        expect(DB::table('booking_status_histories')->where('booking_guid', $booking->guid)->where('new_status', 'expired')->count())->toBe(0);
+        expect(DB::table('payment_intents')->where('guid', $attempt->payment_intent_guid)->value('status'))->toBe('requires_payment');
+    });
+});
+
+it('starts the payment cycle exactly once when different keys race to choose the first method on MySQL', function () {
+    withMtxMysql(function (array $connection, string $database): void {
+        [$owner, $booking] = mtxPayable(startCountdown: false);
+        $base = ['action' => 'initiate', 'booking_guid' => $booking->guid, 'user_guid' => $owner->guid];
+        $jobs = [$base + ['key' => 'cycle-a'], $base + ['key' => 'cycle-b'], $base + ['key' => 'cycle-c'], $base + ['key' => 'cycle-d']];
+
+        $run = runMtxWorkers($jobs, $connection, $database);
+
+        $row = DB::table('bookings')->where('guid', $booking->guid)->first();
+        expect((int) $row->payment_cycle)->toBe(1)->and($row->payment_started_at)->not->toBeNull()
+            ->and(DB::table('payment_attempts')->count())->toBe(1)->and($run['provider_calls'])->toBe(1)
+            ->and(DB::table('payment_intents')->value('expires_at'))->toBe($row->payment_expires_at)
+            ->and(DB::table('payment_attempts')->value('instruction_expires_at'))->toBe($row->payment_expires_at);
+    });
+});
+
+it('cancels a booking exactly once when the owner cancels in parallel with other cancels and a new method choice on MySQL', function () {
+    withMtxMysql(function (array $connection, string $database): void {
+        [$owner, $booking, $attempt] = mtxMysqlSeed('pending');
+        $base = ['booking_guid' => $booking->guid, 'user_guid' => $owner->guid, 'provider_state' => 'cancel'];
+        $jobs = [$base + ['action' => 'cancel_booking'], $base + ['action' => 'cancel_booking'], $base + ['action' => 'cancel_booking'],
+            $base + ['action' => 'initiate', 'key' => 'late-method', 'method' => 'qris', 'channel' => 'qris']];
+
+        $run = runMtxWorkers($jobs, $connection, $database);
+
+        expect(DB::table('bookings')->where('guid', $booking->guid)->value('status'))->toBe('cancelled')
+            ->and(DB::table('booking_status_histories')->where('booking_guid', $booking->guid)->where('new_status', 'cancelled')->count())->toBe(1)
+            ->and(DB::table('payment_intents')->where('guid', $attempt->payment_intent_guid)->value('status'))->toBe('cancelled')
+            ->and(DB::table('payment_attempts')->where('payment_intent_guid', $attempt->payment_intent_guid)->whereIn('status', ['initiating', 'pending', 'unknown', 'paid'])->count())->toBe(0)
+            ->and(DB::table('bookings')->whereIn('status', \App\Support\BookingRules::HELD)->count())->toBe(0)
+            ->and($run['calls_in_transaction'])->toBe(0);
+        foreach ($run['results'] as $result) {
+            if (! $result['ok']) {
+                expect($result['class'])->not->toContain('QueryException')->and($result['code'])->not->toBeNull();
+            }
+        }
+    });
+});
+
+it('lets a settlement win over a booking cancel that races it on MySQL', function () {
+    withMtxMysql(function (array $connection, string $database): void {
+        [$owner, $booking, $attempt] = mtxMysqlSeed('pending', ['next_reconcile_at' => now()->subMinute()]);
+        $base = ['booking_guid' => $booking->guid, 'attempt_guid' => $attempt->guid, 'user_guid' => $owner->guid, 'provider_state' => 'settlement'];
+        $jobs = [$base + ['action' => 'cancel_booking'], $base + ['action' => 'reconcile'], $base + ['action' => 'cancel_booking']];
+
+        $run = runMtxWorkers($jobs, $connection, $database);
+
+        expect(DB::table('bookings')->where('guid', $booking->guid)->value('status'))->toBe('confirmed')
+            ->and(DB::table('payment_intents')->where('guid', $attempt->payment_intent_guid)->value('status'))->toBe('paid')
+            ->and(DB::table('booking_status_histories')->where('booking_guid', $booking->guid)->where('new_status', 'cancelled')->count())->toBe(0)
+            ->and(DB::table('booking_status_histories')->where('booking_guid', $booking->guid)->where('new_status', 'confirmed')->count())->toBe(1)
+            ->and($run['calls_in_transaction'])->toBe(0);
     });
 });
 

@@ -43,6 +43,8 @@ Route::prefix('v1')->group(function () {
         Route::post('bookings/{booking}/payment-attempts', [PaymentController::class, 'initiate'])->middleware('throttle:30,1')->name('payments.initiate');
         Route::post('bookings/{booking}/payment-attempts/{attempt}/refresh', [PaymentController::class, 'refresh'])->whereUuid('attempt')
             ->middleware('throttle:20,1')->name('payments.refresh');
+        Route::post('bookings/{booking}/payment-attempts/{attempt}/cancel', [PaymentController::class, 'cancelAttempt'])->whereUuid('attempt')
+            ->middleware('throttle:10,1')->name('payments.cancel');
         Route::get('bookings/{booking}/payment-attempts/{attempt}/qr', [PaymentController::class, 'qrisImage'])->whereUuid('attempt')
             ->middleware('throttle:60,1')->name('payments.qr');
         Route::get('payments/methods', [PaymentController::class, 'methods'])->middleware('throttle:60,1');

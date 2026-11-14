@@ -20,8 +20,14 @@ final class BookingRules
 
     public const IDEMPOTENCY_DAYS = 7;
 
-    /** The one absolute payment deadline of a Midtrans approval, counted from the authoritative approval time; no retry or refresh extends it. */
+    /**
+     * The one absolute payment deadline of a Midtrans payment cycle. It is counted from the moment the customer picks the first
+     * method (not from approval); switching method or retrying inside the cycle never extends it.
+     */
     public const PAYMENT_WINDOW_SECONDS = 15 * 60;
+
+    /** After approval the customer has this long to pick a method; the booking then expires and its quota is released. */
+    public const PAYMENT_SELECTION_WINDOW_SECONDS = 24 * 3600;
 
     /** The approval window that DOKU and DEMO always had; kept unchanged for them because the 15 minute rule is Midtrans policy. */
     public const LEGACY_PAYMENT_WINDOW_SECONDS = 60 * 60;
@@ -35,6 +41,24 @@ final class BookingRules
     public static function paymentWindowSeconds(string $activeProvider): int
     {
         return $activeProvider === 'midtrans' ? self::PAYMENT_WINDOW_SECONDS : self::LEGACY_PAYMENT_WINDOW_SECONDS;
+    }
+
+    /** Absolute payment deadline for a cycle that starts at $startedAt; it never passes the visit start. */
+    public static function paymentDeadlineFrom(CarbonInterface $startedAt, CarbonImmutable $visitStart, string $activeProvider): CarbonImmutable
+    {
+        return CarbonImmutable::instance($startedAt)->utc()->addSeconds(self::paymentWindowSeconds($activeProvider))->min($visitStart);
+    }
+
+    /** Last moment a payment method can be chosen after approval. */
+    public static function paymentSelectionDeadline(CarbonInterface $approvedAt, CarbonImmutable $visitStart): CarbonImmutable
+    {
+        return CarbonImmutable::instance($approvedAt)->utc()->addSeconds(self::PAYMENT_SELECTION_WINDOW_SECONDS)->min($visitStart);
+    }
+
+    /** Booking snapshot is the only timezone source for an existing booking; the live destination value only backfills old rows. */
+    public static function bookingTimezone(object $booking): string
+    {
+        return $booking->destination_timezone_snapshot ?? $booking->destination_timezone;
     }
 
     public static function visitStart(string $visitDate, string $timezone): CarbonImmutable
