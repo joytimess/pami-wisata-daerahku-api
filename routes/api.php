@@ -346,6 +346,8 @@ Route::prefix('v1')->group(function () {
     Route::prefix('superadmin')
         ->middleware(AuthenticateApiToken::class)
         ->group(function () {
+            Route::get('bookings/timezone-drift', \App\Http\Controllers\Api\V1\TimezoneDriftController::class)
+                ->middleware('throttle:30,1')->name('superadmin.bookings.timezone-drift');
             Route::prefix('facilities')->controller(FacilityController::class)->group(function () {
                 Route::get('/', 'index')->name('superadmin.facilities.index');
                 Route::post('/', 'store')->name('superadmin.facilities.store');

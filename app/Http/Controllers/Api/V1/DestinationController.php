@@ -8,6 +8,7 @@ use App\Http\Requests\DestinationGalleryRequest;
 use App\Http\Resources\DestinationResource;
 use App\Models\Destination;
 use App\Models\DestinationImage;
+use App\Services\BookingTimezoneService;
 use App\Services\CatalogService;
 use App\Services\DestinationGalleryService;
 use Illuminate\Support\Facades\Storage;
@@ -34,11 +35,18 @@ class DestinationController extends Controller
 
     public function update(DestinationGalleryRequest $request, Destination $destination)
     {
+        $previousTimezone = $destination->timezone;
         if ($request->has('gallery_manifest') || $request->hasFile('image') || $request->hasFile('images')) {
-            return response()->json(['data' => $this->gallery->save($request->validated(), $request->user(), $destination)]);
-        }
+            $data = $this->gallery->save($request->validated(), $request->user(), $destination);
+            $impact = app(BookingTimezoneService::class)->impactOfChange($destination->guid, $previousTimezone);
 
-        return new DestinationResource($this->service->adminSave($request->user(), $destination, $request->validated()));
+            return response()->json(['data' => $impact ? ((array) $data) + ['timezone_impact' => $impact] : $data]);
+        }
+        $saved = $this->service->adminSave($request->user(), $destination, $request->validated());
+        // A zone change only affects NEW bookings; the response says how many active bookings keep the old zone.
+        $saved->timezone_impact = app(BookingTimezoneService::class)->impactOfChange($destination->guid, $previousTimezone);
+
+        return new DestinationResource($saved);
     }
 
     public function destroy(CatalogRequest $request, Destination $destination)

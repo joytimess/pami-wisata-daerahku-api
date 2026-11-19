@@ -36,6 +36,8 @@ class DestinationResource extends JsonResource
             'facilities' => FacilityResource::collection($this->whenLoaded('activeFacilities')),
             'rating_average' => $this->rating_average === null ? null : (float) $this->rating_average,
             'rating_count' => (int) $this->rating_count,
+            // Only present on the response of a save that changed the timezone.
+            'timezone_impact' => $this->when(($this->resource->timezone_impact ?? null) !== null, fn () => $this->resource->timezone_impact),
         ];
     }
 }
