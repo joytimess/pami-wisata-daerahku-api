@@ -1,7 +1,9 @@
 <?php
 
-test('the application returns a successful response', function () {
+test('the public homepage directs visitors to Wisata Daerahku', function () {
     $response = $this->get('/');
 
-    $response->assertStatus(200);
+    $response->assertOk()
+        ->assertSeeText('Buka aplikasi Wisata Daerahku')
+        ->assertDontSeeText('Laracasts');
 });
