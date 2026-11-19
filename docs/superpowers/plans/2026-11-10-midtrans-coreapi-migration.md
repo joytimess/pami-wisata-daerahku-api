@@ -20,7 +20,7 @@ Dokumen ini menyimpan hasil audit dan implementation plan yang telah disampaikan
 - Core API standar /v2/charge; bukan Snap Checkout, WebView, atau BI-SNAP.
 - Kanal rilis pertama hanya BCA VA, BNI VA, dan QRIS.
 - Admin approve dahulu → awaiting_payment → verified settlement → confirmed.
-- Satu deadline absolut 15 menit sejak approval; retry tidak memperpanjang deadline.
+- Satu deadline absolut 15 menit sejak pemilihan metode pertama (bukan sejak approval; revisi 2026-11-14); retry dan ganti metode tidak memperpanjang deadline.
 - Satu intent per booking; attempt hanya sekuensial; tidak ada dual active/payable attempts.
 - Pending/unknown menahan kuota sampai bukti terminal atau settlement yang sah.
 - Full refund only; VA manual, QRIS API hanya jika capability aktif.

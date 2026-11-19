@@ -119,8 +119,8 @@ Satu booking adalah rombongan milik satu user. quantity wajib integer positif; a
 
 - Buat booking: validasi destinasi/kategori aktif, tanggal dan jendela booking, harga dan sisa kapasitas; tahan quantity; status pending_approval.
 - Admin menyetujui/menolak maksimal 24 jam sejak booking dibuat. Setelah deadline, approval ditolak meskipun scheduler belum berjalan.
-- Approved berbayar menjadi awaiting_payment: deadline pembayaran 1 jam sejak approval. Gratis langsung confirmed.
-- Setelah 1 jam, checkout baru ditutup dan status masuk payment_verification; hold tetap ada selama grace 15 menit. Grace bukan tambahan waktu bayar.
+- Approved berbayar menjadi awaiting_payment tanpa countdown. Customer punya 24 jam sejak approval (maksimal sampai awal hari kunjungan) untuk memilih metode; lewat itu booking expired dan kuota dilepas. Countdown pembayaran 15 menit (Midtrans) baru dimulai saat metode pertama dipilih. Gratis langsung confirmed. (Revisi 2026-11-14, lihat docs/audits/2026-11-14-payment-countdown-starts-at-approval.md)
+- Setelah deadline countdown, checkout baru ditutup dan status masuk payment_verification; hold tetap ada selama grace 15 menit. Grace bukan tambahan waktu bayar.
 - Pembayaran valid tepat waktu: hold berubah menjadi confirmed, tanpa mengurangi kapasitas dua kali.
 - Rejected atau expired yang aman dipastikan: hold dilepas sekali.
 - Payment yang belum pasti: payment_review, tetap menahan kuota menurut kesepakatan sementara; beri alert admin. Batas maksimum penanganan kasus ini masih belum diputuskan dan menjadi release gate.

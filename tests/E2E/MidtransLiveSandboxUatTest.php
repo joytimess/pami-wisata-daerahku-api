@@ -217,3 +217,69 @@ it('treats signed notifications only as triggers checked against live Status', f
     expect($snapshot('bca'))->toBe($bca)->and($bad->status())->toBe(401)
         ->and($snapshot('qris')[0])->not->toBe('paid')->and($snapshot('qris')[1])->not->toBe('confirmed');
 });
+
+it('starts the countdown at method choice, cancels the unpaid VA on the live Sandbox and lets the customer choose again', function () {
+    if (env('MIDTRANS_UAT_STEP') !== 'cycle') {
+        $this->markTestSkipped('cycle step not selected');
+    }
+    [$destination, $date] = seedDestination(capacity: 5, price: 10000, days: 5, destination: ['name' => 'UAT cycle '.Str::random(4)]);
+    $owner = makeUser();
+    $headers = bearer($owner);
+    $booking = app(BookingService::class)->create($owner, bookingPayload($destination, $date, 1) + ['idempotency_key' => (string) Str::uuid()]);
+    app(BookingService::class)->decide(makeUser(2), $booking->guid, true);
+    $row = fn () => DB::table('bookings')->where('guid', $booking->guid)->first();
+    $atApproval = [$row()->status, $row()->payment_started_at, $row()->payment_expires_at, $row()->payment_selection_expires_at !== null];
+
+    $first = $this->postJson('/api/v1/bookings/'.$booking->guid.'/payment-attempts', ['method_code' => 'virtual_account', 'channel' => 'bca'], $headers + ['Idempotency-Key' => 'uat-cycle-1']);
+    $first->assertSuccessful();
+    $attempt = DB::table('payment_attempts')->where('guid', $first->json('data.attempt_guid'))->first();
+    $started = $row();
+    $deadlineMinutes = round((strtotime($started->payment_expires_at) - strtotime($started->payment_started_at)) / 60, 1);
+
+    $cancel = $this->postJson('/api/v1/bookings/'.$booking->guid.'/payment-attempts/'.$attempt->guid.'/cancel', [], $headers);
+    $afterCancel = DB::table('payment_attempts')->where('guid', $attempt->guid)->first();
+    $events = DB::table('payment_events')->where('payment_attempt_guid', $attempt->guid)->get(['event_type', 'disposition', 'verification'])->toJson();
+
+    $second = $this->postJson('/api/v1/bookings/'.$booking->guid.'/payment-attempts', ['method_code' => 'virtual_account', 'channel' => 'bni'], $headers + ['Idempotency-Key' => 'uat-cycle-2']);
+    $secondAttempt = DB::table('payment_attempts')->where('guid', $second->json('data.attempt_guid'))->first();
+
+    uatLine(sprintf('cycle at_approval=%s deadline_min=%s cancel=%d first_attempt=%s second=%d second_order_differs=%s same_deadline=%s booking=%s intent=%s events=%s',
+        json_encode($atApproval), $deadlineMinutes, $cancel->status(), $afterCancel->status, $second->status(),
+        var_export($secondAttempt && $secondAttempt->merchant_reference !== $attempt->merchant_reference, true),
+        var_export($row()->payment_expires_at === $started->payment_expires_at, true), $row()->status,
+        DB::table('payment_intents')->where('booking_guid', $booking->guid)->value('status'), $events));
+    file_put_contents((string) env('MIDTRANS_UAT_STATE'), json_encode(['cycle' => ['owner' => $owner->guid, 'booking' => $booking->guid,
+        'first' => $attempt->guid, 'second' => $secondAttempt?->guid, 'pay' => $second->json('data.instruction.va_number')]], JSON_PRETTY_PRINT));
+
+    expect($atApproval[0])->toBe('awaiting_payment')->and($atApproval[1])->toBeNull()->and($atApproval[2])->toBeNull()
+        ->and($deadlineMinutes)->toBe(15.0)->and($cancel->status())->toBeLessThan(300)
+        ->and($row()->payment_expires_at)->toBe($started->payment_expires_at)->and($row()->status)->toBe('awaiting_payment');
+});
+
+it('resets the unpaid cycle only after live Status proves the order closed, and keeps the quota held', function () {
+    if (env('MIDTRANS_UAT_STEP') !== 'reset') {
+        $this->markTestSkipped('reset step not selected');
+    }
+    $row = uatState()['cycle'];
+    $deadline = DB::table('bookings')->where('guid', $row['booking'])->value('payment_expires_at');
+    expect(now()->gte($deadline))->toBeTrue();
+    $held = fn () => (int) DB::table('bookings')->whereIn('status', \App\Support\BookingRules::HELD)->sum('quantity');
+    $before = [DB::table('payment_attempts')->where('guid', $row['second'])->value('status'), DB::table('bookings')->where('guid', $row['booking'])->value('status'), $held()];
+
+    app(BookingService::class)->expireDue(); // an open, unproven attempt must keep the booking in place
+    $afterFirstPass = DB::table('bookings')->where('guid', $row['booking'])->value('status');
+    app(MidtransPaymentService::class)->reconcile($row['second']);
+    app(BookingService::class)->expireDue();
+    app(BookingService::class)->expireDue(); // idempotent
+
+    $booking = DB::table('bookings')->where('guid', $row['booking'])->first();
+    $attempt = DB::table('payment_attempts')->where('guid', $row['second'])->first();
+    $intent = DB::table('payment_intents')->where('booking_guid', $row['booking'])->first();
+    uatLine(sprintf('reset deadline=%s before=%s after_first_pass=%s attempt=%s intent=%s booking=%s started=%s expires=%s held_before=%d held_after=%d histories=%s notifications=%s events=%s',
+        $deadline, json_encode($before), $afterFirstPass, $attempt->status, $intent->status, $booking->status, json_encode($booking->payment_started_at),
+        json_encode($booking->payment_expires_at), $before[2], $held(),
+        DB::table('booking_status_histories')->where('booking_guid', $row['booking'])->pluck('reason', 'new_status')->toJson(),
+        DB::table('notifications')->where('booking_guid', $row['booking'])->pluck('type')->toJson(),
+        DB::table('payment_events')->where('payment_attempt_guid', $row['second'])->get(['verification', 'event_type', 'disposition'])->toJson()));
+    expect($attempt->status)->not->toBe('paid')->and($booking->status)->toBeIn(['awaiting_payment', 'expired']);
+});
