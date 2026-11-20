@@ -75,11 +75,23 @@ it('requires reauthentication to close an account and revokes sessions without d
     $user = User::factory()->create();
     $auth = app(AuthService::class);
     $token = $auth->login(['email' => $user->email, 'password' => 'password']);
-    $accounts = app(AccountService::class);
-    expect(fn () => $accounts->close($user, ['password' => 'wrong']))->toThrow(AuthenticationException::class);
-    $accounts->close($user, ['password' => 'password']);
+    $headers = ['Authorization' => 'Bearer '.$token['access_token']];
+    $this->getJson('/api/v1/auth/me', $headers)->assertOk()->assertJsonPath('data.has_local_password', true);
+    $this->postJson('/api/v1/profile/close', ['password' => 'wrong'], $headers)
+        ->assertUnauthorized()->assertJsonPath('code', 'reauthentication_failed');
+    $this->getJson('/api/v1/auth/me', $headers)->assertOk();
+    $this->postJson('/api/v1/profile/close', ['password' => 'password'], $headers)->assertOk();
     expect($user->fresh()->status)->toBe('closed');
-    expect(fn () => $auth->authenticate($token['access_token']))->toThrow(AuthenticationException::class);
+    $this->getJson('/api/v1/auth/me', $headers)->assertUnauthorized();
+    $this->postJson('/api/v1/auth/refresh', ['refresh_token' => $token['refresh_token']])->assertUnauthorized();
+});
+
+it('returns a stable rejection for the last active superadmin', function () {
+    $user = User::factory()->create(['role' => 2]);
+    $this->postJson('/api/v1/profile/close', ['password' => 'password'], bearer($user))
+        ->assertUnprocessable()->assertJsonPath('code', 'last_active_superadmin')
+        ->assertJsonValidationErrors('account');
+    expect($user->fresh()->status)->toBe('active');
 });
 
 function fakeGoogle(array $claims): void
@@ -109,6 +121,31 @@ function linkGoogle(User $user, string $sub): void
 {
     DB::table('external_identities')->insert(['guid' => (string) Str::uuid(), 'user_guid' => $user->guid, 'provider' => 'google', 'provider_subject' => $sub, 'created_at' => now(), 'updated_at' => now()]);
 }
+
+it('requires a recent Google proof for the subject linked to the same account', function () {
+    fakeGoogle(googleClaims('close-google@example.org', 'close-subject'));
+    $result = $this->postJson('/api/v1/auth/google', ['id_token' => 'valid'])->assertOk();
+    $headers = ['Authorization' => 'Bearer '.$result->json('data.access_token')];
+    $user = User::where('email', 'close-google@example.org')->firstOrFail();
+    $this->getJson('/api/v1/auth/me', $headers)->assertOk()->assertJsonPath('data.has_local_password', false);
+    app()->bind(AccountService::class, fn () => new class extends AccountService
+    {
+        protected function verifyGoogleToken(string $project, string $idToken): array
+        {
+            return googleClaims('close-google@example.org', $idToken === 'other' ? 'other-subject' : 'close-subject')
+                + ['auth_time' => $idToken === 'old' ? time() - 301 : time()];
+        }
+    });
+    $this->postJson('/api/v1/profile/close', ['password' => 'x', 'id_token' => 'valid'], $headers)->assertUnprocessable();
+    foreach (['old', 'other'] as $token) {
+        $this->postJson('/api/v1/profile/close', ['id_token' => $token], $headers)
+            ->assertUnauthorized()->assertJsonPath('code', 'reauthentication_failed');
+    }
+    expect($user->fresh()->status)->toBe('active');
+    $this->postJson('/api/v1/profile/close', ['id_token' => 'fresh'], $headers)->assertOk();
+    expect($user->fresh()->status)->toBe('closed');
+    $this->getJson('/api/v1/auth/me', $headers)->assertUnauthorized();
+});
 
 it('allows Google login for an active role 0 user', function () {
     $user = User::factory()->create(['role' => 0]);

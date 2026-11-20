@@ -14,6 +14,7 @@ class UserResource extends JsonResource
             'avatar_url' => $this->avatar_source === 'default' ? null : 'profile/avatar?v='.$this->avatar_version,
             'avatar_version' => $this->avatar_version,
             'google_avatar_available' => $this->google_avatar_snapshot_path !== null,
+            'has_local_password' => $this->password !== null && $this->password !== '',
         ];
     }
 }

@@ -13,6 +13,9 @@ class CloseAccountRequest extends FormRequest
 
     public function rules(): array
     {
-        return ['password' => ['nullable', 'string', 'required_without:id_token', 'prohibited_with:id_token'], 'id_token' => ['nullable', 'string', 'max:8192', 'required_without:password', 'prohibited_with:password']];
+        return [
+            'password' => ['nullable', 'string', 'required_without:id_token', 'prohibits:id_token'],
+            'id_token' => ['nullable', 'string', 'max:8192', 'required_without:password'],
+        ];
     }
 }

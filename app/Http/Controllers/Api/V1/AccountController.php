@@ -15,6 +15,8 @@ use App\Http\Resources\UserResource;
 use App\Services\AccountService;
 use App\Services\EmailVerificationOtpService;
 use App\Services\PasswordResetOtpService;
+use Illuminate\Auth\AuthenticationException;
+use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Http\Resources\Json\JsonResource;
 
@@ -27,9 +29,13 @@ class AccountController extends Controller
         return new UserResource($this->accounts->update($request->user(), $request->validated()));
     }
 
-    public function close(CloseAccountRequest $request): MessageResource
+    public function close(CloseAccountRequest $request): MessageResource|JsonResponse
     {
-        $this->accounts->close($request->user(), $request->validated());
+        try {
+            $this->accounts->close($request->user(), $request->validated());
+        } catch (AuthenticationException) {
+            return response()->json(['message' => 'Reauthentication failed.', 'code' => 'reauthentication_failed'], 401);
+        }
 
         return new MessageResource('Account closed.');
     }
