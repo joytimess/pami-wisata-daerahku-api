@@ -61,7 +61,8 @@ return Application::configure(basePath: dirname(__DIR__))
                 401 => 'unauthenticated', 403 => 'forbidden', 404 => 'not_found', 422 => 'validation_failed', 429 => 'rate_limited', default => 'service_unavailable'
             };
 
-            return response()->json(['message' => $status >= 500 ? 'Service unavailable.' : 'Request not allowed or resource unavailable.', 'code' => $code], $status)->header('Cache-Control', 'private, no-store');
+            return response()->json(['message' => $status >= 500 ? 'Service unavailable.' : 'Request not allowed or resource unavailable.', 'code' => $code], $status, $exception instanceof HttpExceptionInterface ? $exception->getHeaders() : [])
+                ->header('Cache-Control', 'private, no-store');
         });
         $exceptions->shouldRenderJsonWhen(fn (Request $request) => $request->is('api/*') || $request->expectsJson());
         $exceptions->render(fn (BookingException $exception, Request $request) => $request->is('api/*') ? response()->json(['message' => $exception->getMessage(), 'code' => $exception->errorCode] + ($exception->context ? ['context' => $exception->context] : []), 409)->header('Cache-Control', 'private, no-store') : null);

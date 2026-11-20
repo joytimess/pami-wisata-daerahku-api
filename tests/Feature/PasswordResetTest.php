@@ -56,6 +56,19 @@ it('acknowledges known and unknown addresses identically and issues protected si
     Queue::assertPushed(SendPasswordResetOtp::class, 3);
 });
 
+it('keeps reset requests generic and refuses to issue a local password for Google-only or closed users', function () {
+    Queue::fake([SendPasswordResetOtp::class]);
+    $unknown = $this->postJson('/api/v1/auth/forgot-password', ['email' => 'unknown@example.org'])->assertOk()->json();
+    foreach ([['password' => null], ['status' => 'closed']] as $attributes) {
+        $user = User::factory()->create($attributes);
+        $this->postJson('/api/v1/auth/forgot-password', ['email' => $user->email])
+            ->assertOk()->assertExactJson($unknown);
+        $this->postJson('/api/v1/auth/password-reset/verify-otp', ['email' => $user->email, 'otp' => '123456'])
+            ->assertUnprocessable()->assertJsonPath('code', 'invalid_reset_otp');
+    }
+    Queue::assertNothingPushed();
+});
+
 it('rejects malformed, wrong, expired, consumed and exhausted OTPs', function () {
     [$user, $job] = resetChallenge();
     $route = '/api/v1/auth/password-reset/verify-otp';

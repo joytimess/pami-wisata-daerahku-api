@@ -21,7 +21,7 @@ class ThrottlePasswordReset
         if (random_int(1, 100) === 1) {
             DB::table('password_reset_rate_limits')->where('expires_at', '<', $timestamp - 60)->delete();
         }
-        $allowed = DB::transaction(function () use ($limits) {
+        $retryAfter = DB::transaction(function () use ($limits, $timestamp): ?int {
             foreach ($limits as $limit) {
                 DB::table('password_reset_rate_limits')->upsert(
                     ['key' => $limit['key'], 'window' => $limit['window'], 'attempts' => 0, 'expires_at' => ($limit['window'] + 1) * $limit['duration']],
@@ -30,7 +30,7 @@ class ThrottlePasswordReset
                 );
                 $row = DB::table('password_reset_rate_limits')->where('key', $limit['key'])->lockForUpdate()->first();
                 if ((int) $row->window === $limit['window'] && $row->attempts >= $limit['max']) {
-                    return false;
+                    return (int) $row->expires_at - $timestamp;
                 }
                 DB::table('password_reset_rate_limits')->where('key', $limit['key'])->update([
                     'window' => $limit['window'],
@@ -39,10 +39,10 @@ class ThrottlePasswordReset
                 ]);
             }
 
-            return true;
+            return null;
         }, 3);
-        if (! $allowed) {
-            throw new TooManyRequestsHttpException;
+        if ($retryAfter !== null) {
+            throw new TooManyRequestsHttpException($retryAfter);
         }
 
         return $next($request);
