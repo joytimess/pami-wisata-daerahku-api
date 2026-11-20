@@ -7,10 +7,14 @@ use Illuminate\Support\Str;
 
 uses(RefreshDatabase::class);
 
+beforeEach(function () {
+    config(['midtrans.environment' => 'sandbox', 'operations.demo_payments_enabled' => false]);
+});
+
 /** Payment outcomes are fixtures only in the isolated test database, never a provider simulation. */
-function financialFixture(string $environment = 'sandbox', string $bookingStatus = 'confirmed', int $quantity = 2): array
+function financialFixture(string $environment = 'sandbox', string $bookingStatus = 'confirmed', int $quantity = 2, ?array $selection = null): array
 {
-    [$destination, $date] = seedDestination(capacity: 50, price: 10000, days: 20);
+    [$destination, $date] = $selection ?? seedDestination(capacity: 50, price: 10000, days: 20);
     $booking = app(BookingService::class)->create(makeUser(), bookingPayload($destination, $date, $quantity) + ['idempotency_key' => (string) Str::uuid()]);
     app(BookingService::class)->decide(makeUser(2), $booking->guid, true);
     DB::table('bookings')->where('guid', $booking->guid)->update(['status' => $bookingStatus]);
@@ -58,6 +62,7 @@ it('returns 401 without a token and 403 for visitors', function () {
 
 it('keeps production amounts null without a verified source even when bookings or paid labels exist', function () {
     $this->travelTo('2026-11-05 12:00:00');
+    config(['midtrans.environment' => 'production']);
     [, , , $attempt] = financialFixture('production');
     DB::table('payment_events')->where('payment_attempt_guid', $attempt['guid'])->update(['verification' => 'unverified']);
 
@@ -70,12 +75,14 @@ it('keeps production amounts null without a verified source even when bookings o
 
 it('counts captures once despite duplicate events and shared destination assignments and separates environments', function () {
     $this->travelTo('2026-11-05 12:00:00');
-    [$destination, , , $attempt] = financialFixture();
+    $selection = seedDestination(capacity: 50, price: 10000, days: 20);
+    [$destination, , , $attempt] = financialFixture(selection: $selection);
     financialEvent($attempt, ['disposition' => 'duplicate_capture']);
     $admin = makeUser(1);
     assignTestDestination($admin, $destination);
     assignTestDestination(makeUser(1), $destination);
-    financialFixture('demo', quantity: 3);
+    financialFixture('demo', quantity: 3, selection: $selection);
+    financialFixture('production', quantity: 4, selection: $selection);
     $headers = bearer($admin);
 
     $response = $this->getJson('/api/v1/admin/dashboard/financial?environment=sandbox', $headers)->assertOk()
@@ -88,9 +95,24 @@ it('counts captures once despite duplicate events and shared destination assignm
         ->assertJsonPath('data.financial.method_mix_truncated', false)
         ->assertJsonPath('data.financial.method_mix.0.gross_collected', 20000);
     expect($response->getContent())->not->toContain($attempt['provider_request_id'], $attempt['provider_reference'], 'visitor@example.com');
-    $this->getJson('/api/v1/admin/dashboard/financial', $headers)->assertOk()->assertJsonPath('data.financial.availability', 'unavailable');
-    $this->getJson('/api/v1/admin/dashboard/financial?environment=demo', bearer(makeUser(2)))->assertOk()
+    $query = '/api/v1/admin/dashboard/financial?destination_guid='.$destination->guid;
+    $this->getJson($query.'&environment=demo', $headers)->assertOk()
+        ->assertJsonPath('data.financial.gross_collected', 20000)->assertJsonPath('data.financial.environment', 'sandbox');
+    config(['midtrans.environment' => 'production']);
+    $this->getJson($query.'&environment=sandbox', $headers)->assertOk()
+        ->assertJsonPath('data.financial.source', 'verified_production_events')
+        ->assertJsonPath('data.financial.gross_collected', 40000)->assertJsonPath('data.financial.test_only', false);
+    config(['operations.demo_payments_enabled' => true]);
+    $this->getJson($query, $headers)->assertOk()
+        ->assertJsonPath('data.financial.source', 'simulated_demo_events')
         ->assertJsonPath('data.financial.gross_collected', 30000)->assertJsonPath('data.financial.test_only', true);
+    app()->instance('env', 'production');
+    $this->getJson($query, $headers)->assertOk()
+        ->assertJsonPath('data.financial.environment', 'production')
+        ->assertJsonPath('data.financial.gross_collected', 40000);
+    config(['midtrans.environment' => 'unexpected']);
+    $this->getJson($query.'&environment=sandbox', $headers)->assertServiceUnavailable()
+        ->assertJsonMissingPath('data.financial');
 });
 
 it('scopes role 1 to current assignments and returns 404 for a foreign destination', function () {

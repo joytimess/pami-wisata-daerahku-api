@@ -12,7 +12,7 @@ class FinancialDashboardController extends Controller
 {
     public function __invoke(FinancialDashboardRequest $request, FinancialAnalyticsService $service): JsonResponse
     {
-        return (new OperationalResource(['financial' => $service->summary($request->user(), $request->validated())]))
+        return (new OperationalResource(['financial' => $service->summary($request->user(), $request->safe()->except('environment'))]))
             ->response()->header('Cache-Control', 'private, no-store');
     }
 }

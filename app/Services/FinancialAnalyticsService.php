@@ -9,7 +9,7 @@ use Illuminate\Support\Facades\DB;
 
 class FinancialAnalyticsService
 {
-    public function __construct(private AdminDestinationScopeService $scope) {}
+    public function __construct(private AdminDestinationScopeService $scope, private PaymentGateway $gateway) {}
 
     public function summary(User $actor, array $filters = []): array
     {
@@ -17,8 +17,9 @@ class FinancialAnalyticsService
         if (isset($filters['destination_guid'])) {
             $this->scope->authorize($actor, $filters['destination_guid']);
         }
-        $environment = $filters['environment'] ?? 'production';
-        abort_unless(in_array($environment, ['sandbox', 'demo', 'production'], true), 422);
+        $environment = $filters['environment'] ?? $this->gateway->activeEnvironment();
+        abort_unless(in_array($environment, ['sandbox', 'demo', 'production'], true)
+            && ($environment !== 'demo' || isset($filters['environment']) || $this->gateway->demoEnabled()), 503);
         $provider = $environment === 'demo' ? 'demo' : 'midtrans';
         $period = ['from' => $filters['from'] ?? now()->utc()->startOfMonth()->toDateString(),
             'to' => $filters['to'] ?? now()->utc()->toDateString(), 'date_basis' => 'paid_utc', 'timezone' => 'UTC'];
@@ -39,7 +40,7 @@ class FinancialAnalyticsService
             'attempt_conversion' => null, 'booking_conversion' => null, 'method_mix' => null,
             'method_mix_limit' => 100, 'method_mix_truncated' => null, 'avg_payment_seconds' => null,
             'missing_fields' => ['verified_capture_source', 'gateway_fees', 'refunds']];
-        if (! (clone $captures)->exists() && ! ($environment === 'demo' && app(PaymentGateway::class)->demoEnabled())) {
+        if ($providers->isEmpty()) {
             return $data;
         }
 
