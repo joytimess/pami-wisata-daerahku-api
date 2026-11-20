@@ -2,6 +2,7 @@
 
 namespace App\Services;
 
+use App\Exceptions\DomainValidationException;
 use App\Jobs\SendPasswordResetOtp;
 use App\Models\User;
 use Illuminate\Auth\Events\PasswordReset;
@@ -9,7 +10,6 @@ use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
-use Illuminate\Validation\ValidationException;
 
 class PasswordResetOtpService
 {
@@ -19,7 +19,7 @@ class PasswordResetOtpService
         $email = strtolower(trim($email));
         DB::transaction(function () use ($email) {
             $user = User::where('email', $email)->lockForUpdate()->first();
-            if (! $user) {
+            if (! $user || ! $user->password || $user->status !== 'active') {
                 return;
             }
             $previous = DB::table('password_reset_otps')->where('user_guid', $user->guid)->lockForUpdate()->first();
@@ -52,7 +52,7 @@ class PasswordResetOtpService
         $email = strtolower(trim($email));
         $ticket = DB::transaction(function () use ($email, $otp) {
             $user = User::where('email', $email)->lockForUpdate()->first();
-            if (! $user) {
+            if (! $user || ! $user->password || $user->status !== 'active') {
                 return null;
             }
             $row = DB::table('password_reset_otps')->where('user_guid', $user->guid)->lockForUpdate()->first();
@@ -72,7 +72,7 @@ class PasswordResetOtpService
             return $ticket;
         }, 3);
         if ($ticket === null) {
-            throw ValidationException::withMessages(['otp' => ['The verification code is invalid or expired.']]);
+            throw DomainValidationException::forField('otp', 'invalid_reset_otp', 'The verification code is invalid or expired.');
         }
 
         return ['reset_ticket' => $ticket, 'expires_in_seconds' => 300];
@@ -84,7 +84,7 @@ class PasswordResetOtpService
         $email = strtolower(trim($data['email']));
         $success = DB::transaction(function () use ($email, $data) {
             $user = User::where('email', $email)->lockForUpdate()->first();
-            if (! $user) {
+            if (! $user || ! $user->password || $user->status !== 'active') {
                 return false;
             }
             $row = DB::table('password_reset_otps')->where('user_guid', $user->guid)->lockForUpdate()->first();
@@ -100,7 +100,7 @@ class PasswordResetOtpService
             return true;
         }, 3);
         if (! $success) {
-            throw ValidationException::withMessages(['reset_ticket' => ['The reset ticket is invalid or expired.']]);
+            throw DomainValidationException::forField('reset_ticket', 'invalid_reset_ticket', 'The reset ticket is invalid or expired.');
         }
     }
 

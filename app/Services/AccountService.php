@@ -2,13 +2,13 @@
 
 namespace App\Services;
 
+use App\Exceptions\DomainValidationException;
 use App\Models\User;
 use Illuminate\Auth\Access\AuthorizationException;
 use Illuminate\Auth\AuthenticationException;
 use Illuminate\Auth\Events\Verified;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
-use Illuminate\Validation\ValidationException;
 use Kreait\Firebase\JWT\IdTokenVerifier;
 
 class AccountService
@@ -57,7 +57,7 @@ class AccountService
                 throw new \RuntimeException('FIREBASE_PROJECT_ID is not configured.');
             }
             try {
-                $claims = IdTokenVerifier::createWithProjectId($project)->verifyIdToken($data['id_token'])->payload();
+                $claims = $this->verifyGoogleToken($project, $data['id_token']);
                 if (($claims['firebase']['sign_in_provider'] ?? null) !== 'google.com' || ! is_int($claims['auth_time'] ?? null) || $claims['auth_time'] < time() - 300 || $claims['auth_time'] > time()) {
                     throw new \RuntimeException;
                 }
@@ -79,12 +79,19 @@ class AccountService
                 throw new AuthenticationException('Reauthentication failed.');
             }
             if ($user->role === 2 && $superadmins->count() <= 1) {
-                throw ValidationException::withMessages(['account' => 'The last active superadmin cannot close the account.']);
+                throw DomainValidationException::forField(
+                    'account', 'last_active_superadmin', 'The last active superadmin cannot close the account.'
+                );
             }
             $user->status = 'closed';
             $user->save();
             DB::table('refresh_tokens')->where('user_guid', $user->guid)->whereNull('revoked_at')->update(['revoked_at' => now(), 'updated_at' => now()]);
             DB::table('device_tokens')->where('user_guid', $user->guid)->delete();
         }, 3);
+    }
+
+    protected function verifyGoogleToken(string $project, string $idToken): array
+    {
+        return IdTokenVerifier::createWithProjectId($project)->verifyIdToken($idToken)->payload();
     }
 }

@@ -2,10 +2,10 @@
 
 namespace App\Services;
 
+use App\Exceptions\DomainValidationException;
 use App\Models\User;
 use Illuminate\Auth\Access\AuthorizationException;
 use Illuminate\Support\Facades\DB;
-use Illuminate\Validation\ValidationException;
 
 class AdminService
 {
@@ -58,10 +58,10 @@ class AdminService
                 throw new AuthorizationException;
             }
             if ($actor->guid === $target->guid && (($data['role'] ?? $target->role) !== $target->role || ($data['status'] ?? $target->status) !== $target->status)) {
-                throw ValidationException::withMessages(['role' => 'You cannot change your own role or status.']);
+                throw DomainValidationException::forField('role', 'own_role_or_status_change', 'You cannot change your own role or status.');
             }
             if ($target->role === 2 && $target->status === 'active' && (($data['role'] ?? 2) !== 2 || ($data['status'] ?? 'active') !== 'active') && $superadmins->count() <= 1) {
-                throw ValidationException::withMessages(['role' => 'The last active superadmin cannot be suspended or demoted.']);
+                throw DomainValidationException::forField('role', 'last_superadmin_role_change', 'The last active superadmin cannot be suspended or demoted.');
             }
             if (isset($data['role'])) {
                 $target->role = $data['role'];
